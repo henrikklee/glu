@@ -1,0 +1,36 @@
+[package]
+name = "glu-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "glu"
+path = "src/main.rs"
+
+[features]
+# Forward the client's development-capability feature so the ergonomic root
+# invocation works through the guarded `cargo build-dev` alias (which writes to
+# `target/dev-registry`; see crates/glu-client/Cargo.toml for the policy).
+# Published builds use the default (empty) feature set and the normal
+# `target/release` directory.
+default = []
+dev-registry = ["glu-client/dev-registry"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+console.workspace = true
+glu-client = { path = "../glu-client" }
+glu-core = { path = "../glu-core" }
+libc.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+jsonschema = { version = "0.51", default-features = false }
+tempfile.workspace = true

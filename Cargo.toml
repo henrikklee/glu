@@ -1,0 +1,51 @@
+[workspace]
+members = [
+  "crates/glu-cli",
+  "crates/glu-client",
+  "crates/glu-core",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+publish = false
+repository = "https://github.com/henrikklee/glu"
+
+[workspace.dependencies]
+anyhow = "1"
+apple-codesign = { version = "0.29", default-features = false }
+clap = { version = "4", features = ["derive"] }
+console = "0.15"
+flate2 = { version = "1", features = ["zlib-rs"], default-features = false }
+futures-util = "0.3"
+glob = "0.3"
+memchr = "2"
+regex = "1"
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["http2", "json", "rustls-tls", "stream"] }
+semver = "1"
+chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1.2.2"
+ring = "0.17"
+tar = { version = "0.4", default-features = false }
+tempfile = "3"
+thiserror = "1"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+url = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.local]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+strip = "none"

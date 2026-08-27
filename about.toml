@@ -1,0 +1,35 @@
+# Release dependency license policy. Keep this target-specific and exclude
+# dependencies used only to build or test glu: they are not shipped in the
+# aarch64 macOS release executable.
+targets = ["aarch64-apple-darwin"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+ignore-transitive-dependencies = false
+
+# Permissive licenses are accepted globally. MPL-2.0 is accepted after explicit
+# review; the affected versions and exact source archives are documented in
+# THIRD_PARTY_NOTICES.md.
+accepted = [
+  # Prefer MIT when a dependency offers a choice that includes it.
+  "MIT",
+  "Apache-2.0",
+  "0BSD",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BlueOak-1.0.0",
+  "BSL-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT-0",
+  "MPL-2.0",
+  "OpenSSL",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Unlicense",
+  "Zlib",
+]
+
+workarounds = ["ring"]
+
+[private]
+ignore = true

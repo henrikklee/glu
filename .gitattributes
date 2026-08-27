@@ -1,0 +1,3 @@
+# cargo-about preserves upstream license text verbatim, including intentional
+# trailing whitespace and CRLF line endings in some notices.
+THIRD_PARTY_LICENSES.html -whitespace

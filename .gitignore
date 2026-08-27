@@ -1,0 +1,11 @@
+TODO.md
+AGENTS.md
+/target/
+/purge.sh
+.DS_Store
+*.swp
+.agents/
+.claude/
+skills-lock.json
+docs/internal/
+issues/

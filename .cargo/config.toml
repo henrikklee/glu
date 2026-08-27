@@ -1,0 +1,5 @@
+[alias]
+# Fast production-policy build for the globally linked development CLI.
+build-local = "build --profile local --locked"
+# Keep development capabilities out of the production target directory.
+build-dev = "build --release --locked --features dev-registry --target-dir target/dev-registry"
