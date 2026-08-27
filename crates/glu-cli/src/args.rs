@@ -229,10 +229,12 @@ The forward dependency tree of one package. Installed packages answer from \
 receipts (offline); not-installed ones resolve from the registry, marked \
 `resolved from the registry — not installed`. `-o`/`--online` forces the \
 registry answer for an installed package (what a fresh install would pull) — \
-the two can differ. `-d`/`--direct` limits to one level, `-t`/`--tree` draws \
-the nested tree, `-v` shows each edge's version floor (`>= 2.84.3`, nested \
-view only), and `--status` annotates human output with installed/declared/link state. Unknown names get friendly `package 'X' not found` errors with \
-`Did you mean …?` suggestions.")]
+the two can differ. Human output lists names only by default. `-d`/`--direct` \
+limits to one level, `-t`/`--tree` draws the nested tree, and `-v` annotates \
+packages as `(VERSION installed)` plus each tree edge's declared requirement; resolver \
+candidate versions are never presented as dependency requirements. `--status` \
+annotates human output with installed/declared/link state. Unknown names get \
+friendly `package 'X' not found` errors with `Did you mean …?` suggestions.")]
     Deps {
         /// Only the package's direct dependencies (one level).
         #[arg(short = 'd', long)]

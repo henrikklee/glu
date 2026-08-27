@@ -9,6 +9,7 @@ use crate::command_model::{
     StatusOutput, StatusShell, TimingBreakdownRecord, UpdateOutput, UpdatePackageRecord,
     UpdatePlanOutput,
 };
+use crate::package_list::{self, PackageListItem};
 use crate::tables;
 use anyhow::Result;
 use glu_client::activation::{
@@ -16,7 +17,9 @@ use glu_client::activation::{
 };
 use glu_client::remove::{KeptDeclaredPackage, RemovedPackage};
 use glu_client::state::installed::DependencyTreeNode;
-use glu_client::tree_render::{render_dependency_tree, RootStyle, TreeRenderOptions};
+use glu_client::tree_render::{
+    render_dependency_tree, render_dependency_tree_with_context, RootStyle, TreeRenderOptions,
+};
 use glu_client::{shell::SetupResult, GluClient, LocalQuery};
 use glu_core::{InfoResponse, InstalledPackage, PackageName};
 use std::collections::{BTreeMap, BTreeSet};
@@ -344,28 +347,17 @@ fn render_deps_output(deps: &DepsOutput, globals: &GlobalOptions) {
     }
 
     if globals.tree {
-        print_tree_roots(
-            std::slice::from_ref(&deps.root),
-            deps.direct,
-            globals.verbose,
-        );
+        print_deps_tree(&deps.root, &deps.statuses, deps.direct, globals.verbose);
         if deps.status {
-            print_dependency_status(&dependency_records(
-                &deps.root.children,
-                deps.direct,
+            print_dependency_status(
+                &dependency_records(&deps.root.children, deps.direct, &deps.statuses),
                 &deps.statuses,
-            ));
+                globals.verbose,
+            );
         }
-    } else if deps.status {
-        print_flat_with_status(&dependency_records(
-            &deps.root.children,
-            deps.direct,
-            &deps.statuses,
-        ));
     } else {
-        let mut items = Vec::new();
-        flatten_tree_unique(&deps.root.children, deps.direct, &mut items);
-        print_flat(&items);
+        let records = dependency_records(&deps.root.children, deps.direct, &deps.statuses);
+        print_deps_flat(&records, &deps.statuses, globals.verbose, deps.status);
     }
     if deps.source == DepsSource::Resolved {
         let note = if deps.installed {
@@ -1179,28 +1171,35 @@ impl<'a> UpdatePlanTreeResult<'a> {
 }
 
 pub(crate) fn render_install_preflight(plan: &glu_client::install::InstallPlan) {
-    for package in &plan.promoted {
-        println!(
-            "Added {} {} to your packages",
-            package.name.0, package.version
-        );
-    }
+    let promoted: Vec<_> = plan
+        .promoted
+        .iter()
+        .map(|package| PackageListItem::package(&package.name.0, &package.version))
+        .collect();
+    package_list::print_labeled_section("Added to your packages", &promoted);
+
+    let satisfied: Vec<_> = plan
+        .satisfied
+        .iter()
+        .filter(|package| {
+            package.status == glu_client::install::PackageChangeStatus::AlreadyInstalled
+        })
+        .map(|package| PackageListItem::package(&package.name.0, &package.version))
+        .collect();
+    package_list::print_labeled_section("Already installed", &satisfied);
+
     for package in &plan.satisfied {
-        match package.status {
-            glu_client::install::PackageChangeStatus::AlreadyInstalled => println!(
-                "{} {} is already installed",
-                package.name.0, package.version
-            ),
-            glu_client::install::PackageChangeStatus::InstalledOlderThanResolved => {
-                let resolved = plan
-                    .resolved_version(&package.name)
-                    .unwrap_or("the resolved version");
-                println!(
-                    "{} {} is already installed. Run `glu update {}` to update to {}.",
-                    package.name.0, package.version, package.name.0, resolved
-                );
-            }
-            _ => {}
+        if package.status == glu_client::install::PackageChangeStatus::InstalledOlderThanResolved {
+            let resolved = plan
+                .resolved_version(&package.name)
+                .unwrap_or("the resolved version");
+            println!(
+                "{} {} is already installed. Run `glu update {}` to update to {}.",
+                package.name.0,
+                glu_client::style::dim(&package.version),
+                package.name.0,
+                glu_client::style::dim(resolved)
+            );
         }
     }
 }
@@ -1214,58 +1213,60 @@ pub(crate) fn render_install_execution_plan(
     if total == 0 {
         return;
     }
-    let noun = if total == 1 { "package" } else { "packages" };
-    println!("Will {label} {total} {noun}:");
     if tree {
-        for line in render_dependency_tree(
-            &plan.dependency_tree(),
+        println!(
+            "Will {label} {}:",
+            glu_client::format::plural(total, "package")
+        );
+        let included: BTreeSet<(&str, &str)> = plan
+            .would_install
+            .iter()
+            .map(|package| (package.name.0.as_str(), package.version.as_str()))
+            .chain(
+                plan.renamed
+                    .iter()
+                    .map(|rename| (rename.new_name.0.as_str(), rename.version.as_str())),
+            )
+            .collect();
+        let install_tree = filter_package_tree(&plan.dependency_tree(), &included);
+        for line in render_dependency_tree_with_context(
+            &install_tree.nodes,
             TreeRenderOptions::decorated(RootStyle::AlwaysLast),
+            &install_tree.context,
         ) {
             println!("{line}");
         }
     } else {
-        for rename in &plan.renamed {
-            println!("- {} -> {}", rename.old_name.0, rename.new_name.0);
-        }
-        for (index, package) in plan.would_install.iter().enumerate() {
-            let branch = if index + 1 == plan.would_install.len() {
-                "└──"
-            } else {
-                "├──"
-            };
-            let name = if package.direct == Some(true) {
-                glu_client::style::bold(&package.name.0)
-            } else {
-                package.name.0.clone()
-            };
-            println!(
-                "{} {} {}",
-                glu_client::style::dim(branch),
-                name,
-                glu_client::style::dim(&package.version)
-            );
-        }
+        let mut items: Vec<_> = plan
+            .renamed
+            .iter()
+            .map(|rename| {
+                PackageListItem::rename(&rename.old_name.0, &rename.new_name.0, &rename.version)
+            })
+            .collect();
+        items.extend(plan.would_install.iter().map(|package| {
+            PackageListItem::package(&package.name.0, &package.version)
+                .emphasized(package.direct == Some(true))
+        }));
+        package_list::print_section(&format!("Will {label}"), &items);
     }
     println!();
 }
 
 pub(crate) fn render_update_preflight(plan: &glu_client::install::UpdatePlan) {
-    for package in &plan.up_to_date {
-        println!(
-            "{} {} is already up to date",
-            package.name.0, package.version
-        );
-    }
-    if !plan.cascade_added.is_empty() {
-        println!(
-            "Also updating outdated dependents: {}",
-            plan.cascade_added
-                .iter()
-                .map(|name| name.0.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
+    let up_to_date: Vec<_> = plan
+        .up_to_date
+        .iter()
+        .map(|package| PackageListItem::package(&package.name.0, &package.version))
+        .collect();
+    package_list::print_labeled_section("Already up to date", &up_to_date);
+
+    let dependents: Vec<_> = plan
+        .cascade_added
+        .iter()
+        .map(|name| PackageListItem::name(&name.0))
+        .collect();
+    package_list::print_counted_section("Also updating", "outdated dependent", &dependents);
 }
 
 fn render_install_output(install: &InstallOutput, globals: &GlobalOptions) {
@@ -1273,8 +1274,11 @@ fn render_install_output(install: &InstallOutput, globals: &GlobalOptions) {
         print_json_success(CommandId::Install, &InstallResult::Executed(install));
         return;
     }
-    render_execution_summary(&install.execution, globals);
+    print_package_section("Installed", &install.installed);
+    print_package_section("Promoted to declared", &install.promoted);
+    print_rename_section("Renamed", &install.renamed);
     print_sync_removed_packages(&install.removed);
+    render_execution_summary(&install.execution, globals);
 }
 
 fn render_install_plan_output(plan: &InstallPlanOutput, globals: &GlobalOptions) {
@@ -1300,15 +1304,24 @@ fn render_install_plan_output(plan: &InstallPlanOutput, globals: &GlobalOptions)
     if !has_changes {
         println!("Nothing to do.");
     }
-    print_package_section("Would install", &plan.would_install);
+    let install_tree = globals
+        .tree
+        .then(|| install_only_tree(&plan.dependency_tree, &plan.would_install))
+        .unwrap_or_default();
+    if !install_tree.nodes.is_empty() {
+        println!(
+            "Would install {}:",
+            glu_client::format::plural(plan.would_install.len(), "package")
+        );
+        print_mutation_tree(&install_tree);
+    } else {
+        print_package_section("Would install", &plan.would_install);
+    }
     print_package_section("Already satisfied", &plan.satisfied);
     print_package_section("Would promote to declared", &plan.would_promote);
     print_rename_section("Would rename", &plan.would_rename);
     print_package_section("Would remove", &plan.would_remove);
-    if let Some(bytes) = plan.would_download_bytes {
-        println!("Would download: {bytes} bytes");
-    }
-    print_plan_tree(globals, &plan.dependency_tree);
+    print_would_download(plan.would_download_bytes);
 }
 
 fn render_reinstall_output(reinstall: &ReinstallOutput, globals: &GlobalOptions) {
@@ -1316,8 +1329,10 @@ fn render_reinstall_output(reinstall: &ReinstallOutput, globals: &GlobalOptions)
         print_json_success(CommandId::Reinstall, &ReinstallResult::Executed(reinstall));
         return;
     }
-    render_execution_summary(&reinstall.execution, globals);
+    print_package_section("Reinstalled", &reinstall.reinstalled);
+    print_rename_section("Renamed", &reinstall.renamed);
     print_sync_removed_packages(&reinstall.removed);
+    render_execution_summary(&reinstall.execution, globals);
 }
 
 fn render_reinstall_plan_output(plan: &ReinstallPlanOutput, globals: &GlobalOptions) {
@@ -1336,6 +1351,7 @@ fn render_reinstall_plan_output(plan: &ReinstallPlanOutput, globals: &GlobalOpti
     print_package_section("Already satisfied", &plan.satisfied);
     print_rename_section("Would rename", &plan.would_rename);
     print_package_section("Would remove", &plan.would_remove);
+    print_would_download(plan.would_download_bytes);
 }
 
 fn render_update_output(update: &UpdateOutput, globals: &GlobalOptions) {
@@ -1346,8 +1362,10 @@ fn render_update_output(update: &UpdateOutput, globals: &GlobalOptions) {
     if update.updates.is_empty() && update.execution.trace_path.is_none() && update.broad {
         println!("Already up to date.");
     }
-    render_execution_summary(&update.execution, globals);
+    let updates: Vec<_> = update.updates.iter().map(update_list_item).collect();
+    package_list::print_section("Updated", &updates);
     print_sync_removed_packages(&update.removed);
+    render_execution_summary(&update.execution, globals);
     if !update.updates.is_empty() || update.broad {
         if let Some(hint) = glu_client::outdated::glu_update_hint(
             update.latest_glu_version.as_deref(),
@@ -1393,9 +1411,7 @@ fn render_execution_summary(execution: &ExecutionSummaryRecord, globals: &Global
 }
 
 fn print_sync_removed_packages(packages: &[MutationPackageRecord]) {
-    for package in packages {
-        println!("Removed {} {}", package.name, package.version);
-    }
+    print_package_section("Removed", packages);
 }
 
 fn render_update_plan_output(plan: &UpdatePlanOutput, globals: &GlobalOptions) {
@@ -1412,15 +1428,41 @@ fn render_update_plan_output(plan: &UpdatePlanOutput, globals: &GlobalOptions) {
     if plan.would_update.is_empty() && plan.would_remove.is_empty() {
         println!("Nothing to do.");
     } else {
-        if !plan.would_update.is_empty() {
-            println!("Would update:");
-            for update in &plan.would_update {
-                println!("- {} {} -> {}", update.name, update.current, update.latest);
-            }
+        let rendered_tree = globals.tree
+            && print_update_tree(
+                "Would update",
+                &plan.dependency_tree,
+                &plan
+                    .would_update
+                    .iter()
+                    .map(|update| {
+                        (
+                            update.name.as_str(),
+                            update.current.as_str(),
+                            update.latest.as_str(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        if !rendered_tree {
+            let updates: Vec<_> = plan.would_update.iter().map(update_list_item).collect();
+            package_list::print_section("Would update", &updates);
         }
         print_package_section("Would remove", &plan.would_remove);
     }
-    print_plan_tree(globals, &plan.dependency_tree);
+    print_would_download(plan.would_download_bytes);
+}
+
+fn would_download_message(bytes: Option<u64>) -> Option<String> {
+    bytes
+        .filter(|bytes| *bytes > 0)
+        .map(|bytes| format!("Would download: {}", glu_client::format::human_bytes(bytes)))
+}
+
+fn print_would_download(bytes: Option<u64>) {
+    if let Some(message) = would_download_message(bytes) {
+        println!("{message}");
+    }
 }
 
 fn print_mutation_plan(
@@ -1436,34 +1478,123 @@ fn print_mutation_plan(
     print_package_section("Would remove", removals);
 }
 
+fn update_list_item(update: &UpdatePackageRecord) -> PackageListItem {
+    PackageListItem::update(&update.name, &update.current, &update.latest)
+        .emphasized(update.direct == Some(true))
+}
+
 fn print_package_section(heading: &str, packages: &[MutationPackageRecord]) {
-    if packages.is_empty() {
-        return;
-    }
-    println!("{heading}:");
-    for package in packages {
-        println!("- {} {}", package.name, package.version);
-    }
+    let items: Vec<_> = packages
+        .iter()
+        .map(|package| {
+            PackageListItem::package(&package.name, &package.version)
+                .emphasized(package.direct == Some(true))
+        })
+        .collect();
+    package_list::print_section(heading, &items);
 }
 
 fn print_rename_section(heading: &str, renames: &[RenamePackageRecord]) {
-    if renames.is_empty() {
-        return;
+    let items: Vec<_> = renames
+        .iter()
+        .map(|rename| PackageListItem::rename(&rename.old_name, &rename.new_name, &rename.version))
+        .collect();
+    package_list::print_section(heading, &items);
+}
+
+#[derive(Default)]
+struct MutationTree {
+    nodes: Vec<DependencyTreeNode>,
+    context: BTreeSet<(String, String)>,
+}
+
+fn filter_package_tree(
+    nodes: &[DependencyTreeNode],
+    included: &BTreeSet<(&str, &str)>,
+) -> MutationTree {
+    let mut result = MutationTree::default();
+    for node in nodes {
+        let mut children = filter_package_tree(&node.children, included);
+        result.context.append(&mut children.context);
+        if included.contains(&(node.name.as_str(), node.version.as_str())) {
+            let mut node = node.clone();
+            node.children = children.nodes;
+            result.nodes.push(node);
+        } else if !children.nodes.is_empty() {
+            // Retain the minimal unchanged path needed to preserve factual
+            // dependency edges between visible mutation nodes.
+            result
+                .context
+                .insert((node.name.clone(), node.version.clone()));
+            let mut node = node.clone();
+            node.children = children.nodes;
+            result.nodes.push(node);
+        }
     }
-    println!("{heading}:");
-    for rename in renames {
-        println!(
-            "- {} -> {} {}",
-            rename.old_name, rename.new_name, rename.version
-        );
+    result
+}
+
+fn install_only_tree(
+    tree: &[DependencyTreeNode],
+    would_install: &[MutationPackageRecord],
+) -> MutationTree {
+    let included: BTreeSet<(&str, &str)> = would_install
+        .iter()
+        .map(|package| (package.name.as_str(), package.version.as_str()))
+        .collect();
+    filter_package_tree(tree, &included)
+}
+
+fn print_mutation_tree(tree: &MutationTree) {
+    let options = TreeRenderOptions {
+        decorated: true,
+        direct: false,
+        verbose: false,
+        show_versions: true,
+        version_label: None,
+        root_style: RootStyle::Plain,
+    };
+    for line in render_dependency_tree_with_context(&tree.nodes, options, &tree.context) {
+        println!("{line}");
     }
 }
 
-fn print_plan_tree(globals: &GlobalOptions, tree: &[DependencyTreeNode]) {
-    if globals.tree && !tree.is_empty() {
-        println!("Plan tree:");
-        print_list_tree(tree);
+fn update_only_tree(tree: &[DependencyTreeNode], changes: &[(&str, &str, &str)]) -> MutationTree {
+    let changes: BTreeMap<(&str, &str), &str> = changes
+        .iter()
+        .map(|(name, current, latest)| ((*name, *latest), *current))
+        .collect();
+
+    let included: BTreeSet<(&str, &str)> = changes.keys().copied().collect();
+    let mut tree = filter_package_tree(tree, &included);
+
+    fn add_transitions(nodes: &mut [DependencyTreeNode], changes: &BTreeMap<(&str, &str), &str>) {
+        for node in nodes {
+            if let Some(current) = changes.get(&(node.name.as_str(), node.version.as_str())) {
+                node.version = format!("{current} → {}", node.version);
+            }
+            add_transitions(&mut node.children, changes);
+        }
     }
+    add_transitions(&mut tree.nodes, &changes);
+    tree
+}
+
+pub(crate) fn print_update_tree(
+    action: &str,
+    tree: &[DependencyTreeNode],
+    changes: &[(&str, &str, &str)],
+) -> bool {
+    let tree = update_only_tree(tree, changes);
+    if tree.nodes.is_empty() {
+        return false;
+    }
+    println!(
+        "{action} {}:",
+        glu_client::format::plural(changes.len(), "package")
+    );
+    print_mutation_tree(&tree);
+    true
 }
 
 fn mutation_plan_statuses<'a>(
@@ -1476,6 +1607,7 @@ fn mutation_plan_statuses<'a>(
                 PackageName(record.name.clone()),
                 glu_client::deps::PackageStatus {
                     installed: record.installed.unwrap_or(false),
+                    installed_version: None,
                     linked: record.linked.unwrap_or(false),
                     declared: record.declared.unwrap_or(false),
                     deactivated: record.deactivated.unwrap_or(false),
@@ -1497,6 +1629,7 @@ fn update_plan_statuses(
                 PackageName(record.name.clone()),
                 glu_client::deps::PackageStatus {
                     installed: record.installed.unwrap_or(false),
+                    installed_version: None,
                     linked: record.linked.unwrap_or(false),
                     declared: record.declared.unwrap_or(false),
                     deactivated: record.deactivated.unwrap_or(false),
@@ -1513,13 +1646,22 @@ fn render_activation_output(activation: &ActivationOutput, globals: &GlobalOptio
         print_json_success(CommandId::Activate, activation);
         return;
     }
-    for package in &activation.packages {
-        match package.status {
-            MutationStatus::Activated => println!("Activated {}.", package.name),
-            MutationStatus::AlreadyActive => println!("{} is already active.", package.name),
-            _ => unreachable!("unknown activation status"),
-        }
-    }
+    // Activation state is package-level: selectors resolve names/aliases to
+    // the newest installed keg, rather than targeting an arbitrary version.
+    let activated: Vec<_> = activation
+        .packages
+        .iter()
+        .filter(|package| package.status == MutationStatus::Activated)
+        .map(|package| PackageListItem::name(&package.name))
+        .collect();
+    let unchanged: Vec<_> = activation
+        .packages
+        .iter()
+        .filter(|package| package.status == MutationStatus::AlreadyActive)
+        .map(|package| PackageListItem::name(&package.name))
+        .collect();
+    package_list::print_section("Activated", &activated);
+    package_list::print_labeled_section("Already active", &unchanged);
 }
 
 fn render_deactivation_output(deactivation: &DeactivationOutput, globals: &GlobalOptions) {
@@ -1527,15 +1669,20 @@ fn render_deactivation_output(deactivation: &DeactivationOutput, globals: &Globa
         print_json_success(CommandId::Deactivate, deactivation);
         return;
     }
-    for package in &deactivation.packages {
-        match package.status {
-            MutationStatus::Deactivated => println!("Deactivated {}.", package.name),
-            MutationStatus::AlreadyDeactivated => {
-                println!("{} is already deactivated.", package.name)
-            }
-            _ => unreachable!("unknown deactivation status"),
-        }
-    }
+    let deactivated: Vec<_> = deactivation
+        .packages
+        .iter()
+        .filter(|package| package.status == MutationStatus::Deactivated)
+        .map(|package| PackageListItem::name(&package.name))
+        .collect();
+    let unchanged: Vec<_> = deactivation
+        .packages
+        .iter()
+        .filter(|package| package.status == MutationStatus::AlreadyDeactivated)
+        .map(|package| PackageListItem::name(&package.name))
+        .collect();
+    package_list::print_section("Deactivated", &deactivated);
+    package_list::print_labeled_section("Already deactivated", &unchanged);
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -1551,18 +1698,17 @@ fn render_removal_output(removal: &RemovalOutput, globals: &GlobalOptions) {
         return;
     }
     print_removed_packages(&removal.removed);
-    for kept in &removal.kept {
-        let needing = kept.needed_by.join(", ");
-        let verb = if kept.needed_by.len() == 1 {
-            "needs"
-        } else {
-            "need"
-        };
-        println!(
-            "Removed {} {} from your packages — it stays installed because {needing} {verb} it",
-            kept.name, kept.version
-        );
-    }
+    let kept: Vec<_> = removal
+        .kept
+        .iter()
+        .map(|kept| {
+            PackageListItem::package(&kept.name, &kept.version).annotated(format!(
+                "removed from your packages; retained because needed by {}",
+                kept.needed_by.join(", ")
+            ))
+        })
+        .collect();
+    package_list::print_section("Retained", &kept);
     if !removal.leftover_config_files.is_empty() {
         println!();
         println!(
@@ -1587,13 +1733,15 @@ fn render_removal_plan_output(plan: &RemovalPlanOutput, globals: &GlobalOptions)
         return;
     }
     print_mutation_plan("remove", &[], &plan.would_remove);
-    for kept in &plan.would_keep {
-        let needing = kept.needed_by.join(", ");
-        println!(
-            "Would keep {} {} because declared packages need it: {}",
-            kept.name, kept.version, needing
-        );
-    }
+    let kept: Vec<_> = plan
+        .would_keep
+        .iter()
+        .map(|kept| {
+            PackageListItem::package(&kept.name, &kept.version)
+                .annotated(format!("needed by {}", kept.needed_by.join(", ")))
+        })
+        .collect();
+    package_list::print_section("Would retain", &kept);
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -1619,20 +1767,7 @@ fn render_autoremove_output(autoremove: &AutoremoveOutput, globals: &GlobalOptio
 }
 
 fn print_removed_packages(packages: &[MutationPackageRecord]) {
-    if let Some(message) = removed_packages_message(packages) {
-        println!("{message}");
-    }
-}
-
-fn removed_packages_message(packages: &[MutationPackageRecord]) -> Option<String> {
-    match packages {
-        [] => None,
-        [package] => Some(format!("Removed {} {}", package.name, package.version)),
-        packages => Some(format!(
-            "Removed {}.",
-            glu_client::format::plural(packages.len(), "package")
-        )),
-    }
+    print_package_section("Removed", packages);
 }
 
 fn render_autoremove_plan_output(plan: &AutoremovePlanOutput, globals: &GlobalOptions) {
@@ -1707,19 +1842,18 @@ fn render_status_output(status: &StatusOutput, globals: &GlobalOptions) {
 /// a list primitive.
 pub(crate) fn print_list(packages: &[InstalledPackage], deactivated: &[PackageName]) {
     let deactivated: BTreeSet<&PackageName> = deactivated.iter().collect();
-    for package in packages {
-        let version = glu_client::style::dim(&package.keg_version.0);
-        if deactivated.contains(&package.name) {
-            println!(
-                "{} {} {}",
-                package.name.0,
-                version,
-                glu_client::style::yellow("(deactivated)")
-            );
-        } else {
-            println!("{} {}", package.name.0, version);
-        }
-    }
+    let items: Vec<_> = packages
+        .iter()
+        .map(|package| {
+            let item = PackageListItem::package(&package.name.0, &package.keg_version.0);
+            if deactivated.contains(&package.name) {
+                item.annotated("deactivated")
+            } else {
+                item
+            }
+        })
+        .collect();
+    package_list::print_primitive(&items);
 }
 
 /// Flat view of a tree: every node once, deduped by name and sorted — no
@@ -1747,58 +1881,117 @@ pub(crate) fn flatten_tree_unique(
     *out = seen.into_iter().collect();
 }
 
-/// Bulleted flat lines (`▪ name version` on TTY, `name version` piped).
+/// Flat query output uses the same bare `name version` primitive as `glu ls`.
 pub(crate) fn print_flat(items: &[(String, String)]) {
-    let tty = std::io::stdout().is_terminal();
-    for (name, version) in items {
-        if tty {
-            println!(
-                "{} {} {}",
-                glu_client::style::dim("▪"),
-                name,
-                glu_client::style::dim(version)
-            );
-        } else {
-            println!("{name} {version}");
-        }
-    }
+    let items: Vec<_> = items
+        .iter()
+        .map(|(name, version)| PackageListItem::package(name, version))
+        .collect();
+    package_list::print_primitive(&items);
 }
 
-fn print_flat_with_status(records: &[DependencyRecord]) {
-    let tty = std::io::stdout().is_terminal();
-    for record in records {
-        let status = dependency_status_suffix(record);
-        if tty {
-            println!(
-                "{} {} {} {}",
-                glu_client::style::dim("▪"),
-                record.name,
-                glu_client::style::dim(&record.version),
-                glu_client::style::dim(&status)
-            );
-        } else {
-            println!("{} {} {}", record.name, record.version, status);
-        }
-    }
+fn print_deps_flat(
+    records: &[DependencyRecord],
+    statuses: &BTreeMap<PackageName, glu_client::deps::PackageStatus>,
+    verbose: bool,
+    show_status: bool,
+) {
+    let items: Vec<_> = records
+        .iter()
+        .map(|record| deps_list_item(record, statuses, verbose, show_status))
+        .collect();
+    package_list::print_primitive(&items);
 }
 
-fn print_dependency_status(records: &[DependencyRecord]) {
+fn print_dependency_status(
+    records: &[DependencyRecord],
+    statuses: &BTreeMap<PackageName, glu_client::deps::PackageStatus>,
+    verbose: bool,
+) {
     if records.is_empty() {
         return;
     }
     println!();
-    println!("Dependency status:");
-    for record in records {
-        println!(
-            "- {} {} {}",
-            record.name,
-            record.version,
-            dependency_status_suffix(record)
-        );
+    let items: Vec<_> = records
+        .iter()
+        .map(|record| deps_list_item(record, statuses, verbose, true))
+        .collect();
+    package_list::print_labeled_section("Dependency status", &items);
+}
+
+fn deps_list_item(
+    record: &DependencyRecord,
+    statuses: &BTreeMap<PackageName, glu_client::deps::PackageStatus>,
+    verbose: bool,
+    show_status: bool,
+) -> PackageListItem {
+    let installed_version = statuses
+        .get(&PackageName(record.name.clone()))
+        .and_then(|status| status.installed_version.as_deref());
+    let mut annotation = Vec::new();
+    if verbose {
+        if let Some(version) = installed_version {
+            annotation.push(format!("{version} installed"));
+        }
+    }
+    if show_status {
+        let mut status = dependency_status_parts(record);
+        if verbose && installed_version.is_some() {
+            status.remove(0);
+        }
+        annotation.extend(status.into_iter().map(str::to_string));
+    }
+    let item = PackageListItem::name(&record.name);
+    if annotation.is_empty() {
+        item
+    } else {
+        item.annotated(annotation.join(", "))
     }
 }
 
-fn dependency_status_suffix(record: &DependencyRecord) -> String {
+fn print_deps_tree(
+    root: &DependencyTreeNode,
+    statuses: &BTreeMap<PackageName, glu_client::deps::PackageStatus>,
+    direct: bool,
+    verbose: bool,
+) {
+    fn local_versions(
+        node: &DependencyTreeNode,
+        statuses: &BTreeMap<PackageName, glu_client::deps::PackageStatus>,
+        verbose: bool,
+    ) -> DependencyTreeNode {
+        let mut node = node.clone();
+        node.version = if verbose {
+            statuses
+                .get(&PackageName(node.name.clone()))
+                .and_then(|status| status.installed_version.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        node.children = node
+            .children
+            .iter()
+            .map(|child| local_versions(child, statuses, verbose))
+            .collect();
+        node
+    }
+
+    let root = local_versions(root, statuses, verbose);
+    let options = TreeRenderOptions {
+        decorated: true,
+        direct,
+        verbose,
+        show_versions: verbose,
+        version_label: Some("installed"),
+        root_style: RootStyle::SiblingBranches,
+    };
+    for line in render_dependency_tree(std::slice::from_ref(&root), options) {
+        println!("{line}");
+    }
+}
+
+fn dependency_status_parts(record: &DependencyRecord) -> Vec<&'static str> {
     let mut parts = Vec::new();
     parts.push(if record.installed { "installed" } else { "new" });
     parts.push(if record.direct {
@@ -1816,7 +2009,7 @@ fn dependency_status_suffix(record: &DependencyRecord) -> String {
     } else if matches!(record.linked, Some(false)) {
         parts.push("unlinked");
     }
-    format!("[{}]", parts.join(", "))
+    parts
 }
 
 /// `glu ls --tree`: dependency tree rooted at declared packages; with
@@ -1828,6 +2021,8 @@ pub(crate) fn print_list_tree(tree: &[DependencyTreeNode]) {
         decorated: true,
         direct: false,
         verbose: false,
+        show_versions: true,
+        version_label: None,
         root_style: RootStyle::Plain,
     };
     for line in render_dependency_tree(tree, options) {
@@ -2007,6 +2202,8 @@ pub(crate) fn print_tree_roots(nodes: &[DependencyTreeNode], direct: bool, verbo
         decorated: true,
         direct,
         verbose,
+        show_versions: true,
+        version_label: None,
         root_style: RootStyle::SiblingBranches,
     };
     for line in render_dependency_tree(nodes, options) {
@@ -2205,6 +2402,43 @@ mod tests {
     }
 
     #[test]
+    fn verbose_deps_uses_local_version_not_resolved_candidate() {
+        let record = DependencyRecord {
+            name: "glib".to_string(),
+            version: "9.9-candidate".to_string(),
+            installed: true,
+            linked: Some(true),
+            declared: false,
+            deactivated: false,
+            direct: true,
+            transitive: false,
+            download_bytes: None,
+            installed_bytes: None,
+        };
+        let statuses = BTreeMap::from([(
+            PackageName("glib".to_string()),
+            glu_client::deps::PackageStatus {
+                installed: true,
+                installed_version: Some("2.82.0".to_string()),
+                linked: true,
+                declared: false,
+                deactivated: false,
+                download_bytes: None,
+                installed_bytes: None,
+            },
+        )]);
+
+        assert_eq!(
+            package_list::render_primitive(&[deps_list_item(&record, &statuses, false, false)]),
+            "glib"
+        );
+        assert_eq!(
+            package_list::render_primitive(&[deps_list_item(&record, &statuses, true, false)]),
+            "glib (2.82.0 installed)"
+        );
+    }
+
+    #[test]
     fn dependency_json_records_include_status_annotations() {
         let tree = vec![node(
             "direct",
@@ -2215,6 +2449,7 @@ mod tests {
             PackageName("direct".to_string()),
             glu_client::deps::PackageStatus {
                 installed: true,
+                installed_version: Some("1.0".to_string()),
                 linked: true,
                 declared: false,
                 deactivated: false,
@@ -2247,6 +2482,7 @@ mod tests {
             PackageName("installed-dep".to_string()),
             glu_client::deps::PackageStatus {
                 installed: true,
+                installed_version: Some("1.0".to_string()),
                 linked: true,
                 declared: false,
                 deactivated: false,
@@ -2539,34 +2775,100 @@ mod tests {
     }
 
     #[test]
-    fn removal_messages_collapse_multiple_packages() {
-        let one = vec![plain_mutation_package_record(
-            "vips".to_string(),
-            "8.18.6".to_string(),
-            MutationStatus::Removed,
+    fn download_summary_uses_human_units_and_hides_zero() {
+        assert_eq!(
+            would_download_message(Some(31_513_444)).as_deref(),
+            Some("Would download: 31.5 MB")
+        );
+        assert_eq!(would_download_message(Some(0)), None);
+        assert_eq!(would_download_message(None), None);
+    }
+
+    #[test]
+    fn update_tree_replaces_flat_list_and_omits_unchanged_nodes() {
+        let tree = vec![node(
+            "root",
+            "2.0",
+            vec![
+                node("updated", "3.0", Vec::new()),
+                node("unchanged", "1.0", Vec::new()),
+            ],
         )];
-        let many = vec![
+        let filtered =
+            update_only_tree(&tree, &[("root", "1.0", "2.0"), ("updated", "2.0", "3.0")]);
+
+        assert_eq!(filtered.nodes.len(), 1);
+        assert_eq!(filtered.nodes[0].name, "root");
+        assert_eq!(filtered.nodes[0].version, "1.0 → 2.0");
+        assert_eq!(filtered.nodes[0].children.len(), 1);
+        assert_eq!(filtered.nodes[0].children[0].name, "updated");
+        assert_eq!(filtered.nodes[0].children[0].version, "2.0 → 3.0");
+        assert!(filtered.context.is_empty());
+    }
+
+    #[test]
+    fn install_tree_retains_only_required_installed_context() {
+        let tree = vec![node(
+            "root",
+            "1.0",
+            vec![
+                node("new-direct", "1.0", Vec::new()),
+                node(
+                    "already-installed",
+                    "1.0",
+                    vec![node("new-transitive", "1.0", Vec::new())],
+                ),
+            ],
+        )];
+        let would_install = vec![
             plain_mutation_package_record(
-                "vips".to_string(),
-                "8.18.6".to_string(),
-                MutationStatus::Removed,
+                "root".to_string(),
+                "1.0".to_string(),
+                MutationStatus::WouldInstall,
             ),
             plain_mutation_package_record(
-                "glib".to_string(),
-                "2.88.3".to_string(),
-                MutationStatus::Removed,
+                "new-direct".to_string(),
+                "1.0".to_string(),
+                MutationStatus::WouldInstall,
+            ),
+            plain_mutation_package_record(
+                "new-transitive".to_string(),
+                "1.0".to_string(),
+                MutationStatus::WouldInstall,
             ),
         ];
 
+        let filtered = install_only_tree(&tree, &would_install);
+        assert_eq!(filtered.nodes.len(), 1);
+        assert_eq!(filtered.nodes[0].name, "root");
         assert_eq!(
-            removed_packages_message(&one).as_deref(),
-            Some("Removed vips 8.18.6")
+            filtered.nodes[0]
+                .children
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new-direct", "already-installed"]
         );
         assert_eq!(
-            removed_packages_message(&many).as_deref(),
-            Some("Removed 2 packages.")
+            filtered.nodes[0].children[1].children[0].name,
+            "new-transitive"
         );
-        assert_eq!(removed_packages_message(&[]), None);
+        assert!(filtered
+            .context
+            .contains(&("already-installed".to_string(), "1.0".to_string())));
+    }
+
+    #[test]
+    fn removal_sections_keep_package_details() {
+        let many = [
+            PackageListItem::package("vips", "8.18.6"),
+            PackageListItem::package("glib", "2.88.3"),
+        ];
+
+        assert_eq!(
+            package_list::render_section("Removed", &many),
+            "Removed 2 packages:\n  ▪ glib 2.88.3\n  ▪ vips 8.18.6"
+        );
     }
 
     #[test]

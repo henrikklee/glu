@@ -7,6 +7,65 @@ fn glu() -> Command {
 }
 
 #[test]
+fn deps_human_hides_versions_until_verbose() {
+    let prefix = tempfile::tempdir().unwrap();
+    write_declaration(prefix.path(), &[("root", "1.0")]);
+    write_receipt(prefix.path(), "root", "1.0", &["dep"]);
+    write_receipt(prefix.path(), "dep", "1.0", &[]);
+
+    assert_eq!(human_command(prefix.path(), &["deps", "root"]), "dep\n");
+    assert_eq!(
+        human_command(prefix.path(), &["deps", "root", "-v"]),
+        "dep (1.0 installed)\n"
+    );
+    assert_eq!(
+        human_command(prefix.path(), &["deps", "root", "-t"]),
+        "└── root\n    └── dep\n"
+    );
+    assert_eq!(
+        human_command(prefix.path(), &["deps", "root", "-tv"]),
+        concat!(
+            "└── root (1.0 installed)\n",
+            "    └── dep (requires >= 1.0; 1.0 installed)\n",
+        )
+    );
+}
+
+#[test]
+fn remove_plan_human_uses_the_shared_package_list() {
+    let prefix = tempfile::tempdir().unwrap();
+    write_declaration(prefix.path(), &[("root", "1.0")]);
+    write_receipt(prefix.path(), "root", "1.0", &["dep"]);
+    write_receipt(prefix.path(), "dep", "1.0", &[]);
+
+    let output = human_command(prefix.path(), &["rm", "-p", "root"]);
+    assert_eq!(
+        output,
+        "Would remove 2 packages:\n  ▪ dep 1.0\n  ▪ root 1.0\n"
+    );
+}
+
+#[test]
+fn remove_completion_keeps_the_full_package_list() {
+    let prefix = tempfile::tempdir().unwrap();
+    write_declaration(prefix.path(), &[("root", "1.0")]);
+    write_receipt(prefix.path(), "root", "1.0", &["dep"]);
+    write_receipt(prefix.path(), "dep", "1.0", &[]);
+
+    let output = human_command(prefix.path(), &["rm", "-y", "root"]);
+    assert_eq!(output, "Removed 2 packages:\n  ▪ dep 1.0\n  ▪ root 1.0\n");
+}
+
+#[test]
+fn list_human_remains_an_unmarked_primitive() {
+    let prefix = tempfile::tempdir().unwrap();
+    write_declaration(prefix.path(), &[("root", "1.0")]);
+    write_receipt(prefix.path(), "root", "1.0", &[]);
+
+    assert_eq!(human_command(prefix.path(), &["ls"]), "root 1.0\n");
+}
+
+#[test]
 fn remove_plan_json_reports_would_remove_without_mutating() {
     let prefix = tempfile::tempdir().unwrap();
     write_declaration(prefix.path(), &[("root", "1.0")]);
@@ -84,6 +143,24 @@ fn autoremove_json_execution_reports_executed_mode() {
     let result = &value["result"];
     assert_eq!(result["mode"], "executed");
     assert_eq!(names(&result["packages"]), vec!["dep"]);
+}
+
+fn human_command(prefix: &Path, args: &[&str]) -> String {
+    let output = glu()
+        .args(args)
+        .env("GLU_PREFIX", prefix)
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "glu {} failed\nstdout:\n{}\nstderr:\n{}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    String::from_utf8(output.stdout).unwrap()
 }
 
 fn json_command(prefix: &Path, args: &[&str]) -> serde_json::Value {

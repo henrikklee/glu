@@ -5,6 +5,7 @@ mod diagnostic;
 mod events;
 mod help;
 mod output;
+mod package_list;
 mod progress;
 mod tables;
 mod trace_cmd;

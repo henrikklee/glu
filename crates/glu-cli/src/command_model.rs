@@ -427,6 +427,15 @@ const DEPS_OPTIONS: &[OptionSpec] = &[
         description: "annotate human dependency output with installed/declared/link status",
         conflicts_with: &[],
     },
+    OptionSpec {
+        long: "--verbose",
+        short: Some('v'),
+        kind: OptionKind::Bool,
+        scope: OptionScope::GlobalPresentation,
+        description:
+            "annotate packages with (VERSION installed) and, in tree view, dependency requirements",
+        conflicts_with: &[],
+    },
 ];
 
 const USES_OPTIONS: &[OptionSpec] = &[OptionSpec {
@@ -706,7 +715,7 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         group: CommandGroup::Query,
         aliases: &[],
         summary: "Show what a package depends on",
-        default_behavior: "Shows what NAME depends on. Uses installed receipts when available unless --online is used.",
+        default_behavior: "Shows dependency names only. Uses installed receipts when available unless --online is used; --verbose adds installed versions and tree-edge requirements.",
         arguments: PACKAGE_NAME_ARGUMENTS,
         mutates: false,
         default_scope: None,
@@ -714,7 +723,12 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         capabilities: CAP_TREE_VERBOSE,
         result_schema: Some("DepsResult"),
         options: DEPS_OPTIONS,
-        examples: &["glu deps vips", "glu deps vips -tvd", "glu deps vips -jt"],
+        examples: &[
+            "glu deps vips",
+            "glu deps vips -v",
+            "glu deps vips -tv",
+            "glu deps vips -jt",
+        ],
         subcommands: EMPTY_COMMANDS,
     },
     CommandSpec {

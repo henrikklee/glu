@@ -1,4 +1,5 @@
 use crate::{state::installed::DependencyTreeNode, style};
+use std::collections::BTreeSet;
 
 /// How root nodes should be drawn when rendering a decorated tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +26,11 @@ pub struct TreeRenderOptions {
     pub direct: bool,
     /// Include edge requirements (`>= 1.2.3`) when present.
     pub verbose: bool,
+    /// Include each node's concrete version.
+    pub show_versions: bool,
+    /// Label verbose metadata as dependency requirements and installed
+    /// versions instead of presenting a node version as a requirement.
+    pub version_label: Option<&'static str>,
     /// Root branch convention for decorated output.
     pub root_style: RootStyle,
 }
@@ -35,6 +41,8 @@ impl TreeRenderOptions {
             decorated: true,
             direct: false,
             verbose: false,
+            show_versions: true,
+            version_label: None,
             root_style,
         }
     }
@@ -44,6 +52,8 @@ impl TreeRenderOptions {
             decorated: false,
             direct: false,
             verbose: false,
+            show_versions: true,
+            version_label: None,
             root_style: RootStyle::SiblingBranches,
         }
     }
@@ -54,8 +64,19 @@ pub fn render_dependency_tree(
     nodes: &[DependencyTreeNode],
     options: TreeRenderOptions,
 ) -> Vec<String> {
+    render_dependency_tree_with_context(nodes, options, &BTreeSet::new())
+}
+
+/// Render a tree while retaining unchanged nodes needed to connect visible
+/// mutation work. Context rows are fully dimmed and explicitly annotated so
+/// redirected output remains unambiguous without ANSI styling.
+pub fn render_dependency_tree_with_context(
+    nodes: &[DependencyTreeNode],
+    options: TreeRenderOptions,
+    context: &BTreeSet<(String, String)>,
+) -> Vec<String> {
     let mut lines = Vec::new();
-    render_nodes(nodes, "", 0, options, &mut lines);
+    render_nodes(nodes, "", 0, options, context, &mut lines);
     lines
 }
 
@@ -64,6 +85,7 @@ fn render_nodes(
     prefix: &str,
     depth: usize,
     options: TreeRenderOptions,
+    context: &BTreeSet<(String, String)>,
     lines: &mut Vec<String>,
 ) {
     for (index, node) in nodes.iter().enumerate() {
@@ -79,30 +101,56 @@ fn render_nodes(
         } else {
             format!("{prefix}{}", if last { "    " } else { "│   " })
         };
-        lines.push(render_node_line(node, prefix, last, plain_root, options));
+        lines.push(render_node_line(
+            node, plain_root, prefix, last, options, context,
+        ));
         if !options.direct || depth == 0 {
-            render_nodes(&node.children, &child_prefix, depth + 1, options, lines);
+            render_nodes(
+                &node.children,
+                &child_prefix,
+                depth + 1,
+                options,
+                context,
+                lines,
+            );
         }
     }
 }
 
 fn render_node_line(
     node: &DependencyTreeNode,
+    plain_root: bool,
     prefix: &str,
     last: bool,
-    plain_root: bool,
     options: TreeRenderOptions,
+    context: &BTreeSet<(String, String)>,
 ) -> String {
-    let version = if node.version.is_empty() {
-        String::new()
-    } else if options.decorated {
-        format!(" {}", style::dim(&node.version))
+    let version = (options.show_versions && !node.version.is_empty()).then_some(&node.version);
+    let requirement = options.verbose.then(|| node.requires.as_ref()).flatten();
+    let metadata = if let Some(label) = options.version_label {
+        let mut parts = Vec::new();
+        if let Some(requirement) = requirement {
+            parts.push(format!("requires {requirement}"));
+        }
+        if let Some(version) = version {
+            parts.push(format!("{version} {label}"));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", style::dim(&format!("({})", parts.join("; "))))
+        }
     } else {
-        format!(" {}", node.version)
-    };
-    let requires = if options.verbose {
-        node.requires
-            .as_ref()
+        let version = version
+            .map(|version| {
+                if options.decorated {
+                    format!(" {}", style::dim(version))
+                } else {
+                    format!(" {version}")
+                }
+            })
+            .unwrap_or_default();
+        let requirement = requirement
             .map(|requirement| {
                 if options.decorated {
                     format!(" {}", style::dim(requirement))
@@ -110,12 +158,18 @@ fn render_node_line(
                     format!(" ({requirement})")
                 }
             })
-            .unwrap_or_default()
-    } else {
-        String::new()
+            .unwrap_or_default();
+        format!("{version}{requirement}")
     };
+    let is_context = context.contains(&(node.name.clone(), node.version.clone()));
     if !options.decorated || plain_root {
-        return format!("{}{}{}", node.name, version, requires);
+        let line = format!(
+            "{}{}{}",
+            node.name,
+            metadata,
+            if is_context { " (installed)" } else { "" }
+        );
+        return if is_context { style::dim(&line) } else { line };
     }
 
     let branch = if last { "└── " } else { "├── " };
@@ -124,14 +178,20 @@ fn render_node_line(
     } else {
         String::new()
     };
-    format!(
-        "{}{}{}{}{}",
-        style::dim(&format!("{prefix}{branch}")),
-        node.name,
-        version,
-        requires,
-        marker
-    )
+    if is_context {
+        style::dim(&format!(
+            "{prefix}{branch}{}{} (installed){marker}",
+            node.name, metadata
+        ))
+    } else {
+        format!(
+            "{}{}{}{}",
+            style::dim(&format!("{prefix}{branch}")),
+            node.name,
+            metadata,
+            marker
+        )
+    }
 }
 
 #[cfg(test)]
@@ -190,6 +250,28 @@ mod tests {
                 "└── a a-1".to_string(),
                 "    └── a1 a1-1".to_string(),
                 "└── b b-1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn context_nodes_are_annotated_without_color() {
+        let tree = vec![node(
+            "root",
+            vec![node("context", vec![node("work", vec![])])],
+        )];
+        let context = BTreeSet::from([("context".to_string(), "context-1".to_string())]);
+        let lines = render_dependency_tree_with_context(
+            &tree,
+            TreeRenderOptions::decorated(RootStyle::Plain),
+            &context,
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "root root-1".to_string(),
+                "└── context context-1 (installed)".to_string(),
+                "    └── work work-1".to_string(),
             ]
         );
     }

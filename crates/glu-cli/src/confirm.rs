@@ -1,4 +1,7 @@
-use crate::output::print_tree_roots;
+use crate::{
+    output::print_update_tree,
+    package_list::{self, PackageListItem},
+};
 use anyhow::{bail, Result};
 use glu_client::install::UpdatePlan;
 use glu_client::remove::RemovalPlan;
@@ -15,13 +18,12 @@ pub(super) fn confirm_install(
             glu_client::format::plural(plan.would_remove.len(), "unused package")
         );
     }
-    println!(
-        "Will also remove {}:",
-        glu_client::format::plural(plan.would_remove.len(), "unused package")
-    );
-    for package in &plan.would_remove {
-        println!("- {} {}", package.name.0, package.keg_version.0);
-    }
+    let items: Vec<_> = plan
+        .would_remove
+        .iter()
+        .map(|package| PackageListItem::package(&package.name.0, &package.keg_version.0))
+        .collect();
+    package_list::print_counted_section("Will also remove", "unused package", &items);
     ask_yes_no()
 }
 
@@ -32,13 +34,12 @@ pub(super) fn confirm_removal(plan: &RemovalPlan) -> Result<()> {
             glu_client::format::plural(plan.to_remove.len(), "package")
         );
     }
-    println!(
-        "Will remove {}:",
-        glu_client::format::plural(plan.to_remove.len(), "package")
-    );
-    for package in &plan.to_remove {
-        println!("- {} {}", package.name.0, package.keg_version.0);
-    }
+    let items: Vec<_> = plan
+        .to_remove
+        .iter()
+        .map(|package| PackageListItem::package(&package.name.0, &package.keg_version.0))
+        .collect();
+    package_list::print_section("Will remove", &items);
     ask_yes_no()
 }
 
@@ -60,41 +61,35 @@ pub(super) fn confirm_update(plan: &UpdatePlan, tree: bool) -> Result<()> {
             glu_client::format::plural(plan.to_update.len(), "package")
         );
     }
-    if tree {
-        if let Some(manifest) = &plan.manifest {
-            println!(
-                "Will update {}:",
-                glu_client::format::plural(plan.to_update.len(), "package")
-            );
-            for root in &manifest.roots {
-                if let Some(node) =
-                    glu_client::install::dependency_tree_from_manifest(manifest, &root.package)
-                {
-                    print_tree_roots(std::slice::from_ref(&node), false, false);
-                }
-            }
-        }
-    } else {
-        println!(
-            "Will update {}:",
-            glu_client::format::plural(plan.to_update.len(), "package")
-        );
-        for update in &plan.to_update {
-            println!(
-                "- {} {} -> {}",
-                update.name.0, update.current, update.latest
-            );
-        }
+    let update_tree = plan.dependency_tree();
+    let changes: Vec<_> = plan
+        .to_update
+        .iter()
+        .map(|update| {
+            (
+                update.name.0.as_str(),
+                update.current.as_str(),
+                update.latest.as_str(),
+            )
+        })
+        .collect();
+    if !(tree && print_update_tree("Will update", &update_tree, &changes)) {
+        let items: Vec<_> = plan
+            .to_update
+            .iter()
+            .map(|update| {
+                PackageListItem::update(&update.name.0, &update.current, &update.latest)
+                    .emphasized(update.direct == Some(true))
+            })
+            .collect();
+        package_list::print_section("Will update", &items);
     }
-    if !plan.to_remove.is_empty() {
-        println!(
-            "Will also remove {}:",
-            glu_client::format::plural(plan.to_remove.len(), "package")
-        );
-        for package in &plan.to_remove {
-            println!("- {} {}", package.name.0, package.keg_version.0);
-        }
-    }
+    let removals: Vec<_> = plan
+        .to_remove
+        .iter()
+        .map(|package| PackageListItem::package(&package.name.0, &package.keg_version.0))
+        .collect();
+    package_list::print_section("Will also remove", &removals);
     ask_yes_no()
 }
 
@@ -108,13 +103,11 @@ pub(super) fn confirm_autoremove(packages: &[InstalledPackage]) -> Result<()> {
             glu_client::format::plural(packages.len(), "package")
         );
     }
-    println!(
-        "Will remove {} unused:",
-        glu_client::format::plural(packages.len(), "package")
-    );
-    for package in packages {
-        println!("- {} {}", package.name.0, package.keg_version.0);
-    }
+    let items: Vec<_> = packages
+        .iter()
+        .map(|package| PackageListItem::package(&package.name.0, &package.keg_version.0))
+        .collect();
+    package_list::print_counted_section("Will remove", "unused package", &items);
     ask_yes_no()
 }
 

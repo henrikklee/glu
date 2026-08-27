@@ -36,6 +36,9 @@ pub struct ReverseDepsView {
 #[derive(Debug, Clone, Default)]
 pub struct PackageStatus {
     pub installed: bool,
+    /// Concrete local version, when installed. This is deliberately separate
+    /// from a resolved graph node's candidate version.
+    pub installed_version: Option<String>,
     pub linked: bool,
     pub declared: bool,
     pub deactivated: bool,

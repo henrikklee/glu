@@ -383,23 +383,24 @@ fn deps_statuses(
     state: &state::installed::InstalledState,
     declaration: &state::Declaration,
 ) -> std::collections::BTreeMap<PackageName, deps::PackageStatus> {
-    state
-        .list()
-        .into_iter()
-        .map(|package| {
-            let declared = declaration.contains(&package.name);
-            let deactivated = state.is_deactivated(&PackageSelector(package.name.0.clone()));
-            (
-                package.name.clone(),
-                deps::PackageStatus {
-                    installed: true,
-                    linked: package.linked,
-                    declared,
-                    deactivated,
-                    download_bytes: package.download_bytes,
-                    installed_bytes: package.installed_bytes,
-                },
-            )
-        })
-        .collect()
+    let mut statuses = std::collections::BTreeMap::new();
+    // InstalledState::list returns the newest keg first for each name. Keep
+    // that first entry so verbose dependency output never reports an older
+    // sibling keg as the active installed version.
+    for package in state.list() {
+        let declared = declaration.contains(&package.name);
+        let deactivated = state.is_deactivated(&PackageSelector(package.name.0.clone()));
+        statuses
+            .entry(package.name.clone())
+            .or_insert_with(|| deps::PackageStatus {
+                installed: true,
+                installed_version: Some(package.keg_version.0.clone()),
+                linked: package.linked,
+                declared,
+                deactivated,
+                download_bytes: package.download_bytes,
+                installed_bytes: package.installed_bytes,
+            });
+    }
+    statuses
 }

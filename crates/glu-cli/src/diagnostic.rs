@@ -1,3 +1,4 @@
+use crate::package_list::{self, PackageListItem};
 use anyhow::Error;
 
 pub(crate) fn print_runtime_error(error: &Error) {
@@ -31,20 +32,32 @@ fn print_partial_install_failure(error: &glu_client::install::PartialInstallFail
 
     if !report.installed.is_empty() {
         eprintln!();
-        eprintln!("Installed before failure:");
-        for package in &report.installed {
-            eprintln!("  {} {}", package.name, package.version);
-        }
+        let items: Vec<_> = report
+            .installed
+            .iter()
+            .map(|package| PackageListItem::package(&package.name, &package.version))
+            .collect();
+        eprintln!(
+            "{}",
+            package_list::render_labeled_section("Installed before failure", &items)
+        );
     }
     if !report.failed.is_empty() || !report.skipped.is_empty() {
         eprintln!();
-        eprintln!("Not installed / skipped:");
-        for package in &report.failed {
-            eprintln!("  {} {} [failed]", package.name, package.version);
-        }
-        for package in &report.skipped {
-            eprintln!("  {} {}", package.name, package.version);
-        }
+        let mut items: Vec<_> = report
+            .failed
+            .iter()
+            .map(|package| {
+                PackageListItem::package(&package.name, &package.version).annotated("failed")
+            })
+            .collect();
+        items.extend(report.skipped.iter().map(|package| {
+            PackageListItem::package(&package.name, &package.version).annotated("skipped")
+        }));
+        eprintln!(
+            "{}",
+            package_list::render_labeled_section("Not installed", &items)
+        );
     }
     if !report.partial.is_empty() {
         eprintln!();
