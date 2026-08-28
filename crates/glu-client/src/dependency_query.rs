@@ -29,9 +29,87 @@ pub struct DependencyTreeNode {
     pub children: Vec<DependencyTreeNode>,
     pub already_shown: bool,
     pub incoming: Option<DependencyTreeEdge>,
-    /// Formatted compatibility field for the shared tree renderer. The typed
-    /// minimum remains available on `incoming`.
-    pub requires: Option<String>,
+}
+
+/// A registry query graph contradicted its own package identity facts.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DependencyProjectionError {
+    #[error(
+        "registry graph assigns package key '{key}' to both '{first_id}' and '{second_id}'",
+        key = .package_key.0,
+        first_id = .first.0,
+        second_id = .second.0
+    )]
+    DuplicatePackageKey {
+        package_key: PackageKey,
+        first: PackageId,
+        second: PackageId,
+    },
+    #[error(
+        "registry graph dependency '{selector}' from '{dependent_id}' references missing package '{package_id}'",
+        selector = .requested_as.0,
+        dependent_id = .dependent.0,
+        package_id = .package.0
+    )]
+    MissingDependency {
+        dependent: PackageId,
+        requested_as: PackageSelector,
+        package: PackageId,
+    },
+    #[error(
+        "registry graph dependency '{selector}' from '{dependent_id}' identifies '{package_id}' as '{expected_key}' but that package is '{actual_key}'",
+        selector = .requested_as.0,
+        dependent_id = .dependent.0,
+        package_id = .package.0,
+        expected_key = .expected.0,
+        actual_key = .actual.0
+    )]
+    DependencyIdentityMismatch {
+        dependent: PackageId,
+        requested_as: PackageSelector,
+        package: PackageId,
+        expected: PackageKey,
+        actual: PackageKey,
+    },
+    #[error(
+        "registry graph root '{selector}' references missing package '{package_id}'",
+        selector = .requested_as.0,
+        package_id = .package.0
+    )]
+    MissingRoot {
+        requested_as: PackageSelector,
+        package: PackageId,
+    },
+    #[error(
+        "registry graph root '{selector}' identifies '{package_id}' as '{expected_key}' but that package is '{actual_key}'",
+        selector = .requested_as.0,
+        package_id = .package.0,
+        expected_key = .expected.0,
+        actual_key = .actual.0
+    )]
+    RootIdentityMismatch {
+        requested_as: PackageSelector,
+        package: PackageId,
+        expected: PackageKey,
+        actual: PackageKey,
+    },
+    #[error(
+        "registry graph does not select requested root package '{package_id}'",
+        package_id = .package.0
+    )]
+    UnselectedRoot { package: PackageId },
+    #[error("registry uses graph returned {count} roots for one selector")]
+    UnexpectedUsesRootCount { count: usize },
+}
+
+#[derive(Clone, Copy)]
+enum RegistryGraphShape {
+    /// Resolve manifests contain the complete forward dependency closure.
+    Closed,
+    /// Uses responses omit unrelated forward dependencies. An omitted edge is
+    /// valid unless its claimed stable package key is present under another
+    /// concrete package ID.
+    SparseReverse,
 }
 
 trait ProjectablePackage {
@@ -284,9 +362,6 @@ impl<'a> DependencyProjection<'a> {
             || canonical_name.0.clone(),
             |edge| edge.requested_as.0.clone(),
         );
-        let requires = incoming
-            .as_ref()
-            .and_then(|edge| format_minimum_version(edge.minimum.as_ref()));
         DependencyTreeNode {
             package_key: package.value.package_key().clone(),
             package: package.package.clone(),
@@ -296,9 +371,80 @@ impl<'a> DependencyProjection<'a> {
             children: Vec::new(),
             already_shown: false,
             incoming,
-            requires,
         }
     }
+}
+
+fn validate_registry_graph<P: ProjectablePackage>(
+    packages: &BTreeMap<PackageId, P>,
+    roots: &[glu_core::PackageSelection],
+    shape: RegistryGraphShape,
+) -> Result<(), DependencyProjectionError> {
+    let mut package_ids_by_key = BTreeMap::new();
+    for (package_id, package) in packages {
+        if let Some(first) = package_ids_by_key.insert(package.package_key().clone(), package_id) {
+            return Err(DependencyProjectionError::DuplicatePackageKey {
+                package_key: package.package_key().clone(),
+                first: first.clone(),
+                second: package_id.clone(),
+            });
+        }
+    }
+
+    for (dependent_id, dependent) in packages {
+        for dependency in dependent.deps() {
+            match packages.get(&dependency.package) {
+                Some(provider) if provider.package_key() != &dependency.package_key => {
+                    return Err(DependencyProjectionError::DependencyIdentityMismatch {
+                        dependent: dependent_id.clone(),
+                        requested_as: dependency.requested_as.clone(),
+                        package: dependency.package.clone(),
+                        expected: dependency.package_key.clone(),
+                        actual: provider.package_key().clone(),
+                    });
+                }
+                Some(_) => {}
+                None if matches!(shape, RegistryGraphShape::SparseReverse)
+                    && !package_ids_by_key.contains_key(&dependency.package_key) => {}
+                None => {
+                    return Err(DependencyProjectionError::MissingDependency {
+                        dependent: dependent_id.clone(),
+                        requested_as: dependency.requested_as.clone(),
+                        package: dependency.package.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    for root in roots {
+        let Some(package) = packages.get(&root.package) else {
+            return Err(DependencyProjectionError::MissingRoot {
+                requested_as: root.requested_as.clone(),
+                package: root.package.clone(),
+            });
+        };
+        if package.package_key() != &root.package_key {
+            return Err(DependencyProjectionError::RootIdentityMismatch {
+                requested_as: root.requested_as.clone(),
+                package: root.package.clone(),
+                expected: root.package_key.clone(),
+                actual: package.package_key().clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_install_manifest_graph(
+    manifest: &InstallManifest,
+) -> Result<(), DependencyProjectionError> {
+    validate_registry_graph(
+        &manifest.packages,
+        &manifest.roots,
+        RegistryGraphShape::Closed,
+    )
 }
 
 pub(crate) fn installed_forward_forest<'a>(
@@ -359,27 +505,42 @@ pub(crate) fn dependency_forest_from_manifest(
 pub fn dependency_tree_from_slim(
     manifest: &SlimManifest,
     root_id: &PackageId,
-) -> Option<DependencyTreeNode> {
-    registry_forward_tree(&manifest.packages, root_id)
-}
-
-fn format_minimum_version(minimum: Option<&MinimumVersion>) -> Option<String> {
-    let minimum = minimum?;
-    let mut floor = format!(">= {}", minimum.version);
-    if let Some(revision) = minimum.revision.filter(|revision| *revision > 0) {
-        floor.push_str(&format!("_{revision}"));
+) -> Result<DependencyTreeNode, DependencyProjectionError> {
+    validate_registry_graph(
+        &manifest.packages,
+        &manifest.roots,
+        RegistryGraphShape::Closed,
+    )?;
+    if !manifest.roots.iter().any(|root| &root.package == root_id) {
+        return Err(DependencyProjectionError::UnselectedRoot {
+            package: root_id.clone(),
+        });
     }
-    Some(floor)
+    Ok(registry_forward_tree(&manifest.packages, root_id)
+        .expect("validated slim root must be present"))
 }
 
-pub fn reverse_tree_from_uses(uses: &UsesResponse) -> Option<DependencyTreeNode> {
-    let selection = uses.roots.first()?;
+pub fn reverse_tree_from_uses(
+    uses: &UsesResponse,
+) -> Result<Option<DependencyTreeNode>, DependencyProjectionError> {
+    if uses.roots.len() > 1 {
+        return Err(DependencyProjectionError::UnexpectedUsesRootCount {
+            count: uses.roots.len(),
+        });
+    }
+    validate_registry_graph(
+        &uses.packages,
+        &uses.roots,
+        RegistryGraphShape::SparseReverse,
+    )?;
+    let Some(selection) = uses.roots.first() else {
+        return Ok(None);
+    };
     let projection = DependencyProjection::from_packages(uses.packages.iter());
-    let root = projection.package_key_for_id(&selection.package)?;
-    if root != &selection.package_key {
-        return None;
-    }
-    projection.reverse_tree(root)
+    let root = projection
+        .package_key_for_id(&selection.package)
+        .expect("validated uses root must be present");
+    Ok(projection.reverse_tree(root))
 }
 
 #[cfg(test)]
@@ -457,7 +618,8 @@ mod tests {
             vec![(root_id.clone(), root), (llvm_id.clone(), llvm)],
         );
 
-        let tree = dependency_tree_from_slim(&manifest, &root_id).unwrap();
+        let tree = dependency_tree_from_slim(&manifest, &root_id)
+            .expect("valid slim graph should project its selected root");
         let dependency = &tree.children[0];
 
         assert_eq!(dependency.name, "llvm@22");
@@ -468,7 +630,14 @@ mod tests {
             dependency.incoming.as_ref().unwrap().requested_as.0,
             "llvm@22"
         );
-        assert_eq!(dependency.requires.as_deref(), Some(">= 1.0"));
+        assert_eq!(
+            dependency
+                .incoming
+                .as_ref()
+                .and_then(|edge| edge.minimum.as_ref())
+                .map(|minimum| minimum.version.as_str()),
+            Some("1.0")
+        );
     }
 
     #[test]
@@ -479,7 +648,7 @@ mod tests {
         let manifest = slim_manifest("app", vec![(root_id.clone(), root), (library_id, library)]);
 
         let dependency = &dependency_tree_from_slim(&manifest, &root_id)
-            .unwrap()
+            .expect("valid slim graph should project its selected root")
             .children[0];
 
         assert_eq!(dependency.name, "old-lib");
@@ -503,7 +672,9 @@ mod tests {
             packages: manifest.packages,
         };
 
-        let tree = reverse_tree_from_uses(&uses).unwrap();
+        let tree = reverse_tree_from_uses(&uses)
+            .expect("valid uses graph")
+            .expect("uses graph should contain its selected root");
         let dependent = &tree.children[0];
 
         assert_eq!(dependent.name, "rust");
@@ -512,6 +683,119 @@ mod tests {
         assert_eq!(
             dependent.incoming.as_ref().unwrap().requested_as.0,
             "llvm@22"
+        );
+    }
+
+    #[test]
+    fn slim_projection_rejects_a_missing_dependency_provider() {
+        let (root_id, root) = slim("rust", "1.0", &[("llvm@22", "llvm")]);
+        let manifest = slim_manifest("rust", vec![(root_id.clone(), root)]);
+
+        let error = dependency_tree_from_slim(&manifest, &root_id).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DependencyProjectionError::MissingDependency {
+                dependent,
+                requested_as,
+                package,
+            } if dependent == root_id
+                && requested_as.0 == "llvm@22"
+                && package.0 == "pkg:test/llvm@1.0"
+        ));
+    }
+
+    #[test]
+    fn slim_projection_rejects_a_dependency_identity_mismatch() {
+        let (root_id, root) = slim("rust", "1.0", &[("llvm@22", "llvm")]);
+        let (llvm_id, mut llvm) = slim("llvm", "1.0", &[]);
+        llvm.package_key = PackageKey("package:not-llvm".to_string());
+        let manifest = slim_manifest("rust", vec![(root_id.clone(), root), (llvm_id, llvm)]);
+
+        let error = dependency_tree_from_slim(&manifest, &root_id).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DependencyProjectionError::DependencyIdentityMismatch {
+                expected,
+                actual,
+                ..
+            } if expected.0 == "package:llvm" && actual.0 == "package:not-llvm"
+        ));
+    }
+
+    #[test]
+    fn uses_projection_allows_omitted_unrelated_forward_dependencies() {
+        let (target_id, target) = slim("llvm", "1.0", &[]);
+        let (rust_id, rust) = slim("rust", "1.0", &[("llvm@22", "llvm"), ("zstd", "zstd")]);
+        let manifest = slim_manifest("llvm", vec![(target_id, target), (rust_id, rust)]);
+        let uses = UsesResponse {
+            schema: "glu.uses.v1".to_string(),
+            request: UsesRequestEcho {
+                name: PackageSelector("llvm@22".to_string()),
+                target: Target("arm64_test".to_string()),
+                direct: false,
+            },
+            roots: manifest.roots,
+            packages: manifest.packages,
+        };
+
+        let tree = reverse_tree_from_uses(&uses)
+            .expect("valid sparse uses graph")
+            .expect("uses graph should contain its selected root");
+
+        assert_eq!(tree.children.len(), 1);
+        assert_eq!(tree.children[0].name, "rust");
+    }
+
+    #[test]
+    fn uses_projection_rejects_a_hidden_edge_to_an_included_package() {
+        let (target_id, target) = slim("llvm", "1.0", &[]);
+        let (rust_id, mut rust) = slim("rust", "1.0", &[("llvm@22", "llvm")]);
+        rust.deps[0].package = PackageId("pkg:test/missing-llvm@1.0".to_string());
+        let manifest = slim_manifest("llvm", vec![(target_id, target), (rust_id.clone(), rust)]);
+        let uses = UsesResponse {
+            schema: "glu.uses.v1".to_string(),
+            request: UsesRequestEcho {
+                name: PackageSelector("llvm@22".to_string()),
+                target: Target("arm64_test".to_string()),
+                direct: false,
+            },
+            roots: manifest.roots,
+            packages: manifest.packages,
+        };
+
+        let error = reverse_tree_from_uses(&uses).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DependencyProjectionError::MissingDependency {
+                dependent,
+                requested_as,
+                ..
+            } if dependent == rust_id && requested_as.0 == "llvm@22"
+        ));
+    }
+
+    #[test]
+    fn uses_projection_rejects_multiple_roots() {
+        let (target_id, target) = slim("llvm", "1.0", &[]);
+        let manifest = slim_manifest("llvm", vec![(target_id, target)]);
+        let mut uses = UsesResponse {
+            schema: "glu.uses.v1".to_string(),
+            request: UsesRequestEcho {
+                name: PackageSelector("llvm".to_string()),
+                target: Target("arm64_test".to_string()),
+                direct: false,
+            },
+            roots: manifest.roots,
+            packages: manifest.packages,
+        };
+        uses.roots.push(uses.roots[0].clone());
+
+        assert_eq!(
+            reverse_tree_from_uses(&uses).unwrap_err(),
+            DependencyProjectionError::UnexpectedUsesRootCount { count: 2 }
         );
     }
 }

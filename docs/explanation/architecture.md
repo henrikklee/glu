@@ -83,6 +83,8 @@ Installed queries project only the receipt-backed installed graph. Registry quer
 
 Forward human and NUL output uses the exact selector recorded on each dependency edge. Reverse output names the dependent package while structured output retains the reversed edge's original selector. Local installed, declared, deactivated, and link annotations join by `PackageKey`, not by a requested or displayed name.
 
+Registry graphs fail closed when roots or dependency edges contradict their package IDs and stable keys. Slim resolves are closed graphs, so every dependency provider must be present. Uses responses are sparse reverse graphs and may omit unrelated forward providers, but an edge claiming an included stable key must reference that key's included package ID. Requirement floors remain typed on edges and are formatted only by presentation code.
+
 ## Execution boundary
 
 Execution is a directed acyclic graph. Nodes represent concrete work such as:

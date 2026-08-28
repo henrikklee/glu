@@ -1,5 +1,15 @@
 use crate::{dependency_query::DependencyTreeNode, style};
+use glu_core::MinimumVersion;
 use std::collections::BTreeSet;
+
+/// Format a typed dependency floor at the presentation boundary.
+pub fn format_minimum_version(minimum: &MinimumVersion) -> String {
+    let mut floor = format!(">= {}", minimum.version);
+    if let Some(revision) = minimum.revision.filter(|revision| *revision > 0) {
+        floor.push_str(&format!("_{revision}"));
+    }
+    floor
+}
 
 /// How root nodes should be drawn when rendering a decorated tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,10 +136,18 @@ fn render_node_line(
     context: &BTreeSet<(glu_core::PackageKey, String)>,
 ) -> String {
     let version = (options.show_versions && !node.version.is_empty()).then_some(&node.version);
-    let requirement = options.verbose.then_some(node.requires.as_ref()).flatten();
+    let requirement = options
+        .verbose
+        .then(|| {
+            node.incoming
+                .as_ref()
+                .and_then(|edge| edge.minimum.as_ref())
+                .map(format_minimum_version)
+        })
+        .flatten();
     let metadata = if let Some(label) = options.version_label {
         let mut parts = Vec::new();
-        if let Some(requirement) = requirement {
+        if let Some(requirement) = requirement.as_ref() {
             parts.push(format!("requires {requirement}"));
         }
         if let Some(version) = version {
@@ -151,6 +169,7 @@ fn render_node_line(
             })
             .unwrap_or_default();
         let requirement = requirement
+            .as_ref()
             .map(|requirement| {
                 if options.decorated {
                     format!(" {}", style::dim(requirement))
@@ -208,7 +227,6 @@ mod tests {
             children,
             already_shown: false,
             incoming: None,
-            requires: None,
         }
     }
 
@@ -286,7 +304,14 @@ mod tests {
     #[test]
     fn plain_verbose_direct_output_keeps_only_one_level() {
         let mut child = node("child", vec![node("grandchild", vec![])]);
-        child.requires = Some(">= 1.0".to_string());
+        child.incoming = Some(crate::dependency_query::DependencyTreeEdge {
+            requested_as: glu_core::PackageSelector("child".to_string()),
+            reversed: false,
+            minimum: Some(MinimumVersion {
+                version: "1.0".to_string(),
+                revision: None,
+            }),
+        });
         let tree = vec![node("root", vec![child])];
         let mut options = TreeRenderOptions::plain();
         options.direct = true;

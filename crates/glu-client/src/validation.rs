@@ -6,6 +6,7 @@ use anyhow::{bail, Result};
 use glu_core::{InstallManifest, Prefix};
 
 pub fn validate_client_support(manifest: &InstallManifest, prefix: &Prefix) -> Result<()> {
+    crate::dependency_query::validate_install_manifest_graph(manifest)?;
     validate_prefix(prefix)?;
     validate_fixed_cellar_prefix(manifest, prefix)?;
     validate_manifest_path_components(manifest)?;
@@ -168,5 +169,30 @@ mod tests {
     fn manifest_version_accepts_real_homebrew_shape() {
         let manifest = manifest_with_version("1.2.3_1");
         validate_manifest_path_components(&manifest).unwrap();
+    }
+
+    #[test]
+    fn install_validation_rejects_an_incomplete_registry_graph() {
+        let mut manifest = manifest_with_version("1.2.3");
+        manifest
+            .packages
+            .get_mut(&PackageId("pkg".to_string()))
+            .unwrap()
+            .deps
+            .push(glu_core::PackageDependency {
+                package_key: glu_core::PackageKey("package:missing".to_string()),
+                package: PackageId("pkg:missing@1.0".to_string()),
+                requested_as: glu_core::PackageSelector("missing".to_string()),
+            });
+
+        let error = validate_client_support(
+            &manifest,
+            &Prefix(std::path::PathBuf::from("/opt/glustore")),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("references missing package 'pkg:missing@1.0'"));
     }
 }

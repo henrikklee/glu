@@ -19,7 +19,8 @@ use glu_client::dependency_query::DependencyTreeNode;
 use glu_client::download::cache::{CacheCleanupPlan, CacheCleanupResult, CachedBottle};
 use glu_client::remove::{KeptDeclaredPackage, RemovedPackage};
 use glu_client::tree_render::{
-    render_dependency_tree, render_dependency_tree_with_context, RootStyle, TreeRenderOptions,
+    format_minimum_version, render_dependency_tree, render_dependency_tree_with_context, RootStyle,
+    TreeRenderOptions,
 };
 use glu_client::{shell::SetupResult, GluClient, LocalQuery};
 #[cfg(test)]
@@ -2418,7 +2419,11 @@ fn collect_dependency_graph(
                     .as_ref()
                     .map_or_else(|| child.name.clone(), |edge| edge.requested_as.0.clone()),
                 reversed: child.incoming.as_ref().is_some_and(|edge| edge.reversed),
-                requires: child.requires.clone(),
+                requires: child
+                    .incoming
+                    .as_ref()
+                    .and_then(|edge| edge.minimum.as_ref())
+                    .map(format_minimum_version),
             });
         if !child.already_shown {
             collect_dependency_graph(child, direct, depth + 1, statuses, nodes, edges);
@@ -2610,7 +2615,6 @@ mod tests {
             children,
             already_shown: false,
             incoming: None,
-            requires: None,
         }
     }
 
@@ -2618,7 +2622,14 @@ mod tests {
     fn dependency_graph_json_dedupes_nodes_but_keeps_edges() {
         let repeated = DependencyTreeNode {
             already_shown: true,
-            requires: Some(">= 1.0".to_string()),
+            incoming: Some(glu_client::dependency_query::DependencyTreeEdge {
+                requested_as: glu_core::PackageSelector("shared".to_string()),
+                reversed: false,
+                minimum: Some(glu_core::MinimumVersion {
+                    version: "1.0".to_string(),
+                    revision: None,
+                }),
+            }),
             ..node("shared", "1.0", Vec::new())
         };
         let tree = vec![node(
@@ -2651,7 +2662,6 @@ mod tests {
                 revision: None,
             }),
         });
-        alias.requires = Some(">= 22.1".to_string());
         let tree = vec![node("rust", "1.0", vec![alias])];
 
         let lines = render_dependency_tree(&tree, TreeRenderOptions::plain());

@@ -293,7 +293,7 @@ impl GluClient {
             .map(|root| &root.package)
             .ok_or_else(|| anyhow::anyhow!("registry returned nothing for '{}'", selector.0))?;
         let root = dependency_query::dependency_tree_from_slim(&manifest, root_id)
-            .ok_or_else(|| anyhow::anyhow!("registry result is missing '{}'", selector.0))?;
+            .with_context(|| format!("registry returned an invalid graph for '{}'", selector.0))?;
         Ok(deps::DepsView {
             source: deps::DepsSource::Resolved,
             installed,
@@ -317,7 +317,12 @@ impl GluClient {
             .uses(&selector, &self.config.target, direct)
             .await
             .with_context(|| format!("could not look up what depends on '{}'", selector.0))?;
-        Ok(dependency_query::reverse_tree_from_uses(&response))
+        dependency_query::reverse_tree_from_uses(&response).with_context(|| {
+            format!(
+                "registry returned an invalid uses graph for '{}'",
+                selector.0
+            )
+        })
     }
 
     /// The dangling packages of this prefix — installed, not declared, and

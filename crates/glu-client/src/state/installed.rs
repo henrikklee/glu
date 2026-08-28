@@ -956,8 +956,11 @@ mod tests {
         assert_eq!(tree.children[0].name, "glib");
         assert_eq!(tree.children[0].children.len(), 1);
         assert_eq!(tree.children[0].children[0].name, "pcre2");
-        // The edge floor is recorded for --verbose.
-        assert!(tree.children[0].requires.is_some());
+        // The typed edge floor is available to --verbose rendering.
+        assert!(tree.children[0]
+            .incoming
+            .as_ref()
+            .is_some_and(|edge| edge.minimum.is_some()));
 
         assert!(state
             .dependency_tree_for(&PackageSelector("absent".to_string()))

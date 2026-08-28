@@ -1742,7 +1742,9 @@ mod tree_tests {
             "pcre2",
         );
 
-        let tree = crate::dependency_query::reverse_tree_from_uses(&response).unwrap();
+        let tree = crate::dependency_query::reverse_tree_from_uses(&response)
+            .expect("valid uses graph")
+            .expect("uses graph should contain its selected root");
         assert_eq!(tree.name, "pcre2");
         let children: Vec<&str> = tree.children.iter().map(|n| n.name.as_str()).collect();
         assert_eq!(children, vec!["direct", "glib"]);
@@ -1751,14 +1753,20 @@ mod tree_tests {
         assert_eq!(glib_node.children.len(), 1);
         assert_eq!(glib_node.children[0].name, "vips");
         // The displayed floor comes from the dependent's selected artifact.
-        assert!(glib_node.requires.is_some());
+        assert!(glib_node
+            .incoming
+            .as_ref()
+            .is_some_and(|edge| edge.minimum.is_some()));
     }
 
     #[test]
-    fn reverse_tree_from_uses_none_when_target_absent() {
+    fn reverse_tree_from_uses_none_when_response_has_no_root() {
         let (_id, glib) = slim("glib", "2.88", vec![]);
-        let response = uses_response(vec![(_id, glib)], "pcre2");
-        assert!(crate::dependency_query::reverse_tree_from_uses(&response).is_none());
+        let mut response = uses_response(vec![(_id, glib)], "pcre2");
+        response.roots.clear();
+        assert!(crate::dependency_query::reverse_tree_from_uses(&response)
+            .expect("valid empty uses graph")
+            .is_none());
     }
 
     #[test]
@@ -1787,11 +1795,14 @@ mod tree_tests {
             &manifest,
             &manifest.roots[0].package,
         )
-        .unwrap();
+        .expect("valid slim graph should project its selected root");
         assert_eq!(tree.name, "vips");
         assert_eq!(tree.children.len(), 1);
         assert_eq!(tree.children[0].name, "pcre2");
-        assert!(tree.children[0].requires.is_some());
+        assert!(tree.children[0]
+            .incoming
+            .as_ref()
+            .is_some_and(|edge| edge.minimum.is_some()));
     }
 
     /// Regression test for the interrupted-install autoremove bug: run 1 is
