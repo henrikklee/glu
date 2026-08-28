@@ -1,3 +1,4 @@
+use crate::state::package_graph::InstalledPackageGraph;
 use anyhow::{bail, Result};
 use glu_core::{InstalledPackage, PackageId, PackageKey, PackageName, PackageSelector, Prefix};
 use std::{
@@ -38,6 +39,9 @@ pub struct InstalledState {
     outgoing: BTreeMap<PackageKey, Vec<glu_core::RuntimeDependencyRequirement>>,
     /// Reverse package-key adjacency, built once with the snapshot.
     incoming: BTreeMap<PackageKey, Vec<PackageKey>>,
+    /// Explicit receipt-backed graph. Existing callers still use the legacy
+    /// indexes above until they are migrated in a later change.
+    package_graph: InstalledPackageGraph,
     declared_names: BTreeSet<PackageName>,
     deactivated_names: BTreeSet<PackageName>,
 }
@@ -109,6 +113,7 @@ impl InstalledState {
         for kegs in by_key.values_mut() {
             kegs.sort_by(|a, b| compare_installed(b, a));
         }
+        let package_graph = InstalledPackageGraph::from_packages(&by_key)?;
         let mut outgoing = BTreeMap::new();
         let mut incoming: BTreeMap<PackageKey, Vec<PackageKey>> = BTreeMap::new();
         for (package_key, kegs) in &by_key {
@@ -141,6 +146,7 @@ impl InstalledState {
             selector_index,
             outgoing,
             incoming,
+            package_graph,
             declared_names,
             deactivated_names,
         })
@@ -168,6 +174,10 @@ impl InstalledState {
 
     pub fn dependent_keys(&self, key: &PackageKey) -> &[PackageKey] {
         self.incoming.get(key).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn package_graph(&self) -> &InstalledPackageGraph {
+        &self.package_graph
     }
 
     /// Every installed keg whose current receipt name is exactly `name`,
@@ -754,6 +764,39 @@ mod tests {
                 .insert(PackageName(name.to_string()), version.to_string());
             store.write_declaration(&declaration).unwrap();
         }
+    }
+
+    #[test]
+    fn loaded_state_builds_package_graph_from_receipt_dependencies_and_aliases() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_receipt(tmp.path(), "rust", "1.0", true, false);
+        write_receipt(tmp.path(), "llvm", "1.0", false, false);
+
+        let rust_keg = tmp.path().join("Cellar/rust/1.0");
+        let rust_path = InstalledStateStore::receipt_path_for_keg(&rust_keg);
+        let mut rust: GluInstallReceipt =
+            serde_json::from_slice(&fs::read(&rust_path).unwrap()).unwrap();
+        rust.install.deps = vec![PackageSelector("llvm@22".to_string())];
+        fs::write(&rust_path, serde_json::to_vec(&rust).unwrap()).unwrap();
+
+        let llvm_keg = tmp.path().join("Cellar/llvm/1.0");
+        let llvm_path = InstalledStateStore::receipt_path_for_keg(&llvm_keg);
+        let mut llvm: GluInstallReceipt =
+            serde_json::from_slice(&fs::read(&llvm_path).unwrap()).unwrap();
+        llvm.package.aliases = vec![PackageSelector("llvm@22".to_string())];
+        fs::write(&llvm_path, serde_json::to_vec(&llvm).unwrap()).unwrap();
+
+        let state = InstalledStateStore::new(Prefix(tmp.path().to_path_buf()))
+            .load_installed_state()
+            .unwrap();
+        let graph = state.package_graph();
+        let rust_key = PackageKey("package:rust".to_string());
+        let llvm_key = PackageKey("package:llvm".to_string());
+
+        assert_eq!(graph.package_count(), 2);
+        assert_eq!(graph.dependencies(&rust_key)[0].requested.0, "llvm@22");
+        assert_eq!(graph.dependencies(&rust_key)[0].provider, llvm_key);
+        assert_eq!(graph.dependents(&llvm_key)[0].dependent, rust_key);
     }
 
     fn installed_pkg_with_oldnames(
