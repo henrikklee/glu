@@ -1,38 +1,27 @@
 use anyhow::Result;
-use glu_core::{InstallManifest, PackageDependency, PackageId, ResolvedPackage};
+use glu_core::{InstallManifest, PackageId};
 use std::collections::BTreeSet;
 
-/// Selects the packages that need work and returns the selected subgraph in
+/// Returns the complete topology below `roots` in
 /// dependency-before-dependent order.
-///
-/// Selection and ordering are separate passes. A dependency skipped for one
-/// parent may still be selected for another parent with a higher package-level
-/// minimum. Once selection is complete, ordering considers every edge between
-/// selected packages, so a shared dependency always precedes every selected
-/// dependent regardless of which parent selected it.
-pub fn dependency_order(
+pub fn dependency_closure_order(
     manifest: &InstallManifest,
     roots: &[PackageId],
-    mut should_install: impl FnMut(&ResolvedPackage, &PackageDependency) -> Result<bool>,
 ) -> Result<Vec<PackageId>> {
     let mut selected = BTreeSet::new();
     let mut expanded = BTreeSet::new();
     for root in roots {
-        select_packages(
-            root,
-            manifest,
-            &mut should_install,
-            &mut selected,
-            &mut expanded,
-        )?;
+        select_closure(root, manifest, &mut selected, &mut expanded)?;
     }
 
     order_selected_packages(manifest, &selected)
 }
 
 /// Orders an already-selected package subset dependency-before-dependent.
-/// Selection may come from a reconciliation pass that inspected roots or the
-/// complete manifest closure without automatically selecting every root.
+/// Traversal continues through unselected packages because installer-root
+/// requirement contexts can select a transitive package while reusing its
+/// immediate parent. The selected descendant must still precede the selected
+/// dependent.
 pub fn order_selected_packages(
     manifest: &InstallManifest,
     selected: &BTreeSet<PackageId>,
@@ -53,10 +42,61 @@ pub fn order_selected_packages(
     Ok(order)
 }
 
-fn select_packages(
+/// The nearest selected packages below `package_id`, walking through
+/// unselected intermediates. The execution DAG uses this collapsed frontier
+/// to preserve the dependency-before-dependent commit boundary created by
+/// installer-root requirement contexts without adding dense transitive edges.
+pub(super) fn selected_dependency_frontier(
+    manifest: &InstallManifest,
+    package_id: &PackageId,
+    selected: &BTreeSet<PackageId>,
+) -> Result<BTreeSet<PackageId>> {
+    let mut dependencies = BTreeSet::new();
+    let mut expanded = BTreeSet::new();
+    collect_selected_dependency_frontier(
+        package_id,
+        manifest,
+        selected,
+        &mut dependencies,
+        &mut expanded,
+    )?;
+    dependencies.remove(package_id);
+    Ok(dependencies)
+}
+
+fn collect_selected_dependency_frontier(
     package_id: &PackageId,
     manifest: &InstallManifest,
-    should_install: &mut impl FnMut(&ResolvedPackage, &PackageDependency) -> Result<bool>,
+    selected: &BTreeSet<PackageId>,
+    dependencies: &mut BTreeSet<PackageId>,
+    expanded: &mut BTreeSet<PackageId>,
+) -> Result<()> {
+    if !expanded.insert(package_id.clone()) {
+        return Ok(());
+    }
+    let package = manifest
+        .packages
+        .get(package_id)
+        .ok_or_else(|| anyhow::anyhow!("resolve manifest is missing package {}", package_id.0))?;
+    for dependency in &package.deps {
+        if selected.contains(&dependency.package) {
+            dependencies.insert(dependency.package.clone());
+            continue;
+        }
+        collect_selected_dependency_frontier(
+            &dependency.package,
+            manifest,
+            selected,
+            dependencies,
+            expanded,
+        )?;
+    }
+    Ok(())
+}
+
+fn select_closure(
+    package_id: &PackageId,
+    manifest: &InstallManifest,
     selected: &mut BTreeSet<PackageId>,
     expanded: &mut BTreeSet<PackageId>,
 ) -> Result<()> {
@@ -70,18 +110,7 @@ fn select_packages(
         .get(package_id)
         .ok_or_else(|| anyhow::anyhow!("resolve manifest is missing package {}", package_id.0))?;
     for dependency in &package.deps {
-        if selected.contains(&dependency.package) {
-            continue;
-        }
-        if should_install(package, dependency)? {
-            select_packages(
-                &dependency.package,
-                manifest,
-                should_install,
-                selected,
-                expanded,
-            )?;
-        }
+        select_closure(&dependency.package, manifest, selected, expanded)?;
     }
     Ok(())
 }
@@ -103,20 +132,18 @@ fn order_selected(
         .get(package_id)
         .ok_or_else(|| anyhow::anyhow!("resolve manifest is missing package {}", package_id.0))?;
     for dependency in &package.deps {
-        if selected.contains(&dependency.package) {
-            order_selected(
-                &dependency.package,
-                manifest,
-                selected,
-                ordered,
-                ordering,
-                order,
-            )?;
-        }
+        order_selected(
+            &dependency.package,
+            manifest,
+            selected,
+            ordered,
+            ordering,
+            order,
+        )?;
     }
 
     ordering.remove(package_id);
-    if ordered.insert(package_id.clone()) {
+    if ordered.insert(package_id.clone()) && selected.contains(package_id) {
         order.push(package_id.clone());
     }
     Ok(())
@@ -126,8 +153,8 @@ fn order_selected(
 mod tests {
     use super::*;
     use glu_core::{
-        ArtifactId, InstallManifest, KegVersion, PackageInstallMetadata, PackageName,
-        ResolveRequestEcho, ResolvedArtifact, ResolvedPackage, Target,
+        ArtifactId, InstallManifest, KegVersion, PackageDependency, PackageInstallMetadata,
+        PackageName, ResolveRequestEcho, ResolvedArtifact, ResolvedPackage, Target,
     };
     use std::collections::BTreeMap;
 
@@ -201,8 +228,7 @@ mod tests {
             (root_id.clone(), root, root_artifact),
         ]);
 
-        let order =
-            dependency_order(&manifest, std::slice::from_ref(&root_id), |_, _| Ok(true)).unwrap();
+        let order = dependency_closure_order(&manifest, std::slice::from_ref(&root_id)).unwrap();
 
         assert_eq!(order, vec![dep_id, root_id]);
     }
@@ -216,8 +242,7 @@ mod tests {
             (b_id.clone(), b, b_artifact),
         ]);
 
-        let order =
-            dependency_order(&manifest, std::slice::from_ref(&a_id), |_, _| Ok(true)).unwrap();
+        let order = dependency_closure_order(&manifest, std::slice::from_ref(&a_id)).unwrap();
 
         assert_eq!(order.len(), 2);
         assert!(order.contains(&a_id));
@@ -225,42 +250,19 @@ mod tests {
     }
 
     #[test]
-    fn shared_dependency_selected_by_later_parent_precedes_all_dependents() {
-        let (dependency_id, dependency, dependency_artifact) = pkg("dependency", vec![]);
-        let (first_id, first, first_artifact) = pkg("first", vec!["dependency"]);
-        let (second_id, second, second_artifact) = pkg("second", vec!["dependency"]);
-        let manifest = manifest(vec![
-            (dependency_id.clone(), dependency, dependency_artifact),
-            (first_id.clone(), first, first_artifact),
-            (second_id.clone(), second, second_artifact),
-        ]);
-
-        let order = dependency_order(
-            &manifest,
-            &[first_id.clone(), second_id.clone()],
-            |parent, _| Ok(parent.name.0 == "second"),
-        )
-        .unwrap();
-
-        assert_eq!(order, vec![dependency_id, first_id, second_id]);
-    }
-
-    #[test]
-    fn include_false_prunes_subtree() {
+    fn selected_transitive_dependency_precedes_root_through_reused_parent() {
         let (leaf_id, leaf, leaf_artifact) = pkg("leaf", vec![]);
-        let (dep_id, dep, dep_artifact) = pkg("dep", vec!["leaf"]);
-        let (root_id, root, root_artifact) = pkg("root", vec!["dep"]);
+        let (bridge_id, bridge, bridge_artifact) = pkg("bridge", vec!["leaf"]);
+        let (root_id, root, root_artifact) = pkg("root", vec!["bridge"]);
         let manifest = manifest(vec![
-            (leaf_id, leaf, leaf_artifact),
-            (dep_id.clone(), dep, dep_artifact),
+            (leaf_id.clone(), leaf, leaf_artifact),
+            (bridge_id, bridge, bridge_artifact),
             (root_id.clone(), root, root_artifact),
         ]);
+        let selected = BTreeSet::from([leaf_id.clone(), root_id.clone()]);
 
-        let order = dependency_order(&manifest, std::slice::from_ref(&root_id), |_, dep| {
-            Ok(dep.package != dep_id)
-        })
-        .unwrap();
+        let order = order_selected_packages(&manifest, &selected).unwrap();
 
-        assert_eq!(order, vec![root_id]);
+        assert_eq!(order, vec![leaf_id, root_id]);
     }
 }

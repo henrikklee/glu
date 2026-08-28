@@ -1,6 +1,6 @@
 use crate::{
     download::{cache::ArtifactCache, ghcr::repo_for_blob_url},
-    install::{manifest_lookup::ManifestLookup, planner::InstallWorkSet},
+    install::{graph, manifest_lookup::ManifestLookup, planner::InstallWorkSet},
     postinstall::{
         deferral::{global_flush_order, global_postinstall_label},
         structured,
@@ -563,26 +563,29 @@ fn add_dependency_edges(
         .enumerate()
         .map(|(index, id)| (id, index))
         .collect::<BTreeMap<_, _>>();
+    let selected = install.iter().cloned().collect::<BTreeSet<_>>();
     for package_id in install {
         let package = manifest.require_package(package_id)?;
         let target = NodeKind::KegLink.node_id(&package.name.0);
+        for dependency_id in graph::selected_dependency_frontier(manifest, package_id, &selected)? {
+            let dep_position = position[&dependency_id];
+            // A cyclic pair can only be ordered one way. `install` already
+            // resolved that order; keep only the edge that agrees with it.
+            if dep_position >= position[package_id] {
+                continue;
+            }
+            let dep_package = manifest.require_package(&dependency_id)?;
+            edges.push(ExecEdge::new(
+                &NodeKind::FormulaPostinstall.node_id(&dep_package.name.0),
+                &target,
+                "formula_dependency_committed",
+            ));
+        }
         for dep in &package.deps {
-            if let Some(&dep_position) = position.get(&dep.package) {
-                // A cyclic pair (e.g. two bottled libraries that mutually declare a runtime
-                // dependency on each other) can only be ordered one way. `install`'s order
-                // already resolved that (see graph::dependency_order); keep only the edge that
-                // agrees with it and drop the other, instead of feeding check_acyclic a real
-                // cycle.
-                if dep_position >= position[package_id] {
-                    continue;
-                }
-                let dep_package = manifest.require_package(&dep.package)?;
-                edges.push(ExecEdge::new(
-                    &NodeKind::FormulaPostinstall.node_id(&dep_package.name.0),
-                    &target,
-                    "formula_dependency_committed",
-                ));
-            } else if satisfied.contains(&dep.package) {
+            if position.contains_key(&dep.package) {
+                continue;
+            }
+            if satisfied.contains(&dep.package) {
                 let dep_package = manifest.require_package(&dep.package)?;
                 edges.push(ExecEdge::new(
                     &NodeKind::KegLinkExisting.node_id(&dep_package.name.0),
@@ -655,7 +658,7 @@ fn cache_node_id(kind: &str, key: &[String]) -> String {
 /// Computes, in one linear pass, both the blended per-package scheduling priority (used for
 /// `ExecNode.priority`) and the raw normalized critical-path score keyed by formula name (used
 /// by the scheduler's live download-ranking heuristic). `install` must be in dependency-before-
-/// dependent order (as produced by `graph::dependency_order`), which lets the critical path be
+/// dependent order (as produced by `graph::order_selected_packages`), which lets the critical path be
 /// computed by a single reverse walk instead of memoized recursion: by the time a package is
 /// visited (back to front), every package that depends on it has already been visited.
 fn package_priorities(
@@ -932,6 +935,39 @@ mod tests {
             "formula_postinstall:root",
             "registry_write:root",
             "registry_after_postinstall"
+        )));
+    }
+
+    #[test]
+    fn transitive_selected_dependency_gates_root_through_satisfied_bridge() {
+        let (leaf_id, leaf, leaf_artifact) = pkg("leaf", vec![], vec![], 10);
+        let (bridge_id, bridge, bridge_artifact) = pkg("bridge", vec!["leaf"], vec![], 10);
+        let (root_id, root, root_artifact) = pkg("root", vec!["bridge"], vec![], 20);
+        let manifest = manifest(
+            vec![
+                (leaf_id.clone(), leaf, leaf_artifact),
+                (bridge_id.clone(), bridge, bridge_artifact),
+                (root_id.clone(), root, root_artifact),
+            ],
+            vec![root_id.clone()],
+        );
+        let workset = InstallWorkSet {
+            satisfied: vec![bridge_id],
+            rename: Vec::new(),
+            install: vec![leaf_id, root_id],
+        };
+
+        let plan = execution_plan(&manifest, &workset, &Prefix(PathBuf::from("/tmp/glu")));
+
+        assert!(plan.edges.contains(&ExecEdge::new(
+            "formula_postinstall:leaf",
+            "keg_link:root",
+            "formula_dependency_committed"
+        )));
+        assert!(plan.edges.contains(&ExecEdge::new(
+            "keg_link_existing:bridge",
+            "keg_link:root",
+            "formula_dependency_committed"
         )));
     }
 

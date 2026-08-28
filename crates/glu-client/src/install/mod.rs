@@ -1940,7 +1940,7 @@ mod tree_tests {
         let glib_node = &tree.children[1];
         assert_eq!(glib_node.children.len(), 1);
         assert_eq!(glib_node.children[0].name, "vips");
-        // The edge floor is on the dependent.
+        // The displayed floor comes from the dependent's selected artifact.
         assert!(glib_node.requires.is_some());
     }
 

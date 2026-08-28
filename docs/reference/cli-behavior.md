@@ -140,7 +140,7 @@ Update has three deliberate scopes:
 - bare `glu update` applies that root-update behavior to every declared root;
 - `glu update --all` also reconciles every package in the declared roots' dependency closure to the registry-selected release.
 
-Normal root updates keep an older dependency when it still satisfies the requiring package. They still install newly required or insufficient dependencies and remove dependencies dropped by the updated roots. `--all` is the explicit request to update satisfying dependencies too. Exact selected releases with matching persisted package facts are not repoured.
+Normal root updates keep an older dependency when it satisfies every active installer-root context. Each root's complete selected-bottle requirement map applies throughout that root's topology closure, including below satisfied intermediate packages. They still install newly required or insufficient dependencies and remove dependencies dropped by the updated roots. `--all` is the explicit request to update satisfying dependencies too. Exact selected releases with matching persisted package facts are not repoured.
 
 The outdated endpoint supplies staleness and presentation data, but does not gate reconciliation. Resolve remains authoritative for changed topology, provider identity, and package facts.
 

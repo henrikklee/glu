@@ -32,7 +32,9 @@ The planner compares the manifest with installed state.
 
 Plain `glu install` resolves the requested selector to a package key and treats any installed version of that identity as satisfied. It records or promotes canonical intent in `glu.json` without upgrading that package.
 
-Force-style modes (`update`, `reinstall`, `install --force`) repour roots. Dependency satisfaction is requirement-based: an installed dependency can be reused when its version/revision satisfies the edge's built-against floor.
+Named and bare updates reconcile selected roots while retaining dependencies that still satisfy the active requirement. `update --all` selects the complete declared-root closure. Reinstall and force modes repour the requested roots or closure according to their command flags.
+
+Dependency satisfaction is evaluated in installer-root context. The planner carries one selected bottle's complete flattened requirement map through that package's topology closure. Satisfied intermediate packages are not selected for installation, but traversal continues through their children. A dependency selected for installation is expanded again with its own bottle's requirement map. If multiple roots reach the same package, any context that requires replacement wins.
 
 Old-name matches become explicit rename work.
 
@@ -48,7 +50,7 @@ download → prepare → link/postinstall → receipt write
 
 Other nodes cover setup/authentication, old-name transitions, and coalesced global-cache postinstall work.
 
-Already satisfied packages do not get download or prepare nodes. They still participate as dependency-ready anchors for ordering.
+Already satisfied packages do not get download or prepare nodes. They still participate as dependency-ready anchors for ordering. When an installer-root context selects a transitive package below a satisfied intermediate, the selected transitive package directly gates the dependent's commit.
 
 ## 5. Download and verify
 

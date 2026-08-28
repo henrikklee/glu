@@ -70,6 +70,8 @@ Planning compares:
 
 The planner produces the meaningful transition: install, keep, promote, rename, update, remove, or report.
 
+Dependency reuse is context-sensitive. For each package being expanded as an installer root, the planner applies that package's complete selected-artifact requirement map throughout its topology closure. It continues through satisfied intermediates, and packages selected for installation are expanded again with their own maps. Selection from multiple contexts is merged before dependency ordering and DAG construction.
+
 Plain `glu install` is idempotent by installed root name. It records or promotes intent without upgrading an already installed package. Update, reinstall, and force modes are the paths that repour roots.
 
 ## Execution boundary

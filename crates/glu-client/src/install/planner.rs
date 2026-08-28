@@ -31,6 +31,20 @@ pub struct RenameWorkItem {
     pub old_keg_path: PathBuf,
 }
 
+/// One Homebrew-style formula-installer expansion. Every dependency visited
+/// from this root is checked against the complete flattened requirement map
+/// recorded by this root's selected bottle, not the immediate parent's map.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct InstallerRootContext {
+    package: PackageId,
+}
+
+struct WorksetSelection<'a> {
+    selected: &'a mut BTreeSet<PackageId>,
+    satisfied: &'a mut BTreeSet<PackageId>,
+    rename: &'a mut BTreeSet<RenameWorkItem>,
+}
+
 /// How a command's requested roots and their dependency closure become
 /// install/satisfied work. One public planner boundary owns the modes; private
 /// passes may differ where command semantics genuinely require different
@@ -49,8 +63,9 @@ pub enum WorksetMode {
     Force,
     /// Named and bare `glu update`: update selected roots when their release
     /// or persisted package facts differ, but retain dependencies that still
-    /// satisfy the requiring package. Roots are inspected even when already
-    /// current so newly required or changed dependency topology is reconciled.
+    /// satisfy every active installer-root context. Roots are inspected even
+    /// when already current so newly required or changed dependency topology
+    /// is reconciled.
     UpdateRoots,
     /// `glu update --all`: inspect every package in the resolved declared-root
     /// closure and select every release or persisted package fact that differs
@@ -75,7 +90,8 @@ pub fn compute_workset(
         WorksetMode::Install => {
             let mut satisfied = BTreeSet::new();
             let mut rename = BTreeSet::new();
-            let mut direct_roots = Vec::new();
+            let mut selected = BTreeSet::new();
+            let mut context_roots = Vec::new();
 
             for root in &manifest.roots {
                 let root_id = &root.package;
@@ -95,62 +111,50 @@ pub fn compute_workset(
                             ..rename_item
                         });
                     }
-                    PackageMatch::Missing => direct_roots.push(root_id.clone()),
+                    PackageMatch::Missing => {
+                        selected.insert(root_id.clone());
+                        context_roots.push(root_id.clone());
+                    }
                 }
             }
 
-            let install =
-                graph::dependency_order(manifest, &direct_roots, |parent, dependency| {
-                    match dependency_match(parent, dependency, manifest, state)? {
-                        PackageMatch::Current => {
-                            satisfied.insert(dependency.package.clone());
-                            Ok(false)
-                        }
-                        PackageMatch::PreviousName(rename_item) => {
-                            rename.insert(RenameWorkItem {
-                                package: dependency.package.clone(),
-                                ..rename_item
-                            });
-                            Ok(false)
-                        }
-                        PackageMatch::Missing => Ok(true),
-                    }
-                })?;
+            expand_installer_contexts(
+                manifest,
+                state,
+                &context_roots,
+                &mut selected,
+                &mut satisfied,
+                &mut rename,
+            )?;
+            let install = graph::order_selected_packages(manifest, &selected)?;
 
             Ok(finalize_workset(satisfied, rename, install))
         }
         WorksetMode::Force => {
             // Roots repour unconditionally; the walk covers the full
-            // closure (all roots, not just absent ones) with real
-            // per-dependency satisfaction below them, so a dependency
+            // closure (all roots, not just absent ones) with contextual
+            // dependency satisfaction below them, so a dependency
             // introduced by the version bump is discovered rather than
             // silently missing.
             let mut satisfied = BTreeSet::new();
             let mut rename = BTreeSet::new();
             let roots = manifest.root_package_ids();
-            let install = graph::dependency_order(manifest, &roots, |parent, dependency| {
-                match dependency_match(parent, dependency, manifest, state)? {
-                    PackageMatch::Current => {
-                        satisfied.insert(dependency.package.clone());
-                        Ok(false)
-                    }
-                    PackageMatch::PreviousName(rename_item) => {
-                        rename.insert(RenameWorkItem {
-                            package: dependency.package.clone(),
-                            ..rename_item
-                        });
-                        Ok(false)
-                    }
-                    PackageMatch::Missing => Ok(true),
-                }
-            })?;
+            let mut selected = roots.iter().cloned().collect();
+            expand_installer_contexts(
+                manifest,
+                state,
+                &roots,
+                &mut selected,
+                &mut satisfied,
+                &mut rename,
+            )?;
+            let install = graph::order_selected_packages(manifest, &selected)?;
             Ok(finalize_workset(satisfied, rename, install))
         }
         WorksetMode::UpdateRoots => update_roots_workset(manifest, state),
         WorksetMode::UpdateAll => update_all_workset(manifest, state),
         WorksetMode::ReinstallDeps => {
-            let install =
-                graph::dependency_order(manifest, &manifest.root_package_ids(), |_, _| Ok(true))?;
+            let install = graph::dependency_closure_order(manifest, &manifest.root_package_ids())?;
             Ok(InstallWorkSet {
                 satisfied: vec![],
                 rename: Vec::new(),
@@ -167,7 +171,7 @@ fn update_roots_workset(
     let mut selected = BTreeSet::new();
     let mut satisfied = BTreeSet::new();
     let mut rename = BTreeSet::new();
-    let mut expanded = BTreeSet::new();
+    let context_roots = manifest.root_package_ids();
 
     for root in &manifest.roots {
         let package = manifest.require_package(&root.package)?;
@@ -179,61 +183,114 @@ fn update_roots_workset(
             &mut satisfied,
             &mut rename,
         )?;
-        select_required_dependencies(
-            &root.package,
-            manifest,
-            state,
-            &mut selected,
-            &mut satisfied,
-            &mut rename,
-            &mut expanded,
-        )?;
     }
 
+    expand_installer_contexts(
+        manifest,
+        state,
+        &context_roots,
+        &mut selected,
+        &mut satisfied,
+        &mut rename,
+    )?;
     let install = graph::order_selected_packages(manifest, &selected)?;
     Ok(finalize_workset(satisfied, rename, install))
 }
 
-fn select_required_dependencies(
-    package_id: &PackageId,
+/// Expands every active installer root with that root's own flattened
+/// requirement map. Packages selected for installation become installer
+/// roots in turn, matching Homebrew's nested `FormulaInstaller` behavior.
+///
+/// Selection is monotonic: if any context needs a package, another context
+/// cannot turn it back into satisfied work. Each context still walks through
+/// satisfied dependencies so their children are checked with the same root
+/// requirements (`Dependency::SKIP`, not `PRUNE`).
+fn expand_installer_contexts(
     manifest: &InstallManifest,
     state: &InstalledState,
+    initial_context_roots: &[PackageId],
     selected: &mut BTreeSet<PackageId>,
     satisfied: &mut BTreeSet<PackageId>,
     rename: &mut BTreeSet<RenameWorkItem>,
+) -> Result<()> {
+    let mut pending: BTreeSet<PackageId> = initial_context_roots.iter().cloned().collect();
+    pending.extend(selected.iter().cloned());
+    let mut completed = BTreeSet::new();
+
+    while let Some(context_root) = pending.iter().next().cloned() {
+        pending.remove(&context_root);
+        if !completed.insert(context_root.clone()) {
+            continue;
+        }
+
+        let context = InstallerRootContext {
+            package: context_root.clone(),
+        };
+        let mut expanded = BTreeSet::new();
+        let mut work = WorksetSelection {
+            selected: &mut *selected,
+            satisfied: &mut *satisfied,
+            rename: &mut *rename,
+        };
+        expand_dependency_topology(
+            &context_root,
+            &context,
+            manifest,
+            state,
+            &mut work,
+            &mut expanded,
+        )?;
+
+        pending.extend(
+            work.selected
+                .iter()
+                .filter(|package| !completed.contains(*package))
+                .cloned(),
+        );
+    }
+
+    Ok(())
+}
+
+fn expand_dependency_topology(
+    package_id: &PackageId,
+    context: &InstallerRootContext,
+    manifest: &InstallManifest,
+    state: &InstalledState,
+    work: &mut WorksetSelection<'_>,
     expanded: &mut BTreeSet<PackageId>,
 ) -> Result<()> {
     if !expanded.insert(package_id.clone()) {
         return Ok(());
     }
+
     let package = manifest.require_package(package_id)?;
     for dependency in &package.deps {
-        if selected.contains(&dependency.package) {
-            continue;
-        }
-        match dependency_match(package, dependency, manifest, state)? {
+        match dependency_match(context, dependency, manifest, state)? {
             PackageMatch::Current => {
-                satisfied.insert(dependency.package.clone());
+                work.satisfied.insert(dependency.package.clone());
             }
             PackageMatch::PreviousName(rename_item) => {
-                rename.insert(RenameWorkItem {
+                work.rename.insert(RenameWorkItem {
                     package: dependency.package.clone(),
                     ..rename_item
                 });
             }
             PackageMatch::Missing => {
-                selected.insert(dependency.package.clone());
-                select_required_dependencies(
-                    &dependency.package,
-                    manifest,
-                    state,
-                    selected,
-                    satisfied,
-                    rename,
-                    expanded,
-                )?;
+                work.selected.insert(dependency.package.clone());
             }
         }
+
+        // A satisfied dependency is skipped as install work, but its children
+        // remain part of this installer root's expansion.
+        expand_dependency_topology(
+            &dependency.package,
+            context,
+            manifest,
+            state,
+            work,
+            expanded,
+        )?;
     }
     Ok(())
 }
@@ -431,17 +488,19 @@ fn root_match(
 
 /// A dependency is satisfied by the selected package itself, or by another
 /// installed version of the same stable package identity that meets the
-/// requiring package's minimum version. If the satisfying package is still
-/// installed under a previous name, emit a rename anchor instead of treating
-/// the canonical package as committed.
+/// active installer root's minimum version. The lookup uses the dependency's
+/// exact stable key; aliases and old names are not requirement-map keys. If
+/// the satisfying package is still installed under a previous name, emit a
+/// rename anchor instead of treating the canonical package as committed.
 fn dependency_match(
-    requiring_package: &ResolvedPackage,
+    context: &InstallerRootContext,
     dependency: &PackageDependency,
     manifest: &InstallManifest,
     state: &InstalledState,
 ) -> Result<PackageMatch> {
     let selected_package = manifest.require_package(&dependency.package)?;
-    let minimum = requiring_package
+    let installer_root = manifest.require_package(&context.package)?;
+    let minimum = installer_root
         .dependency_requirements
         .get(&dependency.package_key);
 
@@ -753,6 +812,13 @@ mod tests {
 
     fn id(name: &str) -> PackageId {
         PackageId(format!("pkg:homebrew/core/{name}@1.0"))
+    }
+
+    fn minimum(version: &str) -> glu_core::MinimumVersion {
+        glu_core::MinimumVersion {
+            version: version.to_string(),
+            revision: Some(0),
+        }
     }
 
     fn installed_pkg(
@@ -1123,10 +1189,10 @@ mod tests {
         let app_id = id("app");
         manifest.packages.get_mut(&app_id).unwrap().deps[0].requested_as =
             glu_core::PackageSelector("foo".to_string());
-        let app = manifest.packages[&app_id].clone();
-        let dependency = app.deps[0].clone();
+        let dependency = manifest.packages[&app_id].deps[0].clone();
+        let context = InstallerRootContext { package: app_id };
 
-        let matched = dependency_match(&app, &dependency, &manifest, &state).unwrap();
+        let matched = dependency_match(&context, &dependency, &manifest, &state).unwrap();
 
         assert_eq!(matched, PackageMatch::Current);
     }
@@ -1185,6 +1251,158 @@ mod tests {
         );
         assert!(workset.satisfied.is_empty());
         assert!(workset.rename.is_empty());
+    }
+
+    #[test]
+    fn installer_root_floor_applies_through_a_satisfied_intermediate() {
+        let state = InstalledState::from_packages(vec![
+            installed_pkg("bridge", "1.0", vec![("leaf", "1.0")]),
+            installed_pkg("leaf", "1.0", vec![]),
+        ]);
+        let (leaf_id, leaf, leaf_artifact) = pkg_at("leaf", "2.0", vec![]);
+        let (bridge_id, mut bridge, bridge_artifact) = pkg("bridge", vec!["leaf"]);
+        bridge.deps[0].package = leaf_id.clone();
+        let (root_id, mut root, root_artifact) = pkg("root", vec!["bridge"]);
+        root.dependency_requirements.insert(
+            glu_core::PackageKey("package:leaf".to_string()),
+            minimum("2.0"),
+        );
+        let manifest = manifest_from_parts(
+            vec![
+                (leaf_id.clone(), leaf, leaf_artifact),
+                (bridge_id.clone(), bridge, bridge_artifact),
+                (root_id.clone(), root, root_artifact),
+            ],
+            vec![root_id.clone()],
+        );
+
+        let workset = compute_workset(&manifest, &state, WorksetMode::Install).unwrap();
+
+        assert_eq!(workset.install, vec![leaf_id, root_id]);
+        assert_eq!(workset.satisfied, vec![bridge_id]);
+    }
+
+    #[test]
+    fn selected_dependency_expands_again_with_its_own_requirement_context() {
+        let state = InstalledState::from_packages(vec![installed_pkg("leaf", "1.0", vec![])]);
+        let (leaf_id, leaf, leaf_artifact) = pkg_at("leaf", "2.0", vec![]);
+        let (bridge_id, mut bridge, bridge_artifact) = pkg("bridge", vec!["leaf"]);
+        bridge.deps[0].package = leaf_id.clone();
+        bridge.dependency_requirements.insert(
+            glu_core::PackageKey("package:leaf".to_string()),
+            minimum("2.0"),
+        );
+        let (root_id, mut root, root_artifact) = pkg("root", vec!["bridge"]);
+        root.dependency_requirements.insert(
+            glu_core::PackageKey("package:leaf".to_string()),
+            minimum("1.0"),
+        );
+        let manifest = manifest_from_parts(
+            vec![
+                (leaf_id.clone(), leaf, leaf_artifact),
+                (bridge_id.clone(), bridge, bridge_artifact),
+                (root_id.clone(), root, root_artifact),
+            ],
+            vec![root_id.clone()],
+        );
+
+        let workset = compute_workset(&manifest, &state, WorksetMode::Install).unwrap();
+
+        assert_eq!(workset.install, vec![leaf_id, bridge_id, root_id]);
+        assert!(workset.satisfied.is_empty());
+    }
+
+    #[test]
+    fn selected_concrete_dependency_self_satisfies_an_impossible_floor() {
+        let (leaf_id, leaf, leaf_artifact) = pkg_at("leaf", "2.0", vec![]);
+        let state = InstalledState::from_packages(vec![installed_pkg("leaf", "2.0", vec![])]);
+        let (root_id, mut root, root_artifact) = pkg("root", vec!["leaf"]);
+        root.deps[0].package = leaf_id.clone();
+        root.dependency_requirements.insert(
+            glu_core::PackageKey("package:leaf".to_string()),
+            minimum("99.0"),
+        );
+        let manifest = manifest_from_parts(
+            vec![
+                (leaf_id.clone(), leaf, leaf_artifact),
+                (root_id.clone(), root, root_artifact),
+            ],
+            vec![root_id.clone()],
+        );
+
+        let workset = compute_workset(&manifest, &state, WorksetMode::Install).unwrap();
+
+        assert_eq!(workset.install, vec![root_id]);
+        assert_eq!(workset.satisfied, vec![leaf_id]);
+    }
+
+    #[test]
+    fn requirement_context_does_not_guess_alias_keys() {
+        let (leaf_id, mut leaf, leaf_artifact) = pkg_at("leaf", "2.0", vec![]);
+        leaf.aliases = vec![glu_core::PackageSelector("legacy-leaf".to_string())];
+        let mut installed = installed_pkg("leaf", "1.0", vec![]);
+        installed.aliases = leaf.aliases.clone();
+        let state = InstalledState::from_packages(vec![installed]);
+        let (root_id, mut root, root_artifact) = pkg("root", vec!["leaf"]);
+        root.deps[0].package = leaf_id.clone();
+        root.dependency_requirements
+            .remove(&glu_core::PackageKey("package:leaf".to_string()));
+        root.dependency_requirements.insert(
+            glu_core::PackageKey("package:legacy-leaf".to_string()),
+            minimum("1.0"),
+        );
+        let manifest = manifest_from_parts(
+            vec![
+                (leaf_id.clone(), leaf, leaf_artifact),
+                (root_id.clone(), root, root_artifact),
+            ],
+            vec![root_id.clone()],
+        );
+
+        let workset = compute_workset(&manifest, &state, WorksetMode::Install).unwrap();
+
+        assert_eq!(workset.install, vec![leaf_id, root_id]);
+        assert!(workset.satisfied.is_empty());
+    }
+
+    #[test]
+    fn shared_contexts_keep_the_stricter_floor_independent_of_root_order() {
+        let state = InstalledState::from_packages(vec![
+            installed_pkg("bridge", "1.0", vec![("shared", "1.0")]),
+            installed_pkg("shared", "1.0", vec![]),
+        ]);
+        let (shared_id, shared, shared_artifact) = pkg_at("shared", "2.0", vec![]);
+        let (bridge_id, mut bridge, bridge_artifact) = pkg("bridge", vec!["shared"]);
+        bridge.deps[0].package = shared_id.clone();
+        let (first_id, mut first, first_artifact) = pkg("first", vec!["bridge"]);
+        first.dependency_requirements.insert(
+            glu_core::PackageKey("package:shared".to_string()),
+            minimum("1.0"),
+        );
+        let (second_id, mut second, second_artifact) = pkg("second", vec!["bridge"]);
+        second.dependency_requirements.insert(
+            glu_core::PackageKey("package:shared".to_string()),
+            minimum("2.0"),
+        );
+        let manifest = manifest_from_parts(
+            vec![
+                (shared_id.clone(), shared, shared_artifact),
+                (bridge_id.clone(), bridge, bridge_artifact),
+                (first_id.clone(), first, first_artifact),
+                (second_id.clone(), second, second_artifact),
+            ],
+            vec![first_id.clone(), second_id.clone()],
+        );
+        let mut reversed = manifest.clone();
+        reversed.roots.reverse();
+
+        let forward = compute_workset(&manifest, &state, WorksetMode::Install).unwrap();
+        let backward = compute_workset(&reversed, &state, WorksetMode::Install).unwrap();
+
+        assert_eq!(forward.install, vec![shared_id, first_id, second_id]);
+        assert_eq!(forward.satisfied, vec![bridge_id]);
+        assert_eq!(forward.install, backward.install);
+        assert_eq!(forward.satisfied, backward.satisfied);
     }
 
     #[test]
