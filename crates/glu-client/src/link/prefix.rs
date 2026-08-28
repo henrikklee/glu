@@ -183,7 +183,7 @@ fn write_receipt_at(
                 .iter()
                 .map(|dependency| dependency.requested_as.clone())
                 .collect(),
-            min_versions: package.min_versions.clone(),
+            dependency_requirements: package.dependency_requirements.clone(),
         },
     };
 
@@ -246,8 +246,8 @@ mod tests {
     use crate::bottle::prepare::PreparePhaseTimings;
     use crate::link::keg::link_keg;
     use glu_core::{
-        DependencyRequires, KegVersion, PackageId, PackageInstallMetadata, PackageName,
-        ResolvedArtifact, RuntimeDependencyRequirement,
+        KegVersion, PackageDependency, PackageId, PackageInstallMetadata, PackageName,
+        ResolvedArtifact,
     };
     use tempfile::TempDir;
 
@@ -260,8 +260,8 @@ mod tests {
             version: version.to_string(),
             revision: 0,
             keg_version: KegVersion(version.to_string()),
-            deps: Vec::<RuntimeDependencyRequirement>::new(),
-            min_versions: Default::default(),
+            deps: Vec::<PackageDependency>::new(),
+            dependency_requirements: Default::default(),
             artifact: ArtifactId(format!("art:test:{name}:{version}")),
             install: PackageInstallMetadata {
                 opt_names: Vec::new(),
@@ -358,25 +358,21 @@ mod tests {
         pkg.aliases = vec![glu_core::PackageSelector("vips7".to_string())];
         pkg.install.opt_names = vec![PackageName("vips-opt".to_string())];
         pkg.install.link_overwrite = vec!["bin/vips".to_string()];
-        pkg.deps = vec![RuntimeDependencyRequirement {
+        pkg.deps = vec![PackageDependency {
             package_key: glu_core::PackageKey("package:glib".to_string()),
             package: PackageId("pkg:homebrew/core/glib@2.0_1".to_string()),
             requested_as: glu_core::PackageSelector("glib".to_string()),
-            requires: DependencyRequires {
-                version: "2.0".to_string(),
-                revision: 1,
-            },
         }];
-        pkg.min_versions = std::collections::BTreeMap::from([
+        pkg.dependency_requirements = std::collections::BTreeMap::from([
             (
-                "glib".to_string(),
+                glu_core::PackageKey("package:glib".to_string()),
                 glu_core::MinimumVersion {
                     version: "2.0".to_string(),
                     revision: Some(1),
                 },
             ),
             (
-                "pcre2".to_string(),
+                glu_core::PackageKey("package:pcre2".to_string()),
                 glu_core::MinimumVersion {
                     version: "10.44".to_string(),
                     revision: None,
@@ -419,9 +415,19 @@ mod tests {
             receipt.install.deps,
             vec![glu_core::PackageSelector("glib".to_string())]
         );
-        assert_eq!(receipt.install.min_versions.len(), 2);
-        assert_eq!(receipt.install.min_versions["glib"].revision, Some(1));
-        assert_eq!(receipt.install.min_versions["pcre2"].revision, None);
+        assert_eq!(receipt.install.dependency_requirements.len(), 2);
+        assert_eq!(
+            receipt.install.dependency_requirements
+                [&glu_core::PackageKey("package:glib".to_string())]
+                .revision,
+            Some(1)
+        );
+        assert_eq!(
+            receipt.install.dependency_requirements
+                [&glu_core::PackageKey("package:pcre2".to_string())]
+                .revision,
+            None
+        );
 
         let json = serde_json::to_value(&receipt).unwrap();
         assert_eq!(json["install"]["deps"][0], "glib");

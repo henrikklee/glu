@@ -1042,7 +1042,9 @@ fn manifest_tree_children(
             version: dep_package.keg_version.0.clone(),
             children: Vec::new(),
             already_shown: false,
-            requires: crate::state::installed::format_requires(&dep.requires),
+            requires: crate::state::installed::format_minimum_version(
+                package.dependency_requirements.get(&dep.package_key),
+            ),
         };
         if seen.insert(dep.package_key.clone()) {
             child.children = manifest_tree_children(manifest, &dep.package, seen);
@@ -1096,7 +1098,9 @@ fn slim_tree_children(
             version: dep_package.keg_version.0.clone(),
             children: Vec::new(),
             already_shown: false,
-            requires: crate::state::installed::format_requires(&dep.requires),
+            requires: crate::state::installed::format_minimum_version(
+                package.dependency_requirements.get(&dep.package_key),
+            ),
         };
         if seen.insert(dep.package_key.clone()) {
             child.children = slim_tree_children(packages, &dep.package, seen);
@@ -1151,11 +1155,9 @@ fn uses_reverse_children(
     parents.sort_by_key(|parent| parent.name.0.to_lowercase());
     let mut children = Vec::new();
     for parent in parents {
-        let requires = parent
-            .deps
-            .iter()
-            .find(|dep| &dep.package_key == package_key)
-            .and_then(|dep| crate::state::installed::format_requires(&dep.requires));
+        let requires = crate::state::installed::format_minimum_version(
+            parent.dependency_requirements.get(package_key),
+        );
         let mut node = DependencyTreeNode {
             name: parent.name.0.clone(),
             version: parent.keg_version.0.clone(),
@@ -1218,8 +1220,8 @@ fn canonicalize_declaration_renames(
 mod declaration_rename_tests {
     use super::*;
     use glu_core::{
-        ArtifactId, DependencyRequires, InstallManifest, KegVersion, PackageInstallMetadata,
-        ResolveRequestEcho, ResolvedPackage, RuntimeDependencyRequirement, Target,
+        ArtifactId, InstallManifest, KegVersion, PackageDependency, PackageInstallMetadata,
+        ResolveRequestEcho, ResolvedPackage, Target,
     };
     use std::{collections::BTreeMap, path::PathBuf};
 
@@ -1236,7 +1238,7 @@ mod declaration_rename_tests {
                 revision: 0,
                 keg_version: KegVersion("1.1".to_string()),
                 deps: Vec::new(),
-                min_versions: Default::default(),
+                dependency_requirements: Default::default(),
                 artifact: ArtifactId("art:test".to_string()),
                 install: PackageInstallMetadata {
                     opt_names: Vec::new(),
@@ -1276,14 +1278,10 @@ mod declaration_rename_tests {
         rust.package_key = glu_core::PackageKey("package:rust".to_string());
         rust.name = PackageName("rust".to_string());
         rust.oldnames.clear();
-        rust.deps = vec![RuntimeDependencyRequirement {
+        rust.deps = vec![PackageDependency {
             package_key: glu_core::PackageKey("package:llvm".to_string()),
             package: llvm_id.clone(),
             requested_as: glu_core::PackageSelector("llvm@22".to_string()),
-            requires: DependencyRequires {
-                version: "22.1.8".to_string(),
-                revision: 0,
-            },
         }];
         let mut llvm = resolved_renamed_package().1;
         llvm.package_key = glu_core::PackageKey("package:llvm".to_string());
@@ -1790,13 +1788,35 @@ mod tree_tests {
     use super::*;
     use crate::state::installed::InstalledState;
     use glu_core::{
-        DependencyRequires, KegVersion, PackageId, PackageName, RuntimeDependencyRequirement,
-        SlimPackage, Target, UsesRequestEcho, UsesResponse,
+        KegVersion, PackageDependency, PackageId, PackageName, SlimPackage, Target,
+        UsesRequestEcho, UsesResponse,
     };
     use std::collections::BTreeMap;
 
-    fn slim(name: &str, version: &str, deps: Vec<(&str, &str)>) -> (PackageId, SlimPackage) {
+    fn slim(
+        name: &str,
+        version: &str,
+        dependencies: Vec<(&str, &str)>,
+    ) -> (PackageId, SlimPackage) {
         let id = PackageId(format!("pkg:test/{name}@{version}"));
+        let mut deps = Vec::new();
+        let mut dependency_requirements = BTreeMap::new();
+        for (requested_as, package_id) in dependencies {
+            let package_key = glu_core::PackageKey(format!("package:{requested_as}"));
+            deps.push(PackageDependency {
+                package_key: package_key.clone(),
+                package: PackageId(format!("pkg:test/{package_id}")),
+                requested_as: glu_core::PackageSelector(requested_as.to_string()),
+            });
+            dependency_requirements.insert(
+                package_key,
+                glu_core::MinimumVersion {
+                    version: "1.0".to_string(),
+                    revision: Some(0),
+                },
+            );
+        }
+
         (
             id.clone(),
             SlimPackage {
@@ -1807,18 +1827,8 @@ mod tree_tests {
                 version: version.to_string(),
                 revision: 0,
                 keg_version: KegVersion(version.to_string()),
-                deps: deps
-                    .into_iter()
-                    .map(|(dep_name, dep_id)| RuntimeDependencyRequirement {
-                        package_key: glu_core::PackageKey(format!("package:{dep_name}")),
-                        package: PackageId(format!("pkg:test/{dep_id}")),
-                        requested_as: glu_core::PackageSelector(dep_name.to_string()),
-                        requires: DependencyRequires {
-                            version: "1.0".to_string(),
-                            revision: 0,
-                        },
-                    })
-                    .collect(),
+                deps,
+                dependency_requirements,
             },
         )
     }
@@ -1971,16 +1981,13 @@ mod tree_tests {
             linked: true,
             deps: deps
                 .into_iter()
-                .map(|dep| RuntimeDependencyRequirement {
+                .map(|dep| PackageDependency {
                     package_key: glu_core::PackageKey(format!("package:{dep}")),
                     package: glu_core::PackageId(format!("pkg:test/{dep}@1.0")),
                     requested_as: glu_core::PackageSelector(dep.to_string()),
-                    requires: DependencyRequires {
-                        version: "1.0".to_string(),
-                        revision: 0,
-                    },
                 })
                 .collect(),
+            dependency_requirements: Default::default(),
             download_bytes: None,
             installed_bytes: None,
         }
@@ -2001,8 +2008,8 @@ mod interrupted_install_tests {
     };
     use flate2::{write::GzEncoder, Compression};
     use glu_core::{
-        ArtifactId, DependencyRequires, InstallManifest, KegVersion, PackageInstallMetadata,
-        Prefix, ResolvedArtifact, ResolvedPackage, RuntimeDependencyRequirement, Target,
+        ArtifactId, InstallManifest, KegVersion, PackageDependency, PackageInstallMetadata, Prefix,
+        ResolvedArtifact, ResolvedPackage, Target,
     };
     use std::collections::BTreeMap;
     use tempfile::TempDir;
@@ -2520,14 +2527,10 @@ mod interrupted_install_tests {
             package(
                 "app",
                 app_artifact.0.clone(),
-                vec![RuntimeDependencyRequirement {
+                vec![PackageDependency {
                     package_key: glu_core::PackageKey("package:bar".to_string()),
                     package: bar_id,
                     requested_as: glu_core::PackageSelector("bar".to_string()),
-                    requires: DependencyRequires {
-                        version: "1.0".to_string(),
-                        revision: 0,
-                    },
                 }],
             ),
         );
@@ -2587,7 +2590,7 @@ mod interrupted_install_tests {
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: Vec::new(),
-                min_versions: Default::default(),
+                dependency_requirements: Default::default(),
             },
         };
         InstalledStateStore::write_receipt_at_keg(&keg, &receipt).unwrap();
@@ -2608,14 +2611,10 @@ mod interrupted_install_tests {
             package(
                 "app",
                 app_artifact.0.clone(),
-                vec![RuntimeDependencyRequirement {
+                vec![PackageDependency {
                     package_key: glu_core::PackageKey("package:dep".to_string()),
                     package: dep_id,
                     requested_as: glu_core::PackageSelector("dep".to_string()),
-                    requires: DependencyRequires {
-                        version: "1.0".to_string(),
-                        revision: 0,
-                    },
                 }],
             ),
         );
@@ -2639,11 +2638,20 @@ mod interrupted_install_tests {
         }
     }
 
-    fn package(
-        name: &str,
-        artifact: ArtifactId,
-        deps: Vec<RuntimeDependencyRequirement>,
-    ) -> ResolvedPackage {
+    fn package(name: &str, artifact: ArtifactId, deps: Vec<PackageDependency>) -> ResolvedPackage {
+        let dependency_requirements = deps
+            .iter()
+            .map(|dependency| {
+                (
+                    dependency.package_key.clone(),
+                    glu_core::MinimumVersion {
+                        version: "1.0".to_string(),
+                        revision: Some(0),
+                    },
+                )
+            })
+            .collect();
+
         ResolvedPackage {
             package_key: glu_core::PackageKey(format!("package:{name}")),
             name: PackageName(name.to_string()),
@@ -2653,7 +2661,7 @@ mod interrupted_install_tests {
             revision: 0,
             keg_version: KegVersion("1.0".to_string()),
             deps,
-            min_versions: Default::default(),
+            dependency_requirements,
             artifact,
             install: PackageInstallMetadata {
                 opt_names: Vec::new(),

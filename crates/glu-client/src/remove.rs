@@ -459,7 +459,7 @@ mod tests {
         GluInstallReceipt, ReceiptArtifact, ReceiptInstall, ReceiptPackage, ReceiptPaths,
         ReceiptStatus,
     };
-    use glu_core::{ArtifactId, DependencyRequires, RuntimeDependencyRequirement};
+    use glu_core::{ArtifactId, PackageDependency};
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -491,16 +491,13 @@ mod tests {
             linked: true,
             deps: deps
                 .into_iter()
-                .map(|(dep_name, dep_id)| RuntimeDependencyRequirement {
+                .map(|(dep_name, dep_id)| PackageDependency {
                     package_key: glu_core::PackageKey(format!("package:{dep_name}")),
                     package: PackageId(dep_id.to_string()),
                     requested_as: glu_core::PackageSelector(dep_name.to_string()),
-                    requires: DependencyRequires {
-                        version: "1.0".to_string(),
-                        revision: 0,
-                    },
                 })
                 .collect(),
+            dependency_requirements: Default::default(),
             download_bytes: None,
             installed_bytes: None,
         }
@@ -519,7 +516,7 @@ mod tests {
         version: &str,
         revision: u32,
         declared: bool,
-        deps: Vec<(&str, &str)>,
+        dependencies: Vec<&str>,
     ) {
         let keg_version = if revision == 0 {
             version.to_string()
@@ -559,22 +556,11 @@ mod tests {
                 keg_only: false,
                 linked: false,
                 link_overwrite: Vec::new(),
-                deps: deps
-                    .iter()
-                    .map(|(dep_name, _)| glu_core::PackageSelector((*dep_name).to_string()))
-                    .collect(),
-                min_versions: deps
+                deps: dependencies
                     .into_iter()
-                    .map(|(dep_name, _)| {
-                        (
-                            dep_name.to_string(),
-                            glu_core::MinimumVersion {
-                                version: "1.0".to_string(),
-                                revision: Some(0),
-                            },
-                        )
-                    })
+                    .map(|dependency| glu_core::PackageSelector(dependency.to_string()))
                     .collect(),
+                dependency_requirements: Default::default(),
             },
         };
         fs::write(
@@ -811,14 +797,7 @@ mod tests {
     fn execute_removal_demotes_kept_and_removes_rest() {
         let tmp = TempDir::new().unwrap();
         let prefix = Prefix(tmp.path().to_path_buf());
-        write_fixture_receipt(
-            &prefix,
-            "vips",
-            "8.19.0",
-            0,
-            true,
-            vec![("glib", "pkg:glib@2.0")],
-        );
+        write_fixture_receipt(&prefix, "vips", "8.19.0", 0, true, vec!["glib"]);
         write_fixture_receipt(&prefix, "glib", "2.0", 0, false, vec![]);
         write_fixture_receipt(&prefix, "pcre2", "1.0", 0, false, vec![]);
         mark_deactivated(&prefix, &["vips", "glib", "pcre2"]);
@@ -843,14 +822,7 @@ mod tests {
 
         // glib declared, vips declared needs glib. `rm glib` keeps glib
         // installed because vips still needs it.
-        write_fixture_receipt(
-            &prefix,
-            "vips",
-            "8.19.0",
-            0,
-            true,
-            vec![("glib", "pkg:glib@2.0")],
-        );
+        write_fixture_receipt(&prefix, "vips", "8.19.0", 0, true, vec!["glib"]);
         write_fixture_receipt(&prefix, "glib", "2.0", 0, true, vec![]);
         mark_deactivated(&prefix, &["glib"]);
 
@@ -882,14 +854,7 @@ mod tests {
     fn plan_autoremove_returns_only_dangling_packages() {
         let tmp = TempDir::new().unwrap();
         let prefix = Prefix(tmp.path().to_path_buf());
-        write_fixture_receipt(
-            &prefix,
-            "vips",
-            "1.0",
-            0,
-            true,
-            vec![("glib", "pkg:glib@2.0")],
-        );
+        write_fixture_receipt(&prefix, "vips", "1.0", 0, true, vec!["glib"]);
         write_fixture_receipt(&prefix, "glib", "2.0", 0, false, vec![]);
         // foo is not declared and not reachable from vips — dangling.
         write_fixture_receipt(&prefix, "foo", "1.0", 0, false, vec![]);
@@ -904,14 +869,7 @@ mod tests {
     fn execute_autoremove_removes_only_the_dangling_kegs() {
         let tmp = TempDir::new().unwrap();
         let prefix = Prefix(tmp.path().to_path_buf());
-        write_fixture_receipt(
-            &prefix,
-            "vips",
-            "1.0",
-            0,
-            true,
-            vec![("glib", "pkg:glib@2.0")],
-        );
+        write_fixture_receipt(&prefix, "vips", "1.0", 0, true, vec!["glib"]);
         write_fixture_receipt(&prefix, "glib", "2.0", 0, false, vec![]);
         write_fixture_receipt(&prefix, "foo", "1.0", 0, false, vec![]);
         mark_deactivated(&prefix, &["foo", "vips"]);

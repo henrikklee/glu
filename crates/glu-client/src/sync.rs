@@ -53,6 +53,7 @@ pub(crate) fn simulate_post_install_state(
             keg_only: package.install.keg_only,
             linked: false,
             deps: package.deps.clone(),
+            dependency_requirements: package.dependency_requirements.clone(),
             download_bytes: manifest
                 .artifacts
                 .get(&package.artifact)
@@ -133,9 +134,8 @@ pub(crate) fn confirmed_final_dangling(
 mod tests {
     use super::*;
     use glu_core::{
-        ArtifactId, DependencyRequires, InstallManifest, KegVersion, PackageId,
-        PackageInstallMetadata, ResolveRequestEcho, ResolvedPackage, RuntimeDependencyRequirement,
-        Target,
+        ArtifactId, InstallManifest, KegVersion, PackageDependency, PackageId,
+        PackageInstallMetadata, ResolveRequestEcho, ResolvedPackage, Target,
     };
     use std::{collections::BTreeMap, path::PathBuf};
 
@@ -155,16 +155,13 @@ mod tests {
             linked: true,
             deps: deps
                 .into_iter()
-                .map(|dep| RuntimeDependencyRequirement {
+                .map(|dep| PackageDependency {
                     package_key: glu_core::PackageKey(format!("package:{dep}")),
                     package: PackageId(format!("pkg:test/{dep}@1.0")),
                     requested_as: glu_core::PackageSelector(dep.to_string()),
-                    requires: DependencyRequires {
-                        version: "1.0".to_string(),
-                        revision: 0,
-                    },
                 })
                 .collect(),
+            dependency_requirements: Default::default(),
             download_bytes: None,
             installed_bytes: None,
         }
@@ -184,17 +181,13 @@ mod tests {
                 keg_version: KegVersion("2.0".to_string()),
                 deps: deps
                     .into_iter()
-                    .map(|dep| RuntimeDependencyRequirement {
+                    .map(|dep| PackageDependency {
                         package_key: glu_core::PackageKey(format!("package:{dep}")),
                         package: PackageId(format!("pkg:test/{dep}@1.0")),
                         requested_as: glu_core::PackageSelector(dep.to_string()),
-                        requires: DependencyRequires {
-                            version: "1.0".to_string(),
-                            revision: 0,
-                        },
                     })
                     .collect(),
-                min_versions: Default::default(),
+                dependency_requirements: Default::default(),
                 artifact: ArtifactId(format!("artifact:{name}")),
                 install: PackageInstallMetadata {
                     opt_names: Vec::new(),

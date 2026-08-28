@@ -614,7 +614,7 @@ mod tests {
     use super::*;
     use crate::events::{RecordedExecutionEvent, RecordingExecutionEvents};
     use glu_core::{
-        ArtifactId, KegVersion, PackageInstallMetadata, PackageName, RuntimeDependencyRequirement,
+        ArtifactId, KegVersion, PackageDependency, PackageInstallMetadata, PackageName,
     };
 
     fn package() -> ResolvedPackage {
@@ -626,8 +626,8 @@ mod tests {
             version: "1.0".to_string(),
             revision: 0,
             keg_version: KegVersion("1.0".to_string()),
-            deps: Vec::<RuntimeDependencyRequirement>::new(),
-            min_versions: Default::default(),
+            deps: Vec::<PackageDependency>::new(),
+            dependency_requirements: Default::default(),
             artifact: ArtifactId("art:test:fixture".to_string()),
             install: PackageInstallMetadata {
                 opt_names: Vec::new(),

@@ -868,7 +868,7 @@ mod tests {
                 revision: 0,
                 keg_version: KegVersion("1.1".to_string()),
                 deps: Vec::new(),
-                min_versions: Default::default(),
+                dependency_requirements: Default::default(),
                 artifact: ArtifactId("art:test".to_string()),
                 install: PackageInstallMetadata {
                     opt_names: Vec::new(),
@@ -922,7 +922,7 @@ mod tests {
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: Vec::new(),
-                min_versions: Default::default(),
+                dependency_requirements: Default::default(),
             },
         };
         InstalledStateStore::new(prefix.clone())
@@ -1005,7 +1005,7 @@ mod tests {
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: Vec::new(),
-                min_versions: Default::default(),
+                dependency_requirements: Default::default(),
             },
         };
         InstalledStateStore::new(prefix.clone())

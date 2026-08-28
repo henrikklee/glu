@@ -131,7 +131,7 @@ mod tests {
                     revision: 0,
                     keg_version: KegVersion(version.to_string()),
                     deps: vec![],
-                    min_versions: Default::default(),
+                    dependency_requirements: Default::default(),
                     artifact: artifact_id.clone(),
                     install: PackageInstallMetadata {
                         opt_names: Vec::new(),

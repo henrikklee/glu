@@ -80,16 +80,13 @@ pub struct ReceiptInstall {
     pub linked: bool,
     /// Link overwrite patterns from the resolved package metadata. These are
     /// required to reconstruct activation locally without resolving online.
-    #[serde(default)]
     pub link_overwrite: Vec<String>,
     /// Exact direct dependency spellings from the resolved package. Provider
     /// identity is deliberately not persisted on the dependent's receipt.
-    #[serde(default)]
     pub deps: Vec<PackageSelector>,
     /// This installed package's complete flattened minimum-version map.
     /// It is separate from direct graph topology.
-    #[serde(default)]
-    pub min_versions: BTreeMap<String, MinimumVersion>,
+    pub dependency_requirements: BTreeMap<PackageKey, MinimumVersion>,
 }
 
 impl GluInstallReceipt {
@@ -111,6 +108,7 @@ impl GluInstallReceipt {
             // set by InstalledStateStore. One receipt alone only knows the
             // exact dependency spellings it persisted.
             deps: Vec::new(),
+            dependency_requirements: self.install.dependency_requirements.clone(),
             download_bytes: self.sizes.download_bytes,
             installed_bytes: self.sizes.installed_bytes,
         }
@@ -135,17 +133,23 @@ pub(super) fn receipt_path_for_keg(keg_path: &Path) -> PathBuf {
 }
 
 pub(super) fn read_receipt_file(path: &Path) -> Result<GluInstallReceipt> {
+    #[derive(Deserialize)]
+    struct ReceiptSchema {
+        schema: String,
+    }
+
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let receipt: GluInstallReceipt =
+    let receipt_schema: ReceiptSchema =
         serde_json::from_slice(&bytes).with_context(|| format!("decoding {}", path.display()))?;
-    if receipt.schema != "glu.install-receipt.v1" {
+    if receipt_schema.schema != "glu.install-receipt.v1" {
         anyhow::bail!(
             "unsupported install receipt schema {} in {}; reinstall this prefix with the current glu client",
-            receipt.schema,
+            receipt_schema.schema,
             path.display()
         );
     }
-    Ok(receipt)
+
+    serde_json::from_slice(&bytes).with_context(|| format!("decoding {}", path.display()))
 }
 
 pub(super) fn write_receipt_file(path: &Path, receipt: &GluInstallReceipt) -> Result<()> {
@@ -189,16 +193,16 @@ mod tests {
             linked: true,
             link_overwrite: Vec::new(),
             deps: vec![PackageSelector("llvm@22".to_string())],
-            min_versions: BTreeMap::from([
+            dependency_requirements: BTreeMap::from([
                 (
-                    "llvm".to_string(),
+                    PackageKey("package:llvm".to_string()),
                     MinimumVersion {
                         version: "22.1.0".to_string(),
                         revision: Some(2),
                     },
                 ),
                 (
-                    "zstd".to_string(),
+                    PackageKey("package:zstd".to_string()),
                     MinimumVersion {
                         version: "1.5.7".to_string(),
                         revision: None,
@@ -211,13 +215,18 @@ mod tests {
         let decoded: ReceiptInstall = serde_json::from_value(json.clone()).unwrap();
 
         assert_eq!(decoded.deps, vec![PackageSelector("llvm@22".to_string())]);
-        assert_eq!(decoded.min_versions["llvm"].revision, Some(2));
-        assert_eq!(decoded.min_versions["zstd"].revision, None);
-        assert_eq!(json["deps"][0], "llvm@22");
         assert_eq!(
-            json["min_versions"]["zstd"]["revision"],
-            serde_json::Value::Null
+            decoded.dependency_requirements[&PackageKey("package:llvm".to_string())].revision,
+            Some(2)
         );
+        assert_eq!(
+            decoded.dependency_requirements[&PackageKey("package:zstd".to_string())].revision,
+            None
+        );
+        assert_eq!(json["deps"][0], "llvm@22");
+        assert!(json["dependency_requirements"]["package:zstd"]
+            .get("revision")
+            .is_none());
     }
 
     #[test]
@@ -285,7 +294,10 @@ mod tests {
             "links": { "opt_names": [] },
             "install": {
                 "keg_only": false,
-                "linked": true
+                "linked": true,
+                "link_overwrite": [],
+                "deps": [],
+                "dependency_requirements": {}
             }
         }"#;
 

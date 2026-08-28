@@ -72,7 +72,7 @@ Each complete installed keg has a package-local `glu.install-receipt.v1` receipt
 - the concrete `PackageId` and stable `PackageKey`;
 - the canonical display name, selector aliases, and old names;
 - artifact provenance;
-- direct dependency edges with `requested_as`, `package_key`, concrete package ID, and requirement floor;
+- exact direct dependency selectors and the package's separate, flattened `dependency_requirements` map;
 - keg and opt paths;
 - required filesystem `links.opt_names`;
 - link policy, linked state, and completion status.
@@ -81,7 +81,7 @@ Selector aliases and filesystem opt-link names are independent facts. An alias c
 
 Only complete receipts count as installed. Incomplete receipts are ignored by state reads and cleaned before mutating commands plan work. Unsupported receipt schemas fail closed; there is no compatibility or migration path for pre-release receipt shapes.
 
-Receipts do not decide why a package is installed. `glu.json` decides user intent; package-key dependency edges decide reachability.
+Receipts do not decide why a package is installed. `glu.json` decides user intent. Installed state resolves receipt selectors against the complete installed package set, then traverses the resulting package-key graph for reachability.
 
 ## Declared, automatic, and dangling
 
@@ -99,7 +99,7 @@ Sync reconciles three inputs:
 - complete local receipts;
 - the registry-resolved closure.
 
-Registry data describes prospective truth. Receipts describe installed truth. They remain separate authorities but use the same package identity and dependency-edge model.
+Registry data describes prospective truth. Receipts describe installed truth. They remain separate authorities: registry dependencies bind selected package identities, while receipts retain selectors and rebuild provider bindings from the packages currently installed.
 
 It installs missing packages, keeps packages still required by the closure, updates or repours when the command mode asks for that, and removes confirmed dangling packages.
 

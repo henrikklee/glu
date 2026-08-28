@@ -732,7 +732,7 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         group: CommandGroup::Query,
         aliases: &[],
         summary: "Show what a package depends on",
-        default_behavior: "Shows dependency names only. Uses installed receipts when available unless --online is used; --verbose adds installed versions and tree-edge requirements.",
+        default_behavior: "Shows dependency names only. Uses installed receipts when available unless --online is used; --verbose adds installed versions and package-level minimum requirements.",
         arguments: PACKAGE_NAME_ARGUMENTS,
         mutates: false,
         default_scope: None,

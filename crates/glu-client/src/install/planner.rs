@@ -4,8 +4,7 @@ use crate::{
 };
 use anyhow::{bail, Result};
 use glu_core::{
-    InstallManifest, InstalledPackage, PackageId, PackageName, ResolvedPackage,
-    RuntimeDependencyRequirement,
+    InstallManifest, InstalledPackage, PackageDependency, PackageId, PackageName, ResolvedPackage,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -96,28 +95,25 @@ pub fn compute_workset(
                 }
             }
 
-            let install = graph::dependency_order(manifest, &direct_roots, |dep| {
-                match dependency_match(dep, manifest, state)? {
-                    PackageMatch::Current => {
-                        satisfied.insert(dep.package.clone());
-                        Ok(false)
+            let install =
+                graph::dependency_order(manifest, &direct_roots, |parent, dependency| {
+                    match dependency_match(parent, dependency, manifest, state)? {
+                        PackageMatch::Current => {
+                            satisfied.insert(dependency.package.clone());
+                            Ok(false)
+                        }
+                        PackageMatch::PreviousName(rename_item) => {
+                            rename.insert(RenameWorkItem {
+                                package: dependency.package.clone(),
+                                ..rename_item
+                            });
+                            Ok(false)
+                        }
+                        PackageMatch::Missing => Ok(true),
                     }
-                    PackageMatch::PreviousName(rename_item) => {
-                        rename.insert(RenameWorkItem {
-                            package: dep.package.clone(),
-                            ..rename_item
-                        });
-                        Ok(false)
-                    }
-                    PackageMatch::Missing => Ok(true),
-                }
-            })?;
+                })?;
 
-            Ok(InstallWorkSet {
-                satisfied: satisfied.into_iter().collect(),
-                rename: rename.into_iter().collect(),
-                install,
-            })
+            Ok(finalize_workset(satisfied, rename, install))
         }
         WorksetMode::Force => {
             // Roots repour unconditionally; the walk covers the full
@@ -128,38 +124,48 @@ pub fn compute_workset(
             let mut satisfied = BTreeSet::new();
             let mut rename = BTreeSet::new();
             let roots = manifest.root_package_ids();
-            let install =
-                graph::dependency_order(manifest, &roots, |dep| {
-                    match dependency_match(dep, manifest, state)? {
-                        PackageMatch::Current => {
-                            satisfied.insert(dep.package.clone());
-                            Ok(false)
-                        }
-                        PackageMatch::PreviousName(rename_item) => {
-                            rename.insert(RenameWorkItem {
-                                package: dep.package.clone(),
-                                ..rename_item
-                            });
-                            Ok(false)
-                        }
-                        PackageMatch::Missing => Ok(true),
+            let install = graph::dependency_order(manifest, &roots, |parent, dependency| {
+                match dependency_match(parent, dependency, manifest, state)? {
+                    PackageMatch::Current => {
+                        satisfied.insert(dependency.package.clone());
+                        Ok(false)
                     }
-                })?;
-            Ok(InstallWorkSet {
-                satisfied: satisfied.into_iter().collect(),
-                rename: rename.into_iter().collect(),
-                install,
-            })
+                    PackageMatch::PreviousName(rename_item) => {
+                        rename.insert(RenameWorkItem {
+                            package: dependency.package.clone(),
+                            ..rename_item
+                        });
+                        Ok(false)
+                    }
+                    PackageMatch::Missing => Ok(true),
+                }
+            })?;
+            Ok(finalize_workset(satisfied, rename, install))
         }
         WorksetMode::ReinstallDeps => {
             let install =
-                graph::dependency_order(manifest, &manifest.root_package_ids(), |_| Ok(true))?;
+                graph::dependency_order(manifest, &manifest.root_package_ids(), |_, _| Ok(true))?;
             Ok(InstallWorkSet {
                 satisfied: vec![],
                 rename: Vec::new(),
                 install,
             })
         }
+    }
+}
+
+fn finalize_workset(
+    mut satisfied: BTreeSet<PackageId>,
+    mut rename: BTreeSet<RenameWorkItem>,
+    install: Vec<PackageId>,
+) -> InstallWorkSet {
+    let installing: BTreeSet<_> = install.iter().cloned().collect();
+    satisfied.retain(|package| !installing.contains(package));
+    rename.retain(|item| !installing.contains(&item.package));
+    InstallWorkSet {
+        satisfied: satisfied.into_iter().collect(),
+        rename: rename.into_iter().collect(),
+        install,
     }
 }
 
@@ -208,30 +214,35 @@ fn root_match(
     previous_name_match(package_id, package, state, |_| true)
 }
 
-/// A dependency is satisfied when the installed keg is at or above the
-/// built-against floor (`requires`, from the parent bottle's tab); otherwise
-/// the resolved candidate is installed. If the satisfying package is installed
-/// under a previous name from the current resolve metadata, the planner emits
-/// a rename anchor rather than pretending the canonical package is committed.
+/// A dependency is satisfied by the selected package itself, or by another
+/// installed version of the same stable package identity that meets the
+/// requiring package's minimum version. If the satisfying package is still
+/// installed under a previous name, emit a rename anchor instead of treating
+/// the canonical package as committed.
 fn dependency_match(
-    dep: &RuntimeDependencyRequirement,
+    requiring_package: &ResolvedPackage,
+    dependency: &PackageDependency,
     manifest: &InstallManifest,
     state: &InstalledState,
 ) -> Result<PackageMatch> {
-    if let Some(installed) = state.find_by_key(&dep.package_key) {
-        return Ok(
-            if requirement_satisfied(&installed.version, installed.revision, dep) {
-                PackageMatch::Current
-            } else {
-                PackageMatch::Missing
-            },
-        );
+    let selected_package = manifest.require_package(&dependency.package)?;
+    let minimum = requiring_package
+        .dependency_requirements
+        .get(&dependency.package_key);
+
+    let satisfies = |installed: &InstalledPackage| {
+        dependency_requirement_satisfied(installed, &dependency.package, minimum)
+    };
+
+    if let Some(installed) = state.find_by_key(&dependency.package_key) {
+        return Ok(if satisfies(installed) {
+            PackageMatch::Current
+        } else {
+            PackageMatch::Missing
+        });
     }
 
-    let package = manifest.require_package(&dep.package)?;
-    previous_name_match(&dep.package, package, state, |installed| {
-        requirement_satisfied(&installed.version, installed.revision, dep)
-    })
+    previous_name_match(&dependency.package, selected_package, state, satisfies)
 }
 
 fn previous_name_match(
@@ -277,29 +288,25 @@ fn previous_name_match(
     }
 }
 
-/// Test/helper compatibility wrapper for the public satisfaction predicate.
-#[cfg(test)]
-fn dependency_satisfied(
-    dep: &RuntimeDependencyRequirement,
-    state: &InstalledState,
-) -> Result<bool> {
-    let Some(installed) = state.find_by_key(&dep.package_key) else {
-        return Ok(false);
+fn dependency_requirement_satisfied(
+    installed: &InstalledPackage,
+    selected_package: &PackageId,
+    minimum: Option<&glu_core::MinimumVersion>,
+) -> bool {
+    if &installed.id == selected_package {
+        return true;
+    }
+
+    let Some(minimum) = minimum else {
+        return false;
     };
-
-    Ok(requirement_satisfied(
-        &installed.version,
-        installed.revision,
-        dep,
-    ))
-}
-
-/// The installed version/revision must be at or above the built-against floor
-/// (`requires`) recorded on the dependency edge.
-fn requirement_satisfied(version: &str, revision: u32, dep: &RuntimeDependencyRequirement) -> bool {
-    compare_versions(version, &dep.requires.version)
-        .then(revision.cmp(&dep.requires.revision))
-        .is_ge()
+    match compare_versions(&installed.version, &minimum.version) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => minimum
+            .revision
+            .is_none_or(|revision| installed.revision >= revision),
+    }
 }
 
 pub fn validate_manifest(manifest: &InstallManifest) -> Result<()> {
@@ -393,9 +400,8 @@ mod tests {
     use super::*;
     use crate::state::store::InstalledStateStore;
     use glu_core::{
-        ArtifactId, DependencyRequires, KegVersion, PackageInstallMetadata, PackageName,
-        ResolveRequestEcho, ResolvedArtifact, ResolvedPackage, RuntimeDependencyRequirement,
-        Target,
+        ArtifactId, KegVersion, PackageDependency, PackageInstallMetadata, PackageName,
+        ResolveRequestEcho, ResolvedArtifact, ResolvedPackage, Target,
     };
     use std::collections::BTreeMap;
 
@@ -410,18 +416,25 @@ mod tests {
             revision: 0,
             keg_version: KegVersion("1.0".to_string()),
             deps: deps
-                .into_iter()
-                .map(|dep| RuntimeDependencyRequirement {
+                .iter()
+                .map(|dep| PackageDependency {
                     package_key: glu_core::PackageKey(format!("package:{dep}")),
                     package: PackageId(format!("pkg:homebrew/core/{dep}@1.0")),
-                    requested_as: glu_core::PackageSelector(dep.to_string()),
-                    requires: DependencyRequires {
-                        version: "1.0".to_string(),
-                        revision: 0,
-                    },
+                    requested_as: glu_core::PackageSelector((*dep).to_string()),
                 })
                 .collect(),
-            min_versions: Default::default(),
+            dependency_requirements: deps
+                .into_iter()
+                .map(|dep| {
+                    (
+                        glu_core::PackageKey(format!("package:{dep}")),
+                        glu_core::MinimumVersion {
+                            version: "1.0".to_string(),
+                            revision: Some(0),
+                        },
+                    )
+                })
+                .collect(),
             artifact: ArtifactId(format!("art:sha256:{name}")),
             install: PackageInstallMetadata {
                 opt_names: Vec::new(),
@@ -519,8 +532,29 @@ mod tests {
         PackageId(format!("pkg:homebrew/core/{name}@1.0"))
     }
 
-    /// `deps`: (dep_name, dep_requires_version).
-    fn installed_pkg(name: &str, version: &str, deps: Vec<(&str, &str)>) -> InstalledPackage {
+    fn installed_pkg(
+        name: &str,
+        version: &str,
+        dependencies: Vec<(&str, &str)>,
+    ) -> InstalledPackage {
+        let mut deps = Vec::new();
+        let mut dependency_requirements = BTreeMap::new();
+        for (dependency, minimum_version) in dependencies {
+            let package_key = glu_core::PackageKey(format!("package:{dependency}"));
+            deps.push(PackageDependency {
+                package_key: package_key.clone(),
+                package: id(dependency),
+                requested_as: glu_core::PackageSelector(dependency.to_string()),
+            });
+            dependency_requirements.insert(
+                package_key,
+                glu_core::MinimumVersion {
+                    version: minimum_version.to_string(),
+                    revision: Some(0),
+                },
+            );
+        }
+
         InstalledPackage {
             id: PackageId(format!("pkg:homebrew/core/{name}@{version}")),
             package_key: glu_core::PackageKey(format!("package:{name}")),
@@ -534,20 +568,8 @@ mod tests {
             opt_path: std::path::PathBuf::from(format!("/prefix/opt/{name}")),
             keg_only: false,
             linked: true,
-            deps: deps
-                .into_iter()
-                .map(
-                    |(dep_name, dep_requires_version)| RuntimeDependencyRequirement {
-                        package_key: glu_core::PackageKey(format!("package:{dep_name}")),
-                        package: id(dep_name),
-                        requested_as: glu_core::PackageSelector(dep_name.to_string()),
-                        requires: DependencyRequires {
-                            version: dep_requires_version.to_string(),
-                            revision: 0,
-                        },
-                    },
-                )
-                .collect(),
+            deps,
+            dependency_requirements,
             download_bytes: None,
             installed_bytes: None,
         }
@@ -624,7 +646,7 @@ mod tests {
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: vec![],
-                min_versions: Default::default(),
+                dependency_requirements: Default::default(),
             },
         };
         std::fs::write(
@@ -696,7 +718,7 @@ mod tests {
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: vec![],
-                min_versions: Default::default(),
+                dependency_requirements: Default::default(),
             },
         };
         std::fs::write(
@@ -764,7 +786,7 @@ mod tests {
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: vec![],
-                min_versions: Default::default(),
+                dependency_requirements: Default::default(),
             },
         };
         std::fs::write(
@@ -867,21 +889,20 @@ mod tests {
     }
 
     #[test]
-    fn dep_is_satisfied_through_installed_oldname_index() {
+    fn dependency_match_uses_stable_package_identity_for_alias_selectors() {
         let mut installed = installed_pkg("bar", "1.0", vec![]);
         installed.aliases = vec![glu_core::PackageSelector("foo".to_string())];
         let state = InstalledState::from_packages(vec![installed]);
-        let dep = RuntimeDependencyRequirement {
-            package_key: glu_core::PackageKey("package:bar".to_string()),
-            package: id("bar"),
-            requested_as: glu_core::PackageSelector("foo".to_string()),
-            requires: DependencyRequires {
-                version: "1.0".to_string(),
-                revision: 0,
-            },
-        };
+        let mut manifest = manifest(vec!["app"], vec![("app", vec!["bar"]), ("bar", vec![])]);
+        let app_id = id("app");
+        manifest.packages.get_mut(&app_id).unwrap().deps[0].requested_as =
+            glu_core::PackageSelector("foo".to_string());
+        let app = manifest.packages[&app_id].clone();
+        let dependency = app.deps[0].clone();
 
-        assert!(dependency_satisfied(&dep, &state).unwrap());
+        let matched = dependency_match(&app, &dependency, &manifest, &state).unwrap();
+
+        assert_eq!(matched, PackageMatch::Current);
     }
 
     #[test]
@@ -907,6 +928,37 @@ mod tests {
 
         assert_eq!(workset.install, vec![id("libuv"), id("node")]);
         assert!(workset.satisfied.is_empty());
+    }
+
+    #[test]
+    fn stricter_shared_requirement_installs_dependency_once_for_all_parents() {
+        let state = InstalledState::from_packages(vec![installed_pkg("shared", "0.9", vec![])]);
+        let mut manifest = manifest(
+            vec!["first", "second"],
+            vec![
+                ("first", vec!["shared"]),
+                ("second", vec!["shared"]),
+                ("shared", vec![]),
+            ],
+        );
+        let shared_key = glu_core::PackageKey("package:shared".to_string());
+        manifest
+            .packages
+            .get_mut(&id("first"))
+            .unwrap()
+            .dependency_requirements
+            .get_mut(&shared_key)
+            .unwrap()
+            .version = "0.9".to_string();
+
+        let workset = compute_workset(&manifest, &state, WorksetMode::Install).unwrap();
+
+        assert_eq!(
+            workset.install,
+            vec![id("shared"), id("first"), id("second")]
+        );
+        assert!(workset.satisfied.is_empty());
+        assert!(workset.rename.is_empty());
     }
 
     #[test]

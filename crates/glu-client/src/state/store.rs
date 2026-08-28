@@ -5,8 +5,8 @@ use crate::state::{
 };
 use anyhow::{bail, Context, Result};
 use glu_core::{
-    DependencyRequires, InstalledPackage, KegVersion, PackageId, PackageKey, PackageLinkMetadata,
-    PackageName, PackageSelector, Prefix, RuntimeDependencyRequirement,
+    InstalledPackage, KegVersion, PackageDependency, PackageId, PackageKey, PackageLinkMetadata,
+    PackageName, PackageSelector, Prefix,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -221,23 +221,10 @@ impl InstalledStateStore {
                                 requested_as.0
                             )
                         })?;
-                    let requires = receipt
-                        .install
-                        .min_versions
-                        .get(&requested_as.0)
-                        .map(|minimum| DependencyRequires {
-                            version: minimum.version.clone(),
-                            revision: minimum.revision.unwrap_or(0),
-                        })
-                        .unwrap_or(DependencyRequires {
-                            version: String::new(),
-                            revision: 0,
-                        });
-                    Ok(RuntimeDependencyRequirement {
+                    Ok(PackageDependency {
                         package_key: package_key.clone(),
                         package: package_id.clone(),
                         requested_as: requested_as.clone(),
-                        requires,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -410,7 +397,7 @@ mod tests {
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: vec![],
-                min_versions: Default::default(),
+                dependency_requirements: Default::default(),
             },
         };
         std::fs::write(

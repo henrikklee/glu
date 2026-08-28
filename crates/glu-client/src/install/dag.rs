@@ -782,8 +782,8 @@ fn visit(
 mod tests {
     use super::*;
     use glu_core::{
-        ArtifactId, DependencyRequires, KegVersion, PackageInstallMetadata, ResolveRequestEcho,
-        ResolvedArtifact, ResolvedPackage, RuntimeDependencyRequirement, Target,
+        ArtifactId, KegVersion, PackageDependency, PackageInstallMetadata, ResolveRequestEcho,
+        ResolvedArtifact, ResolvedPackage, Target,
     };
 
     #[test]
@@ -817,17 +817,13 @@ mod tests {
             keg_version: KegVersion("1.0".to_string()),
             deps: deps
                 .into_iter()
-                .map(|dep| RuntimeDependencyRequirement {
+                .map(|dep| PackageDependency {
                     package_key: glu_core::PackageKey(format!("package:{dep}")),
                     package: PackageId(format!("pkg:homebrew/core/{dep}@1.0")),
                     requested_as: glu_core::PackageSelector(dep.to_string()),
-                    requires: DependencyRequires {
-                        version: "1.0".to_string(),
-                        revision: 0,
-                    },
                 })
                 .collect(),
-            min_versions: Default::default(),
+            dependency_requirements: Default::default(),
             artifact: artifact.clone(),
             install: PackageInstallMetadata {
                 opt_names: Vec::new(),

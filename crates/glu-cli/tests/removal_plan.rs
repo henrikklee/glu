@@ -226,11 +226,12 @@ fn write_receipt(prefix: &Path, name: &str, version: &str, deps: &[&str]) {
     let opt = prefix.join("opt").join(name);
     let deps_json = deps
         .iter()
-        .map(|dep| {
-            format!(
-                r#"{{"package_key":"package:{dep}","package":"{dep}@1.0","requested_as":"{dep}","requires":{{"version":"1.0","revision":0}}}}"#
-            )
-        })
+        .map(|dependency| format!(r#""{dependency}""#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let dependency_requirements_json = deps
+        .iter()
+        .map(|dependency| format!(r#""package:{dependency}":{{"version":"1.0","revision":0}}"#))
         .collect::<Vec<_>>()
         .join(",");
     let receipt = format!(
@@ -262,7 +263,8 @@ fn write_receipt(prefix: &Path, name: &str, version: &str, deps: &[&str]) {
     "keg_only":false,
     "linked":true,
     "link_overwrite":[],
-    "deps":[{deps_json}]
+    "deps":[{deps_json}],
+    "dependency_requirements":{{{dependency_requirements_json}}}
   }}
 }}"#,
         "0".repeat(64),

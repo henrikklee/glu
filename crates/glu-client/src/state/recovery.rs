@@ -126,7 +126,7 @@ mod tests {
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: Vec::new(),
-                min_versions: Default::default(),
+                dependency_requirements: Default::default(),
             },
         };
         fs::write(

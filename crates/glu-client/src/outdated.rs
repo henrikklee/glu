@@ -122,6 +122,7 @@ mod tests {
             keg_only: false,
             linked: true,
             deps: vec![],
+            dependency_requirements: Default::default(),
             download_bytes: None,
             installed_bytes: None,
         }

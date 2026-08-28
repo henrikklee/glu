@@ -9,7 +9,7 @@ The architecture localizes complexity behind small contracts: the registry retur
 The registry owns package metadata. The client owns local execution.
 
 ```txt
-registry: resolve package graph, artifacts, dependency edges, install facts
+registry: resolve package topology, dependency requirements, artifacts, install facts
 client:   plan, validate, download, prepare, link, postinstall, record, trace
 ```
 
@@ -53,7 +53,7 @@ The client asks the registry for the whole package closure before installing. It
 That design gives the planner and scheduler all facts up front:
 
 - selected roots;
-- dependency edges and requirement floors;
+- direct dependency topology and separate package-level requirement maps;
 - artifact URLs, sizes, and SHA-256 digests;
 - install metadata;
 - structured postinstall facts.

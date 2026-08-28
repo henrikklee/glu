@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use glu_core::{InstalledPackage, MinimumVersion, PackageKey, PackageSelector};
+use glu_core::{InstalledPackage, PackageKey, PackageSelector};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One installed dependency relationship. The requested selector is the
@@ -10,7 +10,6 @@ pub struct InstalledDependencyEdge {
     pub dependent: PackageKey,
     pub requested: PackageSelector,
     pub provider: PackageKey,
-    pub minimum_version: Option<MinimumVersion>,
 }
 
 /// The dependency graph of the newest installed package for each stable
@@ -48,12 +47,6 @@ impl InstalledPackageGraph {
                     dependent: dependent.clone(),
                     requested: dependency.requested_as.clone(),
                     provider: dependency.package_key.clone(),
-                    minimum_version: (!dependency.requires.version.is_empty()).then(|| {
-                        MinimumVersion {
-                            version: dependency.requires.version.clone(),
-                            revision: Some(dependency.requires.revision),
-                        }
-                    }),
                 };
                 incoming
                     .entry(edge.provider.clone())
@@ -95,9 +88,7 @@ impl InstalledPackageGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glu_core::{
-        DependencyRequires, KegVersion, PackageId, PackageName, RuntimeDependencyRequirement,
-    };
+    use glu_core::{KegVersion, PackageDependency, PackageId, PackageName};
     use std::path::PathBuf;
 
     fn package(name: &str, aliases: &[&str], deps: &[(&str, &str)]) -> InstalledPackage {
@@ -119,16 +110,13 @@ mod tests {
             linked: true,
             deps: deps
                 .iter()
-                .map(|(requested, provider)| RuntimeDependencyRequirement {
+                .map(|(requested, provider)| PackageDependency {
                     package_key: PackageKey(format!("package:{provider}")),
                     package: PackageId(format!("pkg:test/{provider}@1.0")),
                     requested_as: PackageSelector((*requested).to_string()),
-                    requires: DependencyRequires {
-                        version: String::new(),
-                        revision: 0,
-                    },
                 })
                 .collect(),
+            dependency_requirements: Default::default(),
             download_bytes: None,
             installed_bytes: None,
         }

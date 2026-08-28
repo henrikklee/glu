@@ -1,69 +1,114 @@
 use anyhow::Result;
-use glu_core::{InstallManifest, PackageId, RuntimeDependencyRequirement};
+use glu_core::{InstallManifest, PackageDependency, PackageId, ResolvedPackage};
 use std::collections::BTreeSet;
 
-/// Walks the package dependency graph reachable from `roots`, returning packages in
-/// dependency-before-dependent order. `include` is asked, per edge, whether to descend into
-/// that dependency; returning `false` prunes the subtree without adding it to the order (the
-/// caller can still record it, e.g. as already-satisfied).
+/// Selects the packages that need work and returns the selected subgraph in
+/// dependency-before-dependent order.
 ///
-/// A dependency that is already an in-progress ancestor on the current walk (i.e. a real cycle,
-/// such as two bottled libraries that mutually declare a runtime dependency on each other) is
-/// skipped rather than re-entered — mirroring Homebrew's own `Dependency.expand`, which tracks
-/// an `@expand_stack` for exactly this reason. The ancestor's own frame still adds it to the
-/// order once it completes, so nothing is lost; only the back-edge is dropped.
+/// Selection and ordering are separate passes. A dependency skipped for one
+/// parent may still be selected for another parent with a higher package-level
+/// minimum. Once selection is complete, ordering considers every edge between
+/// selected packages, so a shared dependency always precedes every selected
+/// dependent regardless of which parent selected it.
 pub fn dependency_order(
     manifest: &InstallManifest,
     roots: &[PackageId],
-    mut include: impl FnMut(&RuntimeDependencyRequirement) -> Result<bool>,
+    mut should_install: impl FnMut(&ResolvedPackage, &PackageDependency) -> Result<bool>,
 ) -> Result<Vec<PackageId>> {
-    let mut order = Vec::new();
-    let mut done = BTreeSet::new();
-    let mut in_progress = BTreeSet::new();
+    let mut selected = BTreeSet::new();
+    let mut expanded = BTreeSet::new();
     for root in roots {
-        if done.contains(root) || in_progress.contains(root) {
-            continue;
-        }
-        visit(
+        select_packages(
             root,
             manifest,
-            &mut include,
-            &mut done,
-            &mut in_progress,
+            &mut should_install,
+            &mut selected,
+            &mut expanded,
+        )?;
+    }
+
+    let mut order = Vec::new();
+    let mut ordered = BTreeSet::new();
+    let mut ordering = BTreeSet::new();
+    for root in roots {
+        order_selected(
+            root,
+            manifest,
+            &selected,
+            &mut ordered,
+            &mut ordering,
             &mut order,
         )?;
     }
     Ok(order)
 }
 
-fn visit(
+fn select_packages(
     package_id: &PackageId,
     manifest: &InstallManifest,
-    include: &mut impl FnMut(&RuntimeDependencyRequirement) -> Result<bool>,
-    done: &mut BTreeSet<PackageId>,
-    in_progress: &mut BTreeSet<PackageId>,
-    order: &mut Vec<PackageId>,
+    should_install: &mut impl FnMut(&ResolvedPackage, &PackageDependency) -> Result<bool>,
+    selected: &mut BTreeSet<PackageId>,
+    expanded: &mut BTreeSet<PackageId>,
 ) -> Result<()> {
+    selected.insert(package_id.clone());
+    if !expanded.insert(package_id.clone()) {
+        return Ok(());
+    }
+
     let package = manifest
         .packages
         .get(package_id)
         .ok_or_else(|| anyhow::anyhow!("resolve manifest is missing package {}", package_id.0))?;
-
-    in_progress.insert(package_id.clone());
-    for dep in &package.deps {
-        if done.contains(&dep.package) || in_progress.contains(&dep.package) {
+    for dependency in &package.deps {
+        if selected.contains(&dependency.package) {
             continue;
         }
-        if include(dep)? {
-            visit(&dep.package, manifest, include, done, in_progress, order)?;
-        } else {
-            done.insert(dep.package.clone());
+        if should_install(package, dependency)? {
+            select_packages(
+                &dependency.package,
+                manifest,
+                should_install,
+                selected,
+                expanded,
+            )?;
         }
     }
-    in_progress.remove(package_id);
+    Ok(())
+}
 
-    done.insert(package_id.clone());
-    order.push(package_id.clone());
+fn order_selected(
+    package_id: &PackageId,
+    manifest: &InstallManifest,
+    selected: &BTreeSet<PackageId>,
+    ordered: &mut BTreeSet<PackageId>,
+    ordering: &mut BTreeSet<PackageId>,
+    order: &mut Vec<PackageId>,
+) -> Result<()> {
+    if ordered.contains(package_id) || !ordering.insert(package_id.clone()) {
+        return Ok(());
+    }
+
+    let package = manifest
+        .packages
+        .get(package_id)
+        .ok_or_else(|| anyhow::anyhow!("resolve manifest is missing package {}", package_id.0))?;
+    for dependency in &package.deps {
+        if selected.contains(&dependency.package) {
+            order_selected(
+                &dependency.package,
+                manifest,
+                selected,
+                ordered,
+                ordering,
+                order,
+            )?;
+        }
+    }
+
+    ordering.remove(package_id);
+    if ordered.insert(package_id.clone()) {
+        order.push(package_id.clone());
+    }
     Ok(())
 }
 
@@ -71,8 +116,8 @@ fn visit(
 mod tests {
     use super::*;
     use glu_core::{
-        ArtifactId, DependencyRequires, InstallManifest, KegVersion, PackageInstallMetadata,
-        PackageName, ResolveRequestEcho, ResolvedArtifact, ResolvedPackage, Target,
+        ArtifactId, InstallManifest, KegVersion, PackageInstallMetadata, PackageName,
+        ResolveRequestEcho, ResolvedArtifact, ResolvedPackage, Target,
     };
     use std::collections::BTreeMap;
 
@@ -89,17 +134,13 @@ mod tests {
             keg_version: KegVersion("1.0".to_string()),
             deps: deps
                 .into_iter()
-                .map(|dep| RuntimeDependencyRequirement {
+                .map(|dep| PackageDependency {
                     package_key: glu_core::PackageKey(format!("package:{dep}")),
                     package: PackageId(format!("pkg:homebrew/core/{dep}@1.0")),
                     requested_as: glu_core::PackageSelector(dep.to_string()),
-                    requires: DependencyRequires {
-                        version: "1.0".to_string(),
-                        revision: 0,
-                    },
                 })
                 .collect(),
-            min_versions: Default::default(),
+            dependency_requirements: Default::default(),
             artifact: artifact.clone(),
             install: PackageInstallMetadata {
                 opt_names: Vec::new(),
@@ -151,7 +192,7 @@ mod tests {
         ]);
 
         let order =
-            dependency_order(&manifest, std::slice::from_ref(&root_id), |_| Ok(true)).unwrap();
+            dependency_order(&manifest, std::slice::from_ref(&root_id), |_, _| Ok(true)).unwrap();
 
         assert_eq!(order, vec![dep_id, root_id]);
     }
@@ -165,11 +206,33 @@ mod tests {
             (b_id.clone(), b, b_artifact),
         ]);
 
-        let order = dependency_order(&manifest, std::slice::from_ref(&a_id), |_| Ok(true)).unwrap();
+        let order =
+            dependency_order(&manifest, std::slice::from_ref(&a_id), |_, _| Ok(true)).unwrap();
 
         assert_eq!(order.len(), 2);
         assert!(order.contains(&a_id));
         assert!(order.contains(&b_id));
+    }
+
+    #[test]
+    fn shared_dependency_selected_by_later_parent_precedes_all_dependents() {
+        let (dependency_id, dependency, dependency_artifact) = pkg("dependency", vec![]);
+        let (first_id, first, first_artifact) = pkg("first", vec!["dependency"]);
+        let (second_id, second, second_artifact) = pkg("second", vec!["dependency"]);
+        let manifest = manifest(vec![
+            (dependency_id.clone(), dependency, dependency_artifact),
+            (first_id.clone(), first, first_artifact),
+            (second_id.clone(), second, second_artifact),
+        ]);
+
+        let order = dependency_order(
+            &manifest,
+            &[first_id.clone(), second_id.clone()],
+            |parent, _| Ok(parent.name.0 == "second"),
+        )
+        .unwrap();
+
+        assert_eq!(order, vec![dependency_id, first_id, second_id]);
     }
 
     #[test]
@@ -183,7 +246,7 @@ mod tests {
             (root_id.clone(), root, root_artifact),
         ]);
 
-        let order = dependency_order(&manifest, std::slice::from_ref(&root_id), |dep| {
+        let order = dependency_order(&manifest, std::slice::from_ref(&root_id), |_, dep| {
             Ok(dep.package != dep_id)
         })
         .unwrap();

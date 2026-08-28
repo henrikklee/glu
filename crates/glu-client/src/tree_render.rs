@@ -24,7 +24,7 @@ pub struct TreeRenderOptions {
     pub decorated: bool,
     /// Show only one dependency level below each supplied root.
     pub direct: bool,
-    /// Include edge requirements (`>= 1.2.3`) when present.
+    /// Include the requiring package's minimum (`>= 1.2.3`) when present.
     pub verbose: bool,
     /// Include each node's concrete version.
     pub show_versions: bool,

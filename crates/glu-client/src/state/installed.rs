@@ -35,12 +35,8 @@ pub struct InstalledState {
     /// Every selector advertised by installed receipts resolves to one stable
     /// package identity.
     selector_index: HashMap<PackageSelector, PackageKey>,
-    /// Direct package-key adjacency from the newest installed keg per package.
-    outgoing: BTreeMap<PackageKey, Vec<glu_core::RuntimeDependencyRequirement>>,
-    /// Reverse package-key adjacency, built once with the snapshot.
-    incoming: BTreeMap<PackageKey, Vec<PackageKey>>,
-    /// Explicit receipt-backed graph. Existing callers still use the legacy
-    /// indexes above until they are migrated in a later change.
+    /// Receipt-backed dependency topology for the newest installed keg of
+    /// each package. Receipts remain the durable source of graph facts.
     package_graph: InstalledPackageGraph,
     declared_names: BTreeSet<PackageName>,
     deactivated_names: BTreeSet<PackageName>,
@@ -114,38 +110,11 @@ impl InstalledState {
             kegs.sort_by(|a, b| compare_installed(b, a));
         }
         let package_graph = InstalledPackageGraph::from_packages(&by_key)?;
-        let mut outgoing = BTreeMap::new();
-        let mut incoming: BTreeMap<PackageKey, Vec<PackageKey>> = BTreeMap::new();
-        for (package_key, kegs) in &by_key {
-            let Some(package) = kegs.first() else {
-                continue;
-            };
-            outgoing.insert(package_key.clone(), package.deps.clone());
-            for dep in &package.deps {
-                if !by_key.contains_key(&dep.package_key) {
-                    bail!(
-                        "installed package {} references missing package key {}",
-                        package.name.0,
-                        dep.package_key.0
-                    );
-                }
-                incoming
-                    .entry(dep.package_key.clone())
-                    .or_default()
-                    .push(package_key.clone());
-            }
-        }
-        for dependents in incoming.values_mut() {
-            dependents.sort();
-            dependents.dedup();
-        }
         Ok(Self {
             prefix,
             by_name,
             by_key,
             selector_index,
-            outgoing,
-            incoming,
             package_graph,
             declared_names,
             deactivated_names,
@@ -166,14 +135,6 @@ impl InstalledState {
         self.selector_index
             .get(selector)
             .and_then(|key| self.find_by_key(key))
-    }
-
-    pub fn dependencies(&self, key: &PackageKey) -> &[glu_core::RuntimeDependencyRequirement] {
-        self.outgoing.get(key).map_or(&[], Vec::as_slice)
-    }
-
-    pub fn dependent_keys(&self, key: &PackageKey) -> &[PackageKey] {
-        self.incoming.get(key).map_or(&[], Vec::as_slice)
     }
 
     pub fn package_graph(&self) -> &InstalledPackageGraph {
@@ -400,16 +361,12 @@ fn dependency_tree_children(
                 .unwrap_or_default(),
             children: Vec::new(),
             already_shown: false,
-            requires: format_minimum_version(dep.minimum_version.as_ref()),
+            requires: format_minimum_version(package.dependency_requirements.get(&dep.provider)),
         };
         if let Some(provider_package) = provider {
             if seen.insert(dep.provider.clone()) {
                 child.children = dependency_tree_children(provider_package, state, seen);
-            } else if !state
-                .package_graph()
-                .dependencies(&dep.provider)
-                .is_empty()
-            {
+            } else if !state.package_graph().dependencies(&dep.provider).is_empty() {
                 child.already_shown = true;
             }
         }
@@ -418,20 +375,9 @@ fn dependency_tree_children(
     children
 }
 
-/// The `requires` floor of a dependency edge, as a display string —
-/// `>= 2.84.3` or `>= 2.84.3_1` for a revisioned floor.
-pub(crate) fn format_requires(requires: &glu_core::DependencyRequires) -> Option<String> {
-    if requires.version.is_empty() {
-        return None;
-    }
-    let mut floor = format!(">= {}", requires.version);
-    if requires.revision > 0 {
-        floor.push_str(&format!("_{}", requires.revision));
-    }
-    Some(floor)
-}
-
-fn format_minimum_version(minimum: Option<&glu_core::MinimumVersion>) -> Option<String> {
+/// A package-level dependency floor as a display string — `>= 2.84.3` or
+/// `>= 2.84.3_1` for a revisioned floor.
+pub(crate) fn format_minimum_version(minimum: Option<&glu_core::MinimumVersion>) -> Option<String> {
     let minimum = minimum?;
     let mut floor = format!(">= {}", minimum.version);
     if let Some(revision) = minimum.revision.filter(|revision| *revision > 0) {
@@ -469,7 +415,7 @@ fn reverse_dependents_children(
             version: parent.keg_version.0.clone(),
             children: Vec::new(),
             already_shown: false,
-            requires: None,
+            requires: format_minimum_version(parent.dependency_requirements.get(package_key)),
         };
         if seen.insert(parent.package_key.clone()) {
             node.children = reverse_dependents_children(state, &parent.package_key, seen);
@@ -713,9 +659,7 @@ mod tests {
         },
         store::InstalledStateStore,
     };
-    use glu_core::{
-        ArtifactId, DependencyRequires, KegVersion, PackageId, RuntimeDependencyRequirement,
-    };
+    use glu_core::{ArtifactId, KegVersion, PackageDependency, PackageId};
     use std::fs;
 
     fn write_receipt(
@@ -777,7 +721,7 @@ mod tests {
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: vec![],
-                min_versions: Default::default(),
+                dependency_requirements: Default::default(),
             },
         };
         let path = InstalledStateStore::receipt_path_for_keg(&keg);
@@ -847,6 +791,7 @@ mod tests {
             keg_only: false,
             linked: true,
             deps: Vec::new(),
+            dependency_requirements: Default::default(),
             download_bytes: None,
             installed_bytes: None,
         }
@@ -868,14 +813,22 @@ mod tests {
             linked: true,
             deps: deps
                 .iter()
-                .map(|dep| RuntimeDependencyRequirement {
+                .map(|dep| PackageDependency {
                     package_key: glu_core::PackageKey(format!("package:{dep}")),
                     package: PackageId(format!("pkg:test/{dep}@1.0")),
                     requested_as: glu_core::PackageSelector((*dep).to_string()),
-                    requires: DependencyRequires {
-                        version: "1.0".to_string(),
-                        revision: 0,
-                    },
+                })
+                .collect(),
+            dependency_requirements: deps
+                .iter()
+                .map(|dep| {
+                    (
+                        glu_core::PackageKey(format!("package:{dep}")),
+                        glu_core::MinimumVersion {
+                            version: "1.0".to_string(),
+                            revision: Some(0),
+                        },
+                    )
                 })
                 .collect(),
             download_bytes: None,
@@ -957,14 +910,10 @@ mod tests {
     #[test]
     fn dangling_packages_resolve_old_dependency_names_through_installed_index() {
         let mut app = installed_pkg_with_oldnames("app", &[], "1.0");
-        app.deps = vec![RuntimeDependencyRequirement {
+        app.deps = vec![PackageDependency {
             package_key: glu_core::PackageKey("package:bar".to_string()),
             package: PackageId("pkg:test/bar@1.0".to_string()),
             requested_as: glu_core::PackageSelector("foo".to_string()),
-            requires: DependencyRequires {
-                version: "1.0".to_string(),
-                revision: 0,
-            },
         }];
         let installed = vec![app, installed_pkg_with_oldnames("bar", &["foo"], "1.0")];
         let declared = declared_set(&["app"]);
@@ -977,14 +926,10 @@ mod tests {
     #[test]
     fn depends_on_any_resolves_old_dependency_names_through_installed_index() {
         let mut app = installed_pkg_with_oldnames("app", &[], "1.0");
-        app.deps = vec![RuntimeDependencyRequirement {
+        app.deps = vec![PackageDependency {
             package_key: glu_core::PackageKey("package:bar".to_string()),
             package: PackageId("pkg:test/bar@1.0".to_string()),
             requested_as: glu_core::PackageSelector("foo".to_string()),
-            requires: DependencyRequires {
-                version: "1.0".to_string(),
-                revision: 0,
-            },
         }];
         let installed = vec![
             app.clone(),
@@ -998,14 +943,10 @@ mod tests {
     #[test]
     fn dangling_packages_follows_package_key_for_alias_edges() {
         let mut rust = installed_pkg_with_oldnames("rust", &[], "1.98.0");
-        rust.deps = vec![RuntimeDependencyRequirement {
+        rust.deps = vec![PackageDependency {
             package_key: glu_core::PackageKey("package:llvm".to_string()),
             package: PackageId("pkg:homebrew/core/llvm@22.1.8_2".to_string()),
             requested_as: glu_core::PackageSelector("llvm@22".to_string()),
-            requires: DependencyRequires {
-                version: "22.1.8".to_string(),
-                revision: 0,
-            },
         }];
         let mut llvm = installed_pkg_with_oldnames("llvm", &[], "22.1.8");
         llvm.id = PackageId("pkg:homebrew/core/llvm@22.1.8_2".to_string());
@@ -1021,14 +962,10 @@ mod tests {
     #[test]
     fn depends_on_any_follows_package_key_for_alias_edges() {
         let mut rust = installed_pkg_with_oldnames("rust", &[], "1.98.0");
-        rust.deps = vec![RuntimeDependencyRequirement {
+        rust.deps = vec![PackageDependency {
             package_key: glu_core::PackageKey("package:llvm".to_string()),
             package: PackageId("pkg:homebrew/core/llvm@22.1.8_2".to_string()),
             requested_as: glu_core::PackageSelector("llvm@22".to_string()),
-            requires: DependencyRequires {
-                version: "22.1.8".to_string(),
-                revision: 0,
-            },
         }];
         let mut llvm = installed_pkg_with_oldnames("llvm", &[], "22.1.8");
         llvm.id = PackageId("pkg:homebrew/core/llvm@22.1.8_2".to_string());
@@ -1042,14 +979,10 @@ mod tests {
     #[test]
     fn selectors_share_package_key_for_forward_and_reverse_queries() {
         let mut rust = installed_pkg_with_oldnames("rust", &[], "1.98.0");
-        rust.deps = vec![RuntimeDependencyRequirement {
+        rust.deps = vec![PackageDependency {
             package_key: glu_core::PackageKey("package:llvm".to_string()),
             package: PackageId("pkg:homebrew/core/llvm@22.1.8_2".to_string()),
             requested_as: glu_core::PackageSelector("llvm@22".to_string()),
-            requires: DependencyRequires {
-                version: "22.1.8".to_string(),
-                revision: 0,
-            },
         }];
         let mut llvm = installed_pkg_with_oldnames("llvm", &[], "22.1.8");
         llvm.id = PackageId("pkg:homebrew/core/llvm@22.1.8_2".to_string());

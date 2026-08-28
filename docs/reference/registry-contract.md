@@ -16,7 +16,7 @@ This document records the client-side assumptions that matter while reading or c
 The registry is the client's metadata trust root. It supplies:
 
 - package identities and versions;
-- dependency edges and requirement floors;
+- direct dependency topology and package-level requirement floors;
 - artifact URLs and SHA-256 digests;
 - artifact sizes when known;
 - install metadata;
@@ -67,18 +67,25 @@ GET /v1/resolve?...&slim=true
 
 Slim responses contain graph shape and minimal package records. They are for display and dependency queries. They must not be treated as install manifests.
 
-## Dependency edges
+## Dependency topology
 
-Every dependency edge contains:
+Every entry in a package's `deps` array contains only direct graph topology:
 
 - `requested_as`: the dependency spelling declared by the parent;
 - `package_key`: the stable identity of the target;
-- `package`: the concrete target selected in this response;
-- `requires`: the built-against version and revision floor.
+- `package`: the concrete target selected in this response.
 
-Graph traversal uses `package_key`. Full and slim resolve use `package` to join an edge to the selected package record. The original spelling is retained for diagnostics and provenance; it does not define topology.
+Full and slim resolve use `package` to join a dependency to the selected package record. Installed-state traversal uses `package_key`. The original spelling is retained for diagnostics and provenance; it does not define package identity.
 
-The client uses the requirement floor for dependency satisfaction. An installed dependency can be reused when its version and revision are at or above the floor.
+Dependency entries do not carry version requirements.
+
+## Dependency requirements
+
+Each package in a full resolve has a `dependency_requirements` object. It is the complete flattened minimum-version map recorded by that package's selected artifact, keyed by `package_key`. It is separate from direct topology and does not create graph edges.
+
+Each minimum contains a version and an optional revision. An omitted revision means there is no revision floor; it is not equivalent to an explicit revision zero.
+
+When deciding whether to reuse an installed direct dependency, the client looks up that dependency's `package_key` in the requiring package's map. The selected concrete package always satisfies its own resolution. A different installed release is reusable only when the map contains a minimum that it satisfies.
 
 ## Package identity
 

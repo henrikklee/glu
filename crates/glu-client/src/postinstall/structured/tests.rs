@@ -1,8 +1,7 @@
 use super::*;
 use flate2::{write::GzEncoder, Compression};
 use glu_core::{
-    ArtifactId, KegVersion, PackageInstallMetadata, PackageName, ResolvedPackage,
-    RuntimeDependencyRequirement,
+    ArtifactId, KegVersion, PackageDependency, PackageInstallMetadata, PackageName, ResolvedPackage,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -27,8 +26,8 @@ fn package_with_steps(steps: Vec<Value>) -> ResolvedPackage {
         version: "1.2.3".to_string(),
         revision: 0,
         keg_version: KegVersion("1.2.3".to_string()),
-        deps: Vec::<RuntimeDependencyRequirement>::new(),
-        min_versions: Default::default(),
+        deps: Vec::<PackageDependency>::new(),
+        dependency_requirements: Default::default(),
         artifact: ArtifactId("art:test:fixture".to_string()),
         install: PackageInstallMetadata {
             opt_names: Vec::new(),

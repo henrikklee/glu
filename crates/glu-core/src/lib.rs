@@ -90,7 +90,7 @@ pub struct ResolveRequestEcho {
     pub name: Vec<PackageSelector>,
     pub target: Target,
     /// Whether the response is the slim variant (no artifact/install
-    /// metadata). `#[serde(default)]` so old responses decode.
+    /// metadata). Full responses omit the field, which represents `false`.
     #[serde(default)]
     pub slim: bool,
 }
@@ -111,12 +111,11 @@ pub struct ResolvedPackage {
     pub revision: u32,
     pub keg_version: KegVersion,
     #[serde(default)]
-    pub deps: Vec<RuntimeDependencyRequirement>,
+    pub deps: Vec<PackageDependency>,
     /// Complete flattened minimum versions recorded by this package's
     /// selected artifact. These constraints belong to the package, not to
     /// its direct dependency edges.
-    #[serde(default)]
-    pub min_versions: BTreeMap<String, MinimumVersion>,
+    pub dependency_requirements: BTreeMap<PackageKey, MinimumVersion>,
     pub artifact: ArtifactId,
     pub install: PackageInstallMetadata,
 }
@@ -142,25 +141,19 @@ impl From<&ResolvedPackage> for PackageLinkMetadata {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct RuntimeDependencyRequirement {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PackageDependency {
     pub package_key: PackageKey,
     pub package: PackageId,
     pub requested_as: PackageSelector,
-    pub requires: DependencyRequires,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct DependencyRequires {
-    pub version: String,
-    pub revision: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MinimumVersion {
     pub version: String,
-    /// Older package metadata may omit revision entirely. That is distinct
+    /// An omitted revision means there is no revision floor. That is distinct
     /// from an explicitly recorded revision zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<u32>,
 }
 
@@ -223,7 +216,9 @@ pub struct SlimPackage {
     pub revision: u32,
     pub keg_version: KegVersion,
     #[serde(default)]
-    pub deps: Vec<RuntimeDependencyRequirement>,
+    pub deps: Vec<PackageDependency>,
+    #[serde(default)]
+    pub dependency_requirements: BTreeMap<PackageKey, MinimumVersion>,
 }
 
 /// Slim resolve response (`?slim=true`): the same graph as the full
@@ -333,8 +328,8 @@ pub struct InstalledPackage {
     pub keg_only: bool,
     #[serde(default)]
     pub linked: bool,
-    #[serde(default)]
-    pub deps: Vec<RuntimeDependencyRequirement>,
+    pub deps: Vec<PackageDependency>,
+    pub dependency_requirements: BTreeMap<PackageKey, MinimumVersion>,
     #[serde(default)]
     pub download_bytes: Option<u64>,
     #[serde(default)]
@@ -377,6 +372,7 @@ mod tests {
         assert_eq!(package.version, "1.0");
         assert_eq!(package.revision, 0);
         assert!(package.deps.is_empty());
+        assert!(package.dependency_requirements.is_empty());
     }
 
     #[test]
@@ -389,13 +385,25 @@ mod tests {
             "version":"1.0",
             "revision":0,
             "keg_version":"1.0",
+            "deps":[{
+                "package_key":"package:dep",
+                "package":"pkg:homebrew/core/dep@2.0",
+                "requested_as":"dep@2"
+            }],
+            "dependency_requirements":{
+                "package:dep":{"version":"2.0"}
+            },
             "artifact":"art:sha256:abc",
             "install":{"opt_names":[]}
         }"#;
         let package: ResolvedPackage = serde_json::from_str(json).unwrap();
         assert!(package.aliases.is_empty());
         assert!(package.oldnames.is_empty());
-        assert!(package.deps.is_empty());
+        assert_eq!(package.deps[0].requested_as.0, "dep@2");
+        assert_eq!(
+            package.dependency_requirements[&PackageKey("package:dep".to_string())].revision,
+            None
+        );
         assert!(!package.install.keg_only);
     }
 }
