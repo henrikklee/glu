@@ -1,13 +1,13 @@
 use crate::command_model::{
-    generated_schema, ActivationOutput, AutoremoveOutput, AutoremovePlanOutput, CommandId,
-    CommandOutput, DeactivationOutput, DepsOutput, DepsSource, ExecutedMode,
-    ExecutionSummaryRecord, GlobalOptions, InfoManyOutput, InfoOutput, InstallOutput,
-    InstallPlanOutput, InstallPoolStatsRecord, InstallStatsRecord, JsonSuccessEnvelope,
-    KeptPackageRecord, ListOutput, ListScope, ListView, MutationPackageRecord, MutationStatus,
-    OutdatedOutput, OutdatedRecord, OutputFormat, PlanMode, ReinstallOutput, ReinstallPlanOutput,
-    RemovalOutput, RemovalPlanOutput, RenamePackageRecord, ReverseDepsOutput, ReverseDepsSource,
-    StatusOutput, StatusShell, TimingBreakdownRecord, UpdateOutput, UpdatePackageRecord,
-    UpdatePlanOutput,
+    generated_schema, ActivationOutput, AutoremoveOutput, AutoremovePlanOutput,
+    CachedDownloadRecord, CleanupOutput, CleanupPlanOutput, CommandId, CommandOutput,
+    DeactivationOutput, DepsOutput, DepsSource, ExecutedMode, ExecutionSummaryRecord,
+    GlobalOptions, InfoManyOutput, InfoOutput, InstallOutput, InstallPlanOutput,
+    InstallPoolStatsRecord, InstallStatsRecord, JsonSuccessEnvelope, KeptPackageRecord, ListOutput,
+    ListScope, ListView, MutationPackageRecord, MutationStatus, OutdatedOutput, OutdatedRecord,
+    OutputFormat, PlanMode, ReinstallOutput, ReinstallPlanOutput, RemovalOutput, RemovalPlanOutput,
+    RenamePackageRecord, ReverseDepsOutput, ReverseDepsSource, StatusOutput, StatusShell,
+    TimingBreakdownRecord, UpdateOutput, UpdatePackageRecord, UpdatePlanOutput,
 };
 use crate::package_list::{self, PackageListItem};
 use crate::tables;
@@ -15,6 +15,7 @@ use anyhow::Result;
 use glu_client::activation::{
     ActivationResult, ActivationStatus, DeactivationResult, DeactivationStatus,
 };
+use glu_client::download::cache::{CacheCleanupPlan, CacheCleanupResult, CachedBottle};
 use glu_client::remove::{KeptDeclaredPackage, RemovedPackage};
 use glu_client::state::installed::DependencyTreeNode;
 use glu_client::tree_render::{
@@ -54,6 +55,8 @@ fn render_human(output: &CommandOutput, globals: &GlobalOptions) {
         CommandOutput::RemovalPlan(plan) => render_removal_plan_output(plan, globals),
         CommandOutput::Autoremove(autoremove) => render_autoremove_output(autoremove, globals),
         CommandOutput::AutoremovePlan(plan) => render_autoremove_plan_output(plan, globals),
+        CommandOutput::Cleanup(cleanup) => render_cleanup_output(cleanup, globals),
+        CommandOutput::CleanupPlan(plan) => render_cleanup_plan_output(plan, globals),
         CommandOutput::Status(status) => render_status_output(status, globals),
         CommandOutput::Outdated(outdated) => render_outdated_output(outdated, globals),
         CommandOutput::TraceView(view) => render_trace_view_output(view),
@@ -89,6 +92,8 @@ fn render_json(output: &CommandOutput, globals: &GlobalOptions) {
         CommandOutput::RemovalPlan(plan) => render_removal_plan_output(plan, globals),
         CommandOutput::Autoremove(autoremove) => render_autoremove_output(autoremove, globals),
         CommandOutput::AutoremovePlan(plan) => render_autoremove_plan_output(plan, globals),
+        CommandOutput::Cleanup(cleanup) => render_cleanup_output(cleanup, globals),
+        CommandOutput::CleanupPlan(plan) => render_cleanup_plan_output(plan, globals),
         CommandOutput::Status(status) => render_status_output(status, globals),
         CommandOutput::Outdated(outdated) => render_outdated_output(outdated, globals),
         CommandOutput::TraceList(list) => print_json_success(CommandId::TraceList, list),
@@ -122,6 +127,8 @@ fn render_null(output: &CommandOutput, globals: &GlobalOptions) {
         | CommandOutput::RemovalPlan(_)
         | CommandOutput::Autoremove(_)
         | CommandOutput::AutoremovePlan(_)
+        | CommandOutput::Cleanup(_)
+        | CommandOutput::CleanupPlan(_)
         | CommandOutput::Status(_)
         | CommandOutput::Outdated(_)
         | CommandOutput::TraceView(_)
@@ -195,6 +202,7 @@ pub(crate) fn result_schema(name: &str) -> Option<serde_json::Value> {
         "ActivationResult" => Some(generated_schema::<ActivationOutput>()),
         "DeactivationResult" => Some(generated_schema::<DeactivationOutput>()),
         "AutoremoveResult" => Some(generated_schema::<AutoremoveResult<'static>>()),
+        "CleanupResult" => Some(generated_schema::<CleanupResult<'static>>()),
         "RemovalResult" => Some(generated_schema::<RemovalResult<'static>>()),
         _ => None,
     }
@@ -1010,6 +1018,70 @@ pub(crate) fn autoremove_plan_output(dangling: &[InstalledPackage]) -> Autoremov
     }
 }
 
+struct CachedBottleSummary {
+    packages: Vec<CachedDownloadRecord>,
+    unassociated_downloads: usize,
+    unassociated_bytes: u64,
+}
+
+fn summarize_cached_bottles(bottles: &[CachedBottle]) -> CachedBottleSummary {
+    let mut packages = BTreeMap::<(String, String), (usize, u64)>::new();
+    let mut unassociated_downloads = 0;
+    let mut unassociated_bytes = 0_u64;
+    for bottle in bottles {
+        if let Some(package) = bottle.package() {
+            let summary = packages
+                .entry((package.name.0.clone(), package.keg_version.0.clone()))
+                .or_default();
+            summary.0 += 1;
+            summary.1 += bottle.bytes();
+        } else {
+            unassociated_downloads += 1;
+            unassociated_bytes += bottle.bytes();
+        }
+    }
+    CachedBottleSummary {
+        packages: packages
+            .into_iter()
+            .map(
+                |((name, version), (downloads, bytes))| CachedDownloadRecord {
+                    name,
+                    version,
+                    downloads,
+                    bytes,
+                },
+            )
+            .collect(),
+        unassociated_downloads,
+        unassociated_bytes,
+    }
+}
+
+pub(crate) fn cleanup_output(result: &CacheCleanupResult) -> CleanupOutput {
+    let summary = summarize_cached_bottles(result.removed());
+    CleanupOutput {
+        mode: ExecutedMode::Executed,
+        removed: summary.packages,
+        removed_downloads: result.removed().len(),
+        unassociated_downloads: summary.unassociated_downloads,
+        unassociated_bytes: summary.unassociated_bytes,
+        reclaimed_bytes: result.reclaimed_bytes(),
+    }
+}
+
+pub(crate) fn cleanup_plan_output(plan: &CacheCleanupPlan) -> CleanupPlanOutput {
+    let summary = summarize_cached_bottles(plan.bottles());
+    CleanupPlanOutput {
+        mode: PlanMode::Plan,
+        would_remove: summary.packages,
+        would_remove_downloads: plan.bottles().len(),
+        unassociated_downloads: summary.unassociated_downloads,
+        unassociated_bytes: summary.unassociated_bytes,
+        requires_confirmation: !plan.bottles().is_empty(),
+        would_reclaim_bytes: plan.reclaimable_bytes(),
+    }
+}
+
 fn render_info_output(info: &InfoOutput, globals: &GlobalOptions) {
     if globals.is_json() {
         print_json_success(CommandId::Info, &InfoResult::One(info));
@@ -1776,6 +1848,93 @@ fn render_autoremove_plan_output(plan: &AutoremovePlanOutput, globals: &GlobalOp
         return;
     }
     print_mutation_plan("remove", &[], &plan.would_remove);
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+enum CleanupResult<'a> {
+    Executed(&'a CleanupOutput),
+    Plan(&'a CleanupPlanOutput),
+}
+
+fn cached_bottle_items(
+    bottles: &[CachedDownloadRecord],
+    unassociated_downloads: usize,
+    unassociated_bytes: u64,
+) -> Vec<PackageListItem> {
+    let mut items: Vec<_> = bottles
+        .iter()
+        .map(|bottle| {
+            let annotation = if bottle.downloads == 1 {
+                glu_client::format::human_bytes(bottle.bytes)
+            } else {
+                format!(
+                    "{}, {}",
+                    glu_client::format::plural(bottle.downloads, "download"),
+                    glu_client::format::human_bytes(bottle.bytes)
+                )
+            };
+            PackageListItem::package(&bottle.name, &bottle.version).annotated(annotation)
+        })
+        .collect();
+    if unassociated_downloads > 0 {
+        items.push(PackageListItem::name("Unassociated").annotated(format!(
+            "{}, {}",
+            glu_client::format::plural(unassociated_downloads, "download"),
+            glu_client::format::human_bytes(unassociated_bytes)
+        )));
+    }
+    items
+}
+
+fn render_cleanup_output(cleanup: &CleanupOutput, globals: &GlobalOptions) {
+    if globals.is_json() {
+        print_json_success(CommandId::Cleanup, &CleanupResult::Executed(cleanup));
+        return;
+    }
+    if cleanup.removed_downloads == 0 {
+        println!("No cached downloads to remove.");
+        return;
+    }
+    package_list::print_counted_section_with_total(
+        "Removed",
+        "cached download",
+        cleanup.removed_downloads,
+        &cached_bottle_items(
+            &cleanup.removed,
+            cleanup.unassociated_downloads,
+            cleanup.unassociated_bytes,
+        ),
+    );
+    println!(
+        "Reclaimed: {}",
+        glu_client::format::human_bytes(cleanup.reclaimed_bytes)
+    );
+}
+
+fn render_cleanup_plan_output(plan: &CleanupPlanOutput, globals: &GlobalOptions) {
+    if globals.is_json() {
+        print_json_success(CommandId::Cleanup, &CleanupResult::Plan(plan));
+        return;
+    }
+    if plan.would_remove_downloads == 0 {
+        println!("No cached downloads to remove.");
+        return;
+    }
+    package_list::print_counted_section_with_total(
+        "Would remove",
+        "cached download",
+        plan.would_remove_downloads,
+        &cached_bottle_items(
+            &plan.would_remove,
+            plan.unassociated_downloads,
+            plan.unassociated_bytes,
+        ),
+    );
+    println!(
+        "Would reclaim: {}",
+        glu_client::format::human_bytes(plan.would_reclaim_bytes)
+    );
 }
 
 fn render_status_output(status: &StatusOutput, globals: &GlobalOptions) {
@@ -2747,6 +2906,36 @@ mod tests {
             "AutoremoveResult",
             &AutoremoveResult::Plan(&autoremove_plan),
         );
+
+        let cleanup = CleanupOutput {
+            mode: ExecutedMode::Executed,
+            removed: vec![CachedDownloadRecord {
+                name: "demo".to_string(),
+                version: "1.0".to_string(),
+                downloads: 1,
+                bytes: 42,
+            }],
+            removed_downloads: 2,
+            unassociated_downloads: 1,
+            unassociated_bytes: 10,
+            reclaimed_bytes: 52,
+        };
+        assert_result_valid("CleanupResult", &CleanupResult::Executed(&cleanup));
+        let cleanup_plan = CleanupPlanOutput {
+            mode: PlanMode::Plan,
+            would_remove: vec![CachedDownloadRecord {
+                name: "demo".to_string(),
+                version: "1.0".to_string(),
+                downloads: 1,
+                bytes: 42,
+            }],
+            would_remove_downloads: 2,
+            unassociated_downloads: 1,
+            unassociated_bytes: 10,
+            requires_confirmation: true,
+            would_reclaim_bytes: 52,
+        };
+        assert_result_valid("CleanupResult", &CleanupResult::Plan(&cleanup_plan));
 
         let status = StatusOutput {
             version: "0.1.0",

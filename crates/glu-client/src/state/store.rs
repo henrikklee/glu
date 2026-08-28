@@ -4,7 +4,7 @@ use crate::state::{
     receipts::{self, GluInstallReceipt, ReceiptStatus},
 };
 use anyhow::{Context, Result};
-use glu_core::{InstalledPackage, PackageLinkMetadata, Prefix};
+use glu_core::{InstalledPackage, KegVersion, PackageLinkMetadata, PackageName, Prefix};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -20,6 +20,13 @@ use std::{
 #[derive(Debug, Clone)]
 pub struct InstalledStateStore {
     prefix: Prefix,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledArtifact {
+    pub name: PackageName,
+    pub keg_version: KegVersion,
+    pub sha256: String,
 }
 
 impl InstalledStateStore {
@@ -131,16 +138,39 @@ impl InstalledStateStore {
         )
     }
 
+    /// Returns the package identity attached to each installed bottle digest.
+    /// Receipt IO remains inside the store; malformed and incomplete receipts
+    /// are ignored just as they are for the installed-state snapshot.
+    pub fn load_installed_artifacts(&self) -> Result<Vec<InstalledArtifact>> {
+        Ok(self
+            .load_complete_receipts(&mut Vec::new())?
+            .into_iter()
+            .map(|receipt| InstalledArtifact {
+                name: receipt.package.name,
+                keg_version: receipt.package.keg_version,
+                sha256: receipt.artifact.sha256,
+            })
+            .collect())
+    }
+
+    fn load_installed_packages(&self, warnings: &mut Vec<String>) -> Result<Vec<InstalledPackage>> {
+        Ok(self
+            .load_complete_receipts(warnings)?
+            .into_iter()
+            .map(|receipt| receipt.installed_package())
+            .collect())
+    }
+
     /// Reads every complete keg receipt under `prefix/Cellar`. Missing Cellar
     /// is an empty state. Malformed receipts are skipped so one damaged keg
     /// does not brick read-only commands.
-    fn load_installed_packages(&self, warnings: &mut Vec<String>) -> Result<Vec<InstalledPackage>> {
+    fn load_complete_receipts(&self, warnings: &mut Vec<String>) -> Result<Vec<GluInstallReceipt>> {
         let cellar = self.prefix.0.join("Cellar");
         if !cellar.exists() {
             return Ok(Vec::new());
         }
 
-        let mut installed = Vec::new();
+        let mut receipts = Vec::new();
         for rack in
             fs::read_dir(&cellar).with_context(|| format!("reading {}", cellar.display()))?
         {
@@ -189,11 +219,11 @@ impl InstalledStateStore {
                 if !keg_path_inside_cellar(&self.prefix, &receipt.paths.keg) {
                     continue;
                 }
-                installed.push(receipt.installed_package());
+                receipts.push(receipt);
             }
         }
 
-        Ok(installed)
+        Ok(receipts)
     }
 }
 
@@ -321,6 +351,22 @@ mod tests {
             .load_installed_state()
             .unwrap();
         assert_eq!(state.names(), vec![PackageName("good".to_string())]);
+    }
+
+    #[test]
+    fn installed_artifacts_are_projected_from_store_owned_receipt_reads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let prefix = Prefix(dir.path().join("prefix"));
+        write_good_receipt(&prefix, "demo", "1.0");
+
+        let artifacts = InstalledStateStore::new(prefix)
+            .load_installed_artifacts()
+            .unwrap();
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].name.0, "demo");
+        assert_eq!(artifacts[0].keg_version.0, "1.0");
+        assert_eq!(artifacts[0].sha256, "a".repeat(64));
     }
 
     #[test]

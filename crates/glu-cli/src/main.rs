@@ -14,13 +14,13 @@ use anyhow::anyhow;
 use args::{Cli, Command};
 use clap::Parser;
 use command_model::{
-    command_spec_by_id, CliError, CliErrorDetails, CommandId, CommandOutput, CommandSpec,
-    ErrorCode, ErrorPackageRecord, ErrorUpdateRecord, ExitClass, GlobalOptions, InfoManyOutput,
-    InfoOutput, InfoPackageError, InfoPackageResult, InstallConfirmationDetails, InvocationInfo,
-    ListOutput, ListScope, ListView, OperationErrorDetails, PackagesErrorDetails,
-    PartialInstallDetails, PlannedRemovalsDetails, RegistryErrorDetails,
-    RemovalConfirmationDetails, RequirementErrorDetails, ReverseDepsOutput, ReverseDepsSource,
-    UnsupportedOptionDetails, UpdateConfirmationDetails, COMMAND_SPECS,
+    command_spec_by_id, CleanupConfirmationDetails, CleanupConfirmationRecord, CliError,
+    CliErrorDetails, CommandId, CommandOutput, CommandSpec, ErrorCode, ErrorPackageRecord,
+    ErrorUpdateRecord, ExitClass, GlobalOptions, InfoManyOutput, InfoOutput, InfoPackageError,
+    InfoPackageResult, InstallConfirmationDetails, InvocationInfo, ListOutput, ListScope, ListView,
+    OperationErrorDetails, PackagesErrorDetails, PartialInstallDetails, PlannedRemovalsDetails,
+    RegistryErrorDetails, RemovalConfirmationDetails, RequirementErrorDetails, ReverseDepsOutput,
+    ReverseDepsSource, UnsupportedOptionDetails, UpdateConfirmationDetails, COMMAND_SPECS,
 };
 use glu_client::{config::ClientConfig, install::InstallOptions, GluClient};
 use glu_core::{PackageName, PackageSelector};
@@ -237,7 +237,9 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                 if json {
                     return Err(install_confirmation_failure(&install_plan, "install"));
                 }
-                confirm::confirm_install(&install_plan, "install")?;
+                if !confirm::confirm_install(&install_plan, "install")? {
+                    return Ok((None, globals));
+                }
             }
             if !json {
                 output::render_install_execution_plan(&install_plan, "install", tree);
@@ -271,7 +273,9 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                 if json {
                     return Err(install_confirmation_failure(&install_plan, "reinstall"));
                 }
-                confirm::confirm_install(&install_plan, "reinstall")?;
+                if !confirm::confirm_install(&install_plan, "reinstall")? {
+                    return Ok((None, globals));
+                }
             }
             if !json {
                 output::render_install_execution_plan(&install_plan, "reinstall", false);
@@ -312,12 +316,64 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                         ),
                     )));
                 }
-                confirm::confirm_autoremove(&dangling)?;
+                if !confirm::confirm_autoremove(&dangling)? {
+                    return Ok((None, globals));
+                }
             }
             let removed = client.execute_autoremove(&dangling)?;
             final_output = Some(CommandOutput::Autoremove(output::autoremove_output(
                 &removed,
             )));
+        }
+        Command::Cleanup {} => {
+            let cleanup_plan = client.plan_cache_cleanup()?;
+            if plan {
+                final_output = Some(CommandOutput::CleanupPlan(output::cleanup_plan_output(
+                    &cleanup_plan,
+                )));
+                return Ok((final_output, globals));
+            }
+            if cleanup_plan.bottles().is_empty() {
+                final_output = Some(CommandOutput::Cleanup(output::cleanup_output(
+                    &glu_client::download::cache::CacheCleanupResult::default(),
+                )));
+                return Ok((final_output, globals));
+            }
+            if !yes {
+                if json {
+                    let summary = output::cleanup_plan_output(&cleanup_plan);
+                    let planned_removals = summary
+                        .would_remove
+                        .into_iter()
+                        .map(|bottle| CleanupConfirmationRecord {
+                            name: bottle.name,
+                            version: bottle.version,
+                            downloads: bottle.downloads,
+                            bytes: bottle.bytes,
+                        })
+                        .collect();
+                    return Err(CliFailure::Structured(Box::new(
+                        CliError::confirmation_required(
+                            "cleanup would remove cached downloads; rerun with --yes to approve this computed plan",
+                            vec!["glu cleanup --yes --json".to_string()],
+                            Some(CliErrorDetails::CleanupConfirmation(
+                                CleanupConfirmationDetails {
+                                    planned_removals,
+                                    planned_downloads: summary.would_remove_downloads,
+                                    unassociated_downloads: summary.unassociated_downloads,
+                                    unassociated_bytes: summary.unassociated_bytes,
+                                    reclaimable_bytes: summary.would_reclaim_bytes,
+                                },
+                            )),
+                        ),
+                    )));
+                }
+                if !confirm::confirm_cleanup(&cleanup_plan)? {
+                    return Ok((None, globals));
+                }
+            }
+            let cleaned = client.execute_cache_cleanup(&cleanup_plan)?;
+            final_output = Some(CommandOutput::Cleanup(output::cleanup_output(&cleaned)));
         }
         Command::Remove { names } => {
             let removal_plan =
@@ -359,7 +415,9 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                         ),
                     )));
                 }
-                confirm::confirm_removal(&removal_plan)?;
+                if !confirm::confirm_removal(&removal_plan)? {
+                    return Ok((None, globals));
+                }
             }
             let removed = client.execute_removal(&removal_plan)?;
             // `.bottle`-sourced config files are real copies in the prefix now
@@ -667,7 +725,9 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                         ),
                     )));
                 }
-                confirm::confirm_update(&plan, tree)?;
+                if !confirm::confirm_update(&plan, tree)? {
+                    return Ok((None, globals));
+                }
             }
             let summary = client.execute_update(plan, verbose, events.clone()).await?;
             final_output = Some(CommandOutput::Update(output::update_output(&summary)));
@@ -1534,6 +1594,20 @@ mod tests {
             CliErrorDetails::PlannedRemovals(crate::command_model::PlannedRemovalsDetails {
                 planned_removals: vec![package()],
             }),
+            CliErrorDetails::CleanupConfirmation(
+                crate::command_model::CleanupConfirmationDetails {
+                    planned_removals: vec![crate::command_model::CleanupConfirmationRecord {
+                        name: "demo".to_string(),
+                        version: "1.0".to_string(),
+                        downloads: 1,
+                        bytes: 42,
+                    }],
+                    planned_downloads: 2,
+                    unassociated_downloads: 1,
+                    unassociated_bytes: 10,
+                    reclaimable_bytes: 52,
+                },
+            ),
             CliErrorDetails::RemovalConfirmation(
                 crate::command_model::RemovalConfirmationDetails {
                     named: vec![package()],

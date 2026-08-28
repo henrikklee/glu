@@ -102,13 +102,19 @@ pub(crate) fn render_counted_section(
     noun: &str,
     items: &[PackageListItem],
 ) -> String {
+    render_counted_section_with_total(action, noun, items.len(), items)
+}
+
+pub(crate) fn render_counted_section_with_total(
+    action: &str,
+    noun: &str,
+    total: usize,
+    items: &[PackageListItem],
+) -> String {
     if items.is_empty() {
         return String::new();
     }
-    let heading = format!(
-        "{action} {}:",
-        glu_client::format::plural(items.len(), noun)
-    );
+    let heading = format!("{action} {}:", glu_client::format::plural(total, noun));
     render(Some(&heading), true, items)
 }
 
@@ -136,6 +142,18 @@ pub(crate) fn print_section(action: &str, items: &[PackageListItem]) {
 
 pub(crate) fn print_counted_section(action: &str, noun: &str, items: &[PackageListItem]) {
     let rendered = render_counted_section(action, noun, items);
+    if !rendered.is_empty() {
+        println!("{rendered}");
+    }
+}
+
+pub(crate) fn print_counted_section_with_total(
+    action: &str,
+    noun: &str,
+    total: usize,
+    items: &[PackageListItem],
+) {
+    let rendered = render_counted_section_with_total(action, noun, total, items);
     if !rendered.is_empty() {
         println!("{rendered}");
     }

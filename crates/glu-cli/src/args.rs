@@ -18,7 +18,7 @@ pub(crate) struct GlobalArgs {
     #[arg(short = 't', long, global = true)]
     pub(crate) tree: bool,
 
-    /// Preview a mutation without changing package or declaration state.
+    /// Preview a mutation without changing glu state.
     #[arg(short = 'p', long, global = true)]
     pub(crate) plan: bool,
 
@@ -144,6 +144,13 @@ dangling set — and the repair tool for bad state (interrupted commands, \
 manual edits). Always lists what it will remove and asks (`-y` skips); \
 prints `No unused packages to remove.` when there is nothing to do.")]
     Autoremove {},
+
+    /// Remove cached package downloads.
+    #[command(long_about = "\
+Removes every completed and partial package download from glu's artifact cache. \
+Lists matching package names and asks before deleting anything; `--plan` previews \
+without mutation and `--yes` approves the computed plan.")]
+    Cleanup {},
 
     /// Keep packages installed but remove their public prefix links.
     #[command(
@@ -364,6 +371,7 @@ impl Command {
             Self::Update { .. } => CommandId::Update,
             Self::Remove { .. } => CommandId::Remove,
             Self::Autoremove { .. } => CommandId::Autoremove,
+            Self::Cleanup { .. } => CommandId::Cleanup,
             Self::Deactivate { .. } => CommandId::Deactivate,
             Self::Activate { .. } => CommandId::Activate,
             Self::List { .. } => CommandId::List,

@@ -141,6 +141,31 @@ impl GluClient {
         install::execute_install(self, plan, options, events).await
     }
 
+    pub fn plan_cache_cleanup(&self) -> Result<download::cache::CacheCleanupPlan> {
+        let packages_by_sha256 = state::store::InstalledStateStore::new(self.config.prefix.clone())
+            .load_installed_artifacts()?
+            .into_iter()
+            .map(|artifact| {
+                (
+                    artifact.sha256,
+                    download::cache::CachedBottlePackage {
+                        name: artifact.name,
+                        keg_version: artifact.keg_version,
+                    },
+                )
+            })
+            .collect();
+        download::cache::ArtifactCache::new(&self.config.prefix)
+            .plan_cleanup_with_packages(&packages_by_sha256)
+    }
+
+    pub fn execute_cache_cleanup(
+        &self,
+        plan: &download::cache::CacheCleanupPlan,
+    ) -> Result<download::cache::CacheCleanupResult> {
+        download::cache::ArtifactCache::new(&self.config.prefix).execute_cleanup(plan)
+    }
+
     /// Validates reinstall targets before planning/execution. `reinstall`
     /// repours installed packages only; `glu install --force` is the variant
     /// that installs absent packages instead.

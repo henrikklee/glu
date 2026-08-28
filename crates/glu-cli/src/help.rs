@@ -40,7 +40,7 @@ const HELP_FOOTER: &[HelpFooterItem] = &[
     HelpFooterItem {
         label: "-p, --plan",
         description: HelpFooterDescription::Static(
-            "Preview the computed mutation without changing package or declaration state.",
+            "Preview the computed mutation without changing glu state.",
         ),
     },
     HelpFooterItem {

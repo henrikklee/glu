@@ -635,6 +635,23 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         subcommands: EMPTY_COMMANDS,
     },
     CommandSpec {
+        id: CommandId::Cleanup,
+        name: "cleanup",
+        group: CommandGroup::Maintenance,
+        aliases: &[],
+        summary: "Remove cached package downloads",
+        default_behavior: "Removes all completed and partial package downloads from the artifact cache; requires confirmation or --yes.",
+        arguments: EMPTY_ARGUMENTS,
+        mutates: true,
+        default_scope: Some("artifact cache"),
+        output_protocols: HUMAN_JSON,
+        capabilities: CAP_PLAN_YES,
+        result_schema: Some("CleanupResult"),
+        options: YES_OPTIONS,
+        examples: &["glu cleanup --plan", "glu cleanup", "glu cleanup -yj"],
+        subcommands: EMPTY_COMMANDS,
+    },
+    CommandSpec {
         id: CommandId::Deactivate,
         name: "deactivate",
         group: CommandGroup::PackageManagement,
@@ -966,6 +983,8 @@ pub(crate) enum CommandId {
     Remove,
     #[serde(rename = "autoremove")]
     Autoremove,
+    #[serde(rename = "cleanup")]
+    Cleanup,
     #[serde(rename = "activate")]
     Activate,
     #[serde(rename = "deactivate")]
@@ -1012,6 +1031,7 @@ impl CommandId {
         Self::Update,
         Self::Remove,
         Self::Autoremove,
+        Self::Cleanup,
         Self::Activate,
         Self::Deactivate,
         Self::List,
@@ -1039,6 +1059,7 @@ impl CommandId {
             Self::Update => "update",
             Self::Remove => "remove",
             Self::Autoremove => "autoremove",
+            Self::Cleanup => "cleanup",
             Self::Activate => "activate",
             Self::Deactivate => "deactivate",
             Self::List => "list",
@@ -1156,6 +1177,7 @@ pub(crate) enum CliErrorDetails {
     Declaration(DeclarationErrorDetails),
     Parse(ParseErrorDetails),
     PlannedRemovals(PlannedRemovalsDetails),
+    CleanupConfirmation(CleanupConfirmationDetails),
     RemovalConfirmation(RemovalConfirmationDetails),
     UpdateConfirmation(UpdateConfirmationDetails),
     InstallConfirmation(InstallConfirmationDetails),
@@ -1201,6 +1223,23 @@ pub(crate) struct ErrorUpdateRecord {
 #[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
 pub(crate) struct PlannedRemovalsDetails {
     pub(crate) planned_removals: Vec<ErrorPackageRecord>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct CleanupConfirmationRecord {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) downloads: usize,
+    pub(crate) bytes: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct CleanupConfirmationDetails {
+    pub(crate) planned_removals: Vec<CleanupConfirmationRecord>,
+    pub(crate) planned_downloads: usize,
+    pub(crate) unassociated_downloads: usize,
+    pub(crate) unassociated_bytes: u64,
+    pub(crate) reclaimable_bytes: u64,
 }
 
 #[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
@@ -1575,6 +1614,8 @@ pub(crate) enum CommandOutput {
     RemovalPlan(RemovalPlanOutput),
     Autoremove(AutoremoveOutput),
     AutoremovePlan(AutoremovePlanOutput),
+    Cleanup(CleanupOutput),
+    CleanupPlan(CleanupPlanOutput),
     Status(StatusOutput),
     Outdated(OutdatedOutput),
     TraceView(crate::trace_cmd::TraceViewOutput),
@@ -1860,6 +1901,35 @@ pub(crate) struct AutoremovePlanOutput {
     pub(crate) mode: PlanMode,
     pub(crate) would_remove: Vec<MutationPackageRecord>,
     pub(crate) requires_confirmation: bool,
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct CachedDownloadRecord {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) downloads: usize,
+    pub(crate) bytes: u64,
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct CleanupOutput {
+    pub(crate) mode: ExecutedMode,
+    pub(crate) removed: Vec<CachedDownloadRecord>,
+    pub(crate) removed_downloads: usize,
+    pub(crate) unassociated_downloads: usize,
+    pub(crate) unassociated_bytes: u64,
+    pub(crate) reclaimed_bytes: u64,
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct CleanupPlanOutput {
+    pub(crate) mode: PlanMode,
+    pub(crate) would_remove: Vec<CachedDownloadRecord>,
+    pub(crate) would_remove_downloads: usize,
+    pub(crate) unassociated_downloads: usize,
+    pub(crate) unassociated_bytes: u64,
+    pub(crate) requires_confirmation: bool,
+    pub(crate) would_reclaim_bytes: u64,
 }
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]

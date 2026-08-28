@@ -128,7 +128,7 @@ The internal postinstall worker is the only client path allowed to write process
 
 Mutating commands that support plan mode compute the same state transition as execution, then stop before mutation.
 
-Plan output shows the meaningful transition: install, update, reinstall, promote, rename, remove, keep, satisfy, download size, and confirmation requirement where relevant. Package records include local-state and impact annotations when known: `installed`, `linked`, `declared`, `deactivated`, `direct`, `transitive`, `cached`, `download_bytes`, and receipt-backed `installed_bytes`.
+Plan output shows the meaningful transition: install, update, reinstall, promote, rename, remove, keep, satisfy, download size, and confirmation requirement where relevant. Package records include local-state and impact annotations when known: `installed`, `linked`, `declared`, `deactivated`, `direct`, `transitive`, `cached`, `download_bytes`, and receipt-backed `installed_bytes`. `glu cleanup --plan` lists package names for cached downloads that match installed-receipt metadata, summarizes unassociated downloads, and reports total reclaimable bytes.
 
 Plan mode is a read-only boundary between decision and execution. Recovery cleanup, lock-protected mutation, and package changes happen only on the execution side. Install and update plans preserve their dependency graph when `--tree` is selected.
 
@@ -136,7 +136,7 @@ Plan mode is a read-only boundary between decision and execution. Recovery clean
 
 `--yes` approves the computed plan. It does not imply `--force`, `--all`, `--dependents`, or any other broadening behavior.
 
-Commands ask for confirmation when the plan is broad by nature or removes more than the user directly named. In non-interactive use, a command that needs confirmation refuses and points at `--yes` instead of choosing a default.
+Commands ask for confirmation when the plan is broad by nature or removes more than the user directly named. Cache cleanup always asks when cached downloads are present. At an interactive prompt, `Y` proceeds and `N` or Escape cancels immediately; Enter accepts the displayed default. Cancellation is a normal successful exit and does not render an error. In non-interactive use, a command that needs confirmation refuses and points at `--yes` instead of choosing a default.
 
 This keeps safety independent from parser shape. New flags must not weaken confirmation semantics.
 

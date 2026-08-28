@@ -112,6 +112,7 @@ glu reinstall [--deps] <name...>
 glu update [name...]               alias: up
 glu remove <selector...>           aliases: rm, uninstall
 glu autoremove
+glu cleanup
 glu deactivate <name...>           alias: unlink
 glu activate [--force] <name...>   alias: link
 glu list                           alias: ls
