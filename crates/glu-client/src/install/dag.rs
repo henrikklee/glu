@@ -201,7 +201,7 @@ pub fn make_execution_plan(
 ) -> Result<ExecutionPlan> {
     let satisfied = workset.satisfied.iter().cloned().collect::<BTreeSet<_>>();
     let uncached = uncached_packages(manifest, &workset.install, prefix)?;
-    let priorities = package_priorities(manifest, &workset.install);
+    let priorities = package_priorities(manifest, &workset.install, &uncached)?;
 
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
@@ -655,43 +655,49 @@ fn cache_node_id(kind: &str, key: &[String]) -> String {
     id
 }
 
-/// Computes, in one linear pass, both the blended per-package scheduling priority (used for
-/// `ExecNode.priority`) and the raw normalized critical-path score keyed by formula name (used
-/// by the scheduler's live download-ranking heuristic). `install` must be in dependency-before-
-/// dependent order (as produced by `graph::order_selected_packages`), which lets the critical path be
-/// computed by a single reverse walk instead of memoized recursion: by the time a package is
-/// visited (back to front), every package that depends on it has already been visited.
+/// Computes the legacy blended per-package priority used to order ready
+/// non-download work. Download dispatch has its own execution-DAG tail rank in
+/// the scheduler.
+///
+/// The dependency relation matches the execution DAG's collapsed selected
+/// frontier, including selected dependencies below reused intermediates. Only
+/// uncached artifacts contribute transfer bytes; a cached artifact is a
+/// zero-transfer handoff whose urgency comes solely from the work it unlocks.
+/// Packages outside `install` contribute neither work nor downstream cost.
 fn package_priorities(
     manifest: &InstallManifest,
     install: &[PackageId],
-) -> BTreeMap<PackageId, f64> {
+    uncached: &BTreeSet<PackageId>,
+) -> Result<BTreeMap<PackageId, f64>> {
     let position = install
         .iter()
         .enumerate()
         .map(|(index, id)| (id.clone(), index))
         .collect::<BTreeMap<_, _>>();
+    let selected = install.iter().cloned().collect::<BTreeSet<_>>();
     let mut dependents = BTreeMap::<PackageId, BTreeSet<PackageId>>::new();
-    let mut sizes = BTreeMap::<PackageId, u64>::new();
+    let mut transfer_bytes = BTreeMap::<PackageId, u64>::new();
     for package_id in install {
-        let Ok(pkg) = manifest.require_package(package_id) else {
-            continue;
+        let package = manifest.require_package(package_id)?;
+        let bytes = if uncached.contains(package_id) {
+            manifest
+                .require_artifact(&package.artifact)?
+                .bytes
+                .unwrap_or(0)
+        } else {
+            0
         };
-        let size = manifest
-            .artifacts
-            .get(&pkg.artifact)
-            .and_then(|artifact| artifact.bytes)
-            .unwrap_or(0);
-        sizes.insert(package_id.clone(), size);
+        transfer_bytes.insert(package_id.clone(), bytes);
         dependents.entry(package_id.clone()).or_default();
-        for dep in &pkg.deps {
+        for dependency_id in graph::selected_dependency_frontier(manifest, package_id, &selected)? {
             // Only the edge direction the plan actually kept (see add_dependency_edges)
             // contributes; the dropped side of a cyclic pair must not be treated as a real
             // "downstream" edge here either, or the reverse pass below would read an
             // as-yet-unvisited entry.
-            if let Some(&dep_position) = position.get(&dep.package) {
+            if let Some(&dep_position) = position.get(&dependency_id) {
                 if dep_position < position[package_id] {
                     dependents
-                        .entry(dep.package.clone())
+                        .entry(dependency_id)
                         .or_default()
                         .insert(package_id.clone());
                 }
@@ -701,7 +707,7 @@ fn package_priorities(
 
     let mut critical = BTreeMap::<PackageId, f64>::new();
     for package_id in install.iter().rev() {
-        let own = ((*sizes.get(package_id).unwrap_or(&0) as f64) + 1.0).ln();
+        let own = ((*transfer_bytes.get(package_id).unwrap_or(&0) as f64) + 1.0).ln();
         let downstream = dependents
             .get(package_id)
             .into_iter()
@@ -712,18 +718,19 @@ fn package_priorities(
     }
 
     let max_critical = critical.values().copied().fold(0.0, f64::max).max(1.0);
-    let max_size = sizes.values().copied().max().unwrap_or(1).max(1) as f64;
+    let max_transfer_bytes = transfer_bytes.values().copied().max().unwrap_or(1).max(1) as f64;
 
     let mut priority = BTreeMap::new();
     for package_id in install {
         let normalized_critical = critical.get(package_id).copied().unwrap_or(0.0) / max_critical;
-        let normalized_size = *sizes.get(package_id).unwrap_or(&0) as f64 / max_size;
+        let normalized_transfer =
+            *transfer_bytes.get(package_id).unwrap_or(&0) as f64 / max_transfer_bytes;
         priority.insert(
             package_id.clone(),
-            (0.75 * normalized_critical) + (0.25 * normalized_size),
+            (0.75 * normalized_critical) + (0.25 * normalized_transfer),
         );
     }
-    priority
+    Ok(priority)
 }
 
 fn dedupe_edges(edges: Vec<ExecEdge>) -> Vec<ExecEdge> {
@@ -969,6 +976,58 @@ mod tests {
             "keg_link:root",
             "formula_dependency_committed"
         )));
+    }
+
+    #[test]
+    fn package_priority_uses_the_same_transitive_frontier_as_execution() {
+        let (leaf_id, leaf, leaf_artifact) = pkg("leaf", vec![], vec![], 10);
+        let (bridge_id, bridge, bridge_artifact) = pkg("bridge", vec!["leaf"], vec![], 10);
+        let (root_id, root, root_artifact) = pkg("root", vec!["bridge"], vec![], 20);
+        let manifest = manifest(
+            vec![
+                (leaf_id.clone(), leaf, leaf_artifact),
+                (bridge_id, bridge, bridge_artifact),
+                (root_id.clone(), root, root_artifact),
+            ],
+            vec![root_id.clone()],
+        );
+        let install = vec![leaf_id.clone(), root_id.clone()];
+        let uncached = install.iter().cloned().collect();
+
+        let priorities = package_priorities(&manifest, &install, &uncached).unwrap();
+
+        assert!(priorities[&leaf_id] > priorities[&root_id]);
+    }
+
+    #[test]
+    fn cached_or_unselected_packages_add_no_transfer_cost() {
+        let (cached_id, cached, cached_artifact) = pkg("cached", vec![], vec![], 10_000);
+        let (uncached_id, uncached, uncached_artifact) = pkg("uncached", vec![], vec![], 10);
+        let (unused_id, unused, unused_artifact) = pkg("unused", vec![], vec![], 1_000_000);
+        let manifest = manifest(
+            vec![
+                (cached_id.clone(), cached, cached_artifact),
+                (uncached_id.clone(), uncached, uncached_artifact),
+                (unused_id.clone(), unused, unused_artifact),
+            ],
+            vec![cached_id.clone(), uncached_id.clone()],
+        );
+        let install = vec![cached_id.clone(), uncached_id.clone()];
+        let uncached_packages = BTreeSet::from([uncached_id.clone()]);
+
+        let priorities = package_priorities(&manifest, &install, &uncached_packages).unwrap();
+
+        assert_eq!(priorities[&cached_id], 0.0);
+        assert!(priorities[&uncached_id] > 0.0);
+        assert!(!priorities.contains_key(&unused_id));
+
+        let workset = InstallWorkSet {
+            satisfied: vec![],
+            rename: vec![],
+            install,
+        };
+        let plan = execution_plan(&manifest, &workset, &Prefix(PathBuf::from("/tmp/glu")));
+        assert!(plan.node("formula_postinstall:unused").is_none());
     }
 
     #[test]
