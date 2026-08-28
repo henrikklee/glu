@@ -32,11 +32,9 @@ pub struct RenameWorkItem {
 }
 
 /// How a command's requested roots and their dependency closure become
-/// install/satisfied work. One function, one mode — previously the mode
-/// concept was split across five near-duplicate builders
-/// (`compute_workset` / `force_roots_workset` / `reinstall_closure_workset` /
-/// `reinstall_roots_workset` / `update_roots_workset`) plus an if/else in
-/// the installer front-matter.
+/// install/satisfied work. One public planner boundary owns the modes; private
+/// passes may differ where command semantics genuinely require different
+/// traversal behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorksetMode {
     /// `glu install`: a root is satisfied by *any* installed version
@@ -45,13 +43,19 @@ pub enum WorksetMode {
     /// are never walked and absent roots flow through the regular
     /// real-checked closure.
     Install,
-    /// `glu update`, `glu install --force`, `glu reinstall`: every named
-    /// root repours regardless of installed state, and the whole closure is
-    /// real-checked below them — a version bump can introduce new
-    /// dependencies, which `Install`'s pruned walk (satisfied roots never
-    /// walked) would silently miss. "No matter how the system is right now,
-    /// make it as I say."
+    /// `glu install --force` / `glu reinstall`: every named root repours
+    /// regardless of installed state, and the whole closure is real-checked
+    /// below them. "No matter how the system is right now, make it as I say."
     Force,
+    /// Named and bare `glu update`: update selected roots when their release
+    /// or persisted package facts differ, but retain dependencies that still
+    /// satisfy the requiring package. Roots are inspected even when already
+    /// current so newly required or changed dependency topology is reconciled.
+    UpdateRoots,
+    /// `glu update --all`: inspect every package in the resolved declared-root
+    /// closure and select every release or persisted package fact that differs
+    /// from installed state. Exact matches are not repoured.
+    UpdateAll,
     /// `glu install --force --deps` / `glu reinstall --deps`: repour the
     /// full dependency closure of the named roots.
     ReinstallDeps,
@@ -142,6 +146,8 @@ pub fn compute_workset(
             })?;
             Ok(finalize_workset(satisfied, rename, install))
         }
+        WorksetMode::UpdateRoots => update_roots_workset(manifest, state),
+        WorksetMode::UpdateAll => update_all_workset(manifest, state),
         WorksetMode::ReinstallDeps => {
             let install =
                 graph::dependency_order(manifest, &manifest.root_package_ids(), |_, _| Ok(true))?;
@@ -152,6 +158,157 @@ pub fn compute_workset(
             })
         }
     }
+}
+
+fn update_roots_workset(
+    manifest: &InstallManifest,
+    state: &InstalledState,
+) -> Result<InstallWorkSet> {
+    let mut selected = BTreeSet::new();
+    let mut satisfied = BTreeSet::new();
+    let mut rename = BTreeSet::new();
+    let mut expanded = BTreeSet::new();
+
+    for root in &manifest.roots {
+        let package = manifest.require_package(&root.package)?;
+        record_selected_package_match(
+            &root.package,
+            package,
+            state,
+            &mut selected,
+            &mut satisfied,
+            &mut rename,
+        )?;
+        select_required_dependencies(
+            &root.package,
+            manifest,
+            state,
+            &mut selected,
+            &mut satisfied,
+            &mut rename,
+            &mut expanded,
+        )?;
+    }
+
+    let install = graph::order_selected_packages(manifest, &selected)?;
+    Ok(finalize_workset(satisfied, rename, install))
+}
+
+fn select_required_dependencies(
+    package_id: &PackageId,
+    manifest: &InstallManifest,
+    state: &InstalledState,
+    selected: &mut BTreeSet<PackageId>,
+    satisfied: &mut BTreeSet<PackageId>,
+    rename: &mut BTreeSet<RenameWorkItem>,
+    expanded: &mut BTreeSet<PackageId>,
+) -> Result<()> {
+    if !expanded.insert(package_id.clone()) {
+        return Ok(());
+    }
+    let package = manifest.require_package(package_id)?;
+    for dependency in &package.deps {
+        if selected.contains(&dependency.package) {
+            continue;
+        }
+        match dependency_match(package, dependency, manifest, state)? {
+            PackageMatch::Current => {
+                satisfied.insert(dependency.package.clone());
+            }
+            PackageMatch::PreviousName(rename_item) => {
+                rename.insert(RenameWorkItem {
+                    package: dependency.package.clone(),
+                    ..rename_item
+                });
+            }
+            PackageMatch::Missing => {
+                selected.insert(dependency.package.clone());
+                select_required_dependencies(
+                    &dependency.package,
+                    manifest,
+                    state,
+                    selected,
+                    satisfied,
+                    rename,
+                    expanded,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn update_all_workset(
+    manifest: &InstallManifest,
+    state: &InstalledState,
+) -> Result<InstallWorkSet> {
+    let mut selected = BTreeSet::new();
+    let mut satisfied = BTreeSet::new();
+    let mut rename = BTreeSet::new();
+    let mut expanded = BTreeSet::new();
+    for root in &manifest.roots {
+        inspect_complete_closure(
+            &root.package,
+            manifest,
+            state,
+            &mut selected,
+            &mut satisfied,
+            &mut rename,
+            &mut expanded,
+        )?;
+    }
+    let install = graph::order_selected_packages(manifest, &selected)?;
+    Ok(finalize_workset(satisfied, rename, install))
+}
+
+fn inspect_complete_closure(
+    package_id: &PackageId,
+    manifest: &InstallManifest,
+    state: &InstalledState,
+    selected: &mut BTreeSet<PackageId>,
+    satisfied: &mut BTreeSet<PackageId>,
+    rename: &mut BTreeSet<RenameWorkItem>,
+    expanded: &mut BTreeSet<PackageId>,
+) -> Result<()> {
+    if !expanded.insert(package_id.clone()) {
+        return Ok(());
+    }
+    let package = manifest.require_package(package_id)?;
+    record_selected_package_match(package_id, package, state, selected, satisfied, rename)?;
+    for dependency in &package.deps {
+        inspect_complete_closure(
+            &dependency.package,
+            manifest,
+            state,
+            selected,
+            satisfied,
+            rename,
+            expanded,
+        )?;
+    }
+    Ok(())
+}
+
+fn record_selected_package_match(
+    package_id: &PackageId,
+    package: &ResolvedPackage,
+    state: &InstalledState,
+    selected: &mut BTreeSet<PackageId>,
+    satisfied: &mut BTreeSet<PackageId>,
+    rename: &mut BTreeSet<RenameWorkItem>,
+) -> Result<()> {
+    match selected_package_match(package_id, package, state)? {
+        PackageMatch::Current => {
+            satisfied.insert(package_id.clone());
+        }
+        PackageMatch::PreviousName(rename_item) => {
+            rename.insert(rename_item);
+        }
+        PackageMatch::Missing => {
+            selected.insert(package_id.clone());
+        }
+    }
+    Ok(())
 }
 
 fn finalize_workset(
@@ -173,8 +330,8 @@ fn finalize_workset(
 /// already-outdated package that depends — directly or transitively — on
 /// one of `target_names`. Mirrors Homebrew's `upgrade_dependents` "also
 /// upgrade outdated runtime dependents" pass (`upgrade.rb`). `--all` never
-/// needs this — it already covers every outdated package — only a named
-/// `update` can miss a dependent that isn't part of the resolve request.
+/// needs this because it reconciles the complete declared-root closure; only
+/// a named `update` can miss a dependent outside its resolve request.
 /// Returns just the newly-discovered names (caller extends the target list
 /// and re-resolves); a single pass suffices, `depends_on_any`'s walk is
 /// already transitive per candidate.
@@ -201,6 +358,64 @@ enum PackageMatch {
     Current,
     PreviousName(RenameWorkItem),
     Missing,
+}
+
+fn selected_package_match(
+    package_id: &PackageId,
+    package: &ResolvedPackage,
+    state: &InstalledState,
+) -> Result<PackageMatch> {
+    if let Some(installed) = state.find_by_key(&package.package_key) {
+        return Ok(
+            if installed_package_facts_match(installed, package_id, package) {
+                PackageMatch::Current
+            } else {
+                PackageMatch::Missing
+            },
+        );
+    }
+    previous_name_match(package_id, package, state, |installed| {
+        &installed.id == package_id
+    })
+}
+
+fn installed_package_facts_match(
+    installed: &InstalledPackage,
+    package_id: &PackageId,
+    package: &ResolvedPackage,
+) -> bool {
+    let mut installed_aliases: Vec<_> = installed.aliases.iter().collect();
+    installed_aliases.sort();
+    let mut resolved_aliases: Vec<_> = package.aliases.iter().collect();
+    resolved_aliases.sort();
+    let mut installed_oldnames: Vec<_> = installed.oldnames.iter().collect();
+    installed_oldnames.sort();
+    let mut resolved_oldnames: Vec<_> = package.oldnames.iter().collect();
+    resolved_oldnames.sort();
+    let mut installed_topology: Vec<_> = installed
+        .deps
+        .iter()
+        .map(|dependency| (&dependency.package_key, &dependency.requested_as))
+        .collect();
+    installed_topology.sort();
+    let mut resolved_topology: Vec<_> = package
+        .deps
+        .iter()
+        .map(|dependency| (&dependency.package_key, &dependency.requested_as))
+        .collect();
+    resolved_topology.sort();
+
+    &installed.id == package_id
+        && installed.package_key == package.package_key
+        && installed.name == package.name
+        && installed.version == package.version
+        && installed.revision == package.revision
+        && installed.keg_version == package.keg_version
+        && installed_aliases == resolved_aliases
+        && installed_oldnames == resolved_oldnames
+        && installed_topology == resolved_topology
+        && installed.dependency_requirements == package.dependency_requirements
+        && installed.keg_only == package.install.keg_only
 }
 
 fn root_match(
@@ -406,15 +621,23 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn pkg(name: &str, deps: Vec<&str>) -> (PackageId, ResolvedPackage, ResolvedArtifact) {
-        let id = PackageId(format!("pkg:homebrew/core/{name}@1.0"));
+        pkg_at(name, "1.0", deps)
+    }
+
+    fn pkg_at(
+        name: &str,
+        version: &str,
+        deps: Vec<&str>,
+    ) -> (PackageId, ResolvedPackage, ResolvedArtifact) {
+        let id = PackageId(format!("pkg:homebrew/core/{name}@{version}"));
         let package = ResolvedPackage {
             package_key: glu_core::PackageKey(format!("package:{name}")),
             name: PackageName(name.to_string()),
             aliases: vec![],
             oldnames: vec![],
-            version: "1.0".to_string(),
+            version: version.to_string(),
             revision: 0,
-            keg_version: KegVersion("1.0".to_string()),
+            keg_version: KegVersion(version.to_string()),
             deps: deps
                 .iter()
                 .map(|dep| PackageDependency {
@@ -962,6 +1185,122 @@ mod tests {
         );
         assert!(workset.satisfied.is_empty());
         assert!(workset.rename.is_empty());
+    }
+
+    #[test]
+    fn update_roots_updates_root_but_keeps_a_satisfying_older_dependency() {
+        let state = InstalledState::from_packages(vec![
+            installed_pkg("app", "1.0", vec![("dep", "1.0")]),
+            installed_pkg("dep", "1.0", vec![]),
+        ]);
+        let (dep_id, dep, dep_artifact) = pkg_at("dep", "2.0", vec![]);
+        let (app_id, mut app, app_artifact) = pkg_at("app", "2.0", vec!["dep"]);
+        app.deps[0].package = dep_id.clone();
+        let manifest = manifest_from_parts(
+            vec![
+                (dep_id.clone(), dep, dep_artifact),
+                (app_id.clone(), app, app_artifact),
+            ],
+            vec![app_id.clone()],
+        );
+
+        let workset = compute_workset(&manifest, &state, WorksetMode::UpdateRoots).unwrap();
+
+        assert_eq!(workset.install, vec![app_id]);
+        assert_eq!(workset.satisfied, vec![dep_id]);
+    }
+
+    #[test]
+    fn update_roots_installs_an_insufficient_dependency_before_the_root() {
+        let state = InstalledState::from_packages(vec![
+            installed_pkg("app", "1.0", vec![("dep", "0.9")]),
+            installed_pkg("dep", "0.9", vec![]),
+        ]);
+        let (dep_id, dep, dep_artifact) = pkg_at("dep", "2.0", vec![]);
+        let (app_id, mut app, app_artifact) = pkg_at("app", "2.0", vec!["dep"]);
+        app.deps[0].package = dep_id.clone();
+        let manifest = manifest_from_parts(
+            vec![
+                (dep_id.clone(), dep, dep_artifact),
+                (app_id.clone(), app, app_artifact),
+            ],
+            vec![app_id.clone()],
+        );
+
+        let workset = compute_workset(&manifest, &state, WorksetMode::UpdateRoots).unwrap();
+
+        assert_eq!(workset.install, vec![dep_id, app_id]);
+        assert!(workset.satisfied.is_empty());
+    }
+
+    #[test]
+    fn update_roots_updates_each_changed_declared_root_without_repours() {
+        let state = InstalledState::from_packages(vec![
+            installed_pkg("first", "1.0", vec![]),
+            installed_pkg("second", "2.0", vec![]),
+        ]);
+        let (first_id, first, first_artifact) = pkg_at("first", "2.0", vec![]);
+        let (second_id, second, second_artifact) = pkg_at("second", "2.0", vec![]);
+        let manifest = manifest_from_parts(
+            vec![
+                (first_id.clone(), first, first_artifact),
+                (second_id.clone(), second, second_artifact),
+            ],
+            vec![first_id.clone(), second_id.clone()],
+        );
+
+        let workset = compute_workset(&manifest, &state, WorksetMode::UpdateRoots).unwrap();
+
+        assert_eq!(workset.install, vec![first_id]);
+        assert_eq!(workset.satisfied, vec![second_id]);
+    }
+
+    #[test]
+    fn update_all_updates_a_satisfying_but_older_dependency() {
+        let state = InstalledState::from_packages(vec![
+            installed_pkg("app", "1.0", vec![("dep", "1.0")]),
+            installed_pkg("dep", "1.0", vec![]),
+        ]);
+        let (dep_id, dep, dep_artifact) = pkg_at("dep", "2.0", vec![]);
+        let (app_id, mut app, app_artifact) = pkg("app", vec!["dep"]);
+        app.deps[0].package = dep_id.clone();
+        let manifest = manifest_from_parts(
+            vec![
+                (dep_id.clone(), dep, dep_artifact),
+                (app_id.clone(), app, app_artifact),
+            ],
+            vec![app_id.clone()],
+        );
+
+        let workset = compute_workset(&manifest, &state, WorksetMode::UpdateAll).unwrap();
+
+        assert_eq!(workset.install, vec![dep_id]);
+        assert_eq!(workset.satisfied, vec![app_id]);
+    }
+
+    #[test]
+    fn update_modes_do_not_repour_exact_package_facts() {
+        let state = InstalledState::from_packages(vec![
+            installed_pkg("app", "1.0", vec![("dep", "1.0")]),
+            installed_pkg("dep", "1.0", vec![]),
+        ]);
+        let manifest = manifest(vec!["app"], vec![("app", vec!["dep"]), ("dep", vec![])]);
+
+        for mode in [WorksetMode::UpdateRoots, WorksetMode::UpdateAll] {
+            let workset = compute_workset(&manifest, &state, mode).unwrap();
+            assert!(workset.install.is_empty());
+            assert!(workset.rename.is_empty());
+        }
+    }
+
+    #[test]
+    fn update_roots_reconciles_new_topology_even_at_the_same_release() {
+        let state = InstalledState::from_packages(vec![installed_pkg("app", "1.0", vec![])]);
+        let manifest = manifest(vec!["app"], vec![("app", vec!["dep"]), ("dep", vec![])]);
+
+        let workset = compute_workset(&manifest, &state, WorksetMode::UpdateRoots).unwrap();
+
+        assert_eq!(workset.install, vec![id("dep"), id("app")]);
     }
 
     #[test]

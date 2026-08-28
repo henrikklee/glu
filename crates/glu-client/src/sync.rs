@@ -39,6 +39,10 @@ pub(crate) fn simulate_post_install_state(
         let Some(package) = manifest.packages.get(package_id) else {
             continue;
         };
+        // Reconciliation can rewrite persisted package facts without changing
+        // the concrete release ID. Execution replaces that keg in place, so
+        // simulation must replace—not duplicate—the corresponding receipt.
+        simulated.retain(|installed| &installed.id != package_id);
         simulated.push(InstalledPackage {
             id: package_id.clone(),
             package_key: package.package_key.clone(),
@@ -281,6 +285,39 @@ mod tests {
         // The superseded app@1.0 (name "app") sorts before "old".
         assert_eq!(names, vec!["app", "old"]);
         assert_eq!(dangling[0].keg_version.0, "1.0");
+    }
+
+    #[test]
+    fn same_release_fact_reconciliation_replaces_the_simulated_receipt() {
+        let mut installed_app = pkg("app", vec!["old"]);
+        installed_app.id = PackageId("pkg:test/app@2.0".to_string());
+        installed_app.version = "2.0".to_string();
+        installed_app.keg_version = KegVersion("2.0".to_string());
+        let state = InstalledState::from_packages(vec![installed_app, pkg("old", vec![])]);
+        let (app_id, app) = resolved_pkg("app", vec![]);
+        let manifest = InstallManifest {
+            schema: "glu.resolve.v1".to_string(),
+            request: ResolveRequestEcho {
+                name: vec![PackageSelector("app".to_string())],
+                target: Target("arm64_sequoia".to_string()),
+                slim: false,
+            },
+            roots: vec![root_selection("app", app_id.clone())],
+            packages: BTreeMap::from([(app_id.clone(), app)]),
+            artifacts: BTreeMap::new(),
+        };
+        let workset = InstallWorkSet {
+            satisfied: Vec::new(),
+            rename: Vec::new(),
+            install: vec![app_id],
+        };
+        let declared = BTreeSet::from([PackageName("app".to_string())]);
+
+        let dangling =
+            predicted_dangling_after_workset(&state, &manifest, &workset, &declared).unwrap();
+
+        assert_eq!(dangling.len(), 1);
+        assert_eq!(dangling[0].name.0, "old");
     }
 
     #[test]

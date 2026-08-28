@@ -126,7 +126,7 @@ fn render_node_line(
     context: &BTreeSet<(String, String)>,
 ) -> String {
     let version = (options.show_versions && !node.version.is_empty()).then_some(&node.version);
-    let requirement = options.verbose.then(|| node.requires.as_ref()).flatten();
+    let requirement = options.verbose.then_some(node.requires.as_ref()).flatten();
     let metadata = if let Some(label) = options.version_label {
         let mut parts = Vec::new();
         if let Some(requirement) = requirement {

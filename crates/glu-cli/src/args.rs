@@ -91,21 +91,23 @@ declared one keeps it declared.")]
     #[command(
         visible_alias = "up",
         long_about = "\
-Updates packages to the latest version and syncs. Bare `glu up` and \
-`glu up --all` are broad mutations and always present the plan and ask; a \
-named `glu up <name>` asks only when the update would remove something (a \
-dependency the new version dropped). `-a` also bumps automatic packages; \
-`-c`/`--dependents` makes a named update also update outdated dependents. `update` never \
-changes what is declared."
+Updates packages to the latest version and syncs. Named update changes the \
+selected declared roots; bare `glu up` changes every declared root. Both keep \
+dependencies that still satisfy the resolved requirements. `glu up --all` \
+also updates every package in the declared roots' dependency closure. Bare \
+`glu up` and `glu up --all` are broad mutations and always present the plan \
+and ask; a named update asks only when it would remove something. \
+`-c`/`--dependents` makes a named update also update outdated dependents. \
+`update` never changes what is declared."
     )]
     Update {
         /// Also update installed, outdated packages that depend (directly
         /// or transitively) on the named packages. No effect with --all,
-        /// which already covers every outdated package.
+        /// which already reconciles the complete declared-root closure.
         #[arg(short = 'c', long)]
         dependents: bool,
 
-        /// Update every outdated package instead of naming specific ones.
+        /// Update declared roots and every package in their dependency closure.
         #[arg(short = 'a', long, conflicts_with = "names")]
         all: bool,
 

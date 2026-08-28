@@ -656,12 +656,13 @@ pub struct UpToDatePackage {
 }
 
 /// The result of planning an update. Planning may first discard interrupted
-/// install trash; it does not apply the requested update. The CLI compares
-/// `to_update`/`to_remove` against what was explicitly named
-/// to decide whether to ask for confirmation (docs/reference/cli-behavior.md,
-/// Confirmation policy). The resolved manifest, workset, and
+/// install trash; it does not apply the requested update. The CLI uses the
+/// command scope and removal set to decide whether to ask for confirmation
+/// (docs/reference/cli-behavior.md, Confirmation policy). The resolved manifest, workset, and
 /// pre-command declaration travel with the plan so execution needs no
-/// re-resolution.
+/// re-resolution. `to_update` contains every package selected for install or
+/// rename, including dependencies selected by `--all` or required for root
+/// satisfaction.
 #[derive(Debug)]
 pub struct UpdatePlan {
     pub to_update: Vec<PlannedUpdate>,
@@ -699,15 +700,83 @@ impl UpdatePlan {
     }
 }
 
+#[derive(Debug)]
+struct UpdateTargetSelection {
+    names: Vec<PackageName>,
+    explicit_keys: BTreeSet<glu_core::PackageKey>,
+}
+
+fn select_update_targets(
+    state: &crate::state::installed::InstalledState,
+    declaration: &Declaration,
+    requested: &[PackageSelector],
+) -> Result<UpdateTargetSelection> {
+    let declared: BTreeSet<PackageName> = declaration.names();
+    if requested.is_empty() {
+        return Ok(UpdateTargetSelection {
+            names: declared.into_iter().collect(),
+            explicit_keys: BTreeSet::new(),
+        });
+    }
+
+    let mut missing = Vec::new();
+    let mut automatic = Vec::new();
+    let mut names = BTreeSet::new();
+    let mut explicit_keys = BTreeSet::new();
+    for selector in requested {
+        let Some(installed) = state.resolve_selector(selector) else {
+            missing.push(PackageName(selector.0.clone()));
+            continue;
+        };
+        if !declared.contains(&installed.name) {
+            automatic.push(installed.name.clone());
+            continue;
+        }
+        explicit_keys.insert(installed.package_key.clone());
+        names.insert(installed.name.clone());
+    }
+
+    if !missing.is_empty() {
+        let quoted: Vec<String> = missing.iter().map(|name| format!("'{}'", name.0)).collect();
+        let (noun, verb) = if quoted.len() == 1 {
+            ("package", "is not installed")
+        } else {
+            ("packages", "are not installed")
+        };
+        bail!("{noun} {} {verb}", quoted.join(", "));
+    }
+    if !automatic.is_empty() {
+        let quoted: Vec<String> = automatic
+            .iter()
+            .map(|name| format!("'{}'", name.0))
+            .collect();
+        if quoted.len() == 1 {
+            bail!(
+                "package {} is installed as a dependency; update its declared root or use `glu update --all`",
+                quoted[0]
+            );
+        }
+        bail!(
+            "packages {} are installed as dependencies; update their declared roots or use `glu update --all`",
+            quoted.join(", ")
+        );
+    }
+
+    Ok(UpdateTargetSelection {
+        names: names.into_iter().collect(),
+        explicit_keys,
+    })
+}
+
 /// Plans an update from a read-only state snapshot. Execution hosts perform
 /// interrupted-install cleanup before requesting this plan. Target selection:
-/// - bare (`glu up`, no names, no `--all`): every declared package with a
-///   newer version available;
-/// - `--all`: every outdated package, declared or automatic;
-/// - named: exactly those (already-up-to-date and missing names are
-///   reported as before).
+/// - named: the named declared roots;
+/// - bare (`glu up`, no names, no `--all`): every declared root;
+/// - `--all`: every declared root, with the complete dependency closure
+///   reconciled to registry-selected releases.
 ///
-/// `--dependents` extends a named update to outdated dependents.
+/// Named and bare update retain dependencies that satisfy the active package
+/// requirements. `--dependents` extends a named update to outdated dependents.
 ///
 /// `to_remove` is computed by simulating the post-update installed set
 /// from the resolve manifest, so the confirmation can show the removals
@@ -736,54 +805,9 @@ pub async fn plan_update(
     let declaration = snapshot.declaration;
     let broad = all || names.is_empty();
     let mut up_to_date = Vec::new();
-
-    let mut target_names: Vec<PackageName> = if all {
-        outdated
-            .packages
-            .iter()
-            .map(|package| package.name.clone())
-            .collect()
-    } else if names.is_empty() {
-        // Bare `glu up`: every declared package with a newer version.
-        let declared: BTreeSet<PackageName> = state.declared_names().into_iter().collect();
-        outdated
-            .packages
-            .iter()
-            .filter(|package| declared.contains(&package.name))
-            .map(|package| package.name.clone())
-            .collect()
-    } else {
-        let mut missing = Vec::new();
-        let mut targets = Vec::new();
-        for selector in &names {
-            let Some(installed) = state.resolve_selector(selector) else {
-                missing.push(PackageName(selector.0.clone()));
-                continue;
-            };
-            if let Some(package) = outdated
-                .packages
-                .iter()
-                .find(|package| package.package_key == installed.package_key)
-            {
-                targets.push(package.name.clone());
-            } else {
-                up_to_date.push(UpToDatePackage {
-                    name: installed.name.clone(),
-                    version: installed.keg_version.0.clone(),
-                });
-            }
-        }
-        if !missing.is_empty() {
-            let quoted: Vec<String> = missing.iter().map(|n| format!("'{}'", n.0)).collect();
-            let (noun, verb) = if quoted.len() == 1 {
-                ("package", "is not installed")
-            } else {
-                ("packages", "are not installed")
-            };
-            bail!("{noun} {} {verb}", quoted.join(", "));
-        }
-        targets
-    };
+    let targets = select_update_targets(&state, &declaration, &names)?;
+    let explicit_target_keys = targets.explicit_keys;
+    let mut target_names = targets.names;
 
     if target_names.is_empty() {
         return Ok(UpdatePlan {
@@ -806,7 +830,7 @@ pub async fn plan_update(
     }
 
     let mut cascade_added = Vec::new();
-    if dependents && !all {
+    if dependents && !all && !names.is_empty() {
         let outdated_names: BTreeSet<PackageName> = outdated
             .packages
             .iter()
@@ -830,8 +854,35 @@ pub async fn plan_update(
             .collect(),
     )
     .await?;
-    let workset = planner::compute_workset(&manifest, &state, planner::WorksetMode::Force)?;
-    if workset.install.is_empty() && workset.rename.is_empty() {
+    let mode = if all {
+        planner::WorksetMode::UpdateAll
+    } else {
+        planner::WorksetMode::UpdateRoots
+    };
+    let workset = planner::compute_workset(&manifest, &state, mode)?;
+    let changed_ids: BTreeSet<PackageId> = workset
+        .install
+        .iter()
+        .cloned()
+        .chain(workset.rename.iter().map(|item| item.package.clone()))
+        .collect();
+    if !explicit_target_keys.is_empty() {
+        for root in &manifest.roots {
+            if changed_ids.contains(&root.package)
+                || !explicit_target_keys.contains(&root.package_key)
+            {
+                continue;
+            }
+            let Some(installed) = state.find_by_key(&root.package_key) else {
+                continue;
+            };
+            up_to_date.push(UpToDatePackage {
+                name: installed.name.clone(),
+                version: installed.keg_version.0.clone(),
+            });
+        }
+    }
+    if changed_ids.is_empty() {
         return Ok(UpdatePlan {
             to_update: Vec::new(),
             up_to_date,
@@ -859,14 +910,19 @@ pub async fn plan_update(
         prefix: &client.config().prefix,
         depths: &depths,
     };
+    let mut changed_order = workset.install.clone();
+    for rename in &workset.rename {
+        if !changed_order.contains(&rename.package) {
+            changed_order.push(rename.package.clone());
+        }
+    }
     let mut to_update = Vec::new();
-    for root in &manifest.roots {
-        let package_id = &root.package;
+    for package_id in &changed_order {
         let Some(package) = manifest.packages.get(package_id) else {
             continue;
         };
         let current = state
-            .find(&package.name)
+            .find_by_key(&package.package_key)
             .map(|installed| installed.keg_version.0.clone())
             .unwrap_or_default();
         let change = package_change_for_id(
@@ -1964,6 +2020,62 @@ mod tree_tests {
         assert_eq!(names, vec!["fmt"]);
     }
 
+    #[test]
+    fn bare_update_selects_every_declared_root_only() {
+        let state =
+            InstalledState::from_packages(vec![pkg("app", vec!["dep"]), pkg("dep", vec![])]);
+        let mut declaration = Declaration::default();
+        declaration
+            .dependencies
+            .insert(PackageName("app".to_string()), "1.0".to_string());
+
+        let targets = select_update_targets(&state, &declaration, &[]).unwrap();
+
+        assert_eq!(targets.names, vec![PackageName("app".to_string())]);
+        assert!(targets.explicit_keys.is_empty());
+    }
+
+    #[test]
+    fn named_update_resolves_alias_to_a_declared_root() {
+        let mut app = pkg("app", vec![]);
+        app.aliases = vec![PackageSelector("application".to_string())];
+        let state = InstalledState::from_packages(vec![app]);
+        let mut declaration = Declaration::default();
+        declaration
+            .dependencies
+            .insert(PackageName("app".to_string()), "1.0".to_string());
+
+        let targets = select_update_targets(
+            &state,
+            &declaration,
+            &[PackageSelector("application".to_string())],
+        )
+        .unwrap();
+
+        assert_eq!(targets.names, vec![PackageName("app".to_string())]);
+        assert_eq!(
+            targets.explicit_keys,
+            BTreeSet::from([glu_core::PackageKey("package:app".to_string())])
+        );
+    }
+
+    #[test]
+    fn named_update_rejects_an_automatic_dependency() {
+        let state =
+            InstalledState::from_packages(vec![pkg("app", vec!["dep"]), pkg("dep", vec![])]);
+        let mut declaration = Declaration::default();
+        declaration
+            .dependencies
+            .insert(PackageName("app".to_string()), "1.0".to_string());
+
+        let err =
+            select_update_targets(&state, &declaration, &[PackageSelector("dep".to_string())])
+                .unwrap_err();
+
+        assert!(err.to_string().contains("installed as a dependency"));
+        assert!(err.to_string().contains("update --all"));
+    }
+
     /// Installed keg helper for the autoremove regression test (mirrors the
     /// `pkg` builders in state/installed.rs).
     fn pkg(name: &str, deps: Vec<&str>) -> glu_core::InstalledPackage {
@@ -2223,7 +2335,7 @@ mod interrupted_install_tests {
         let state = StateSnapshot::load_for_mutation(&prefix).unwrap().installed;
         assert_eq!(state.list().len(), 1);
         let workset =
-            planner::compute_workset(&manifest, &state, planner::WorksetMode::Force).unwrap();
+            planner::compute_workset(&manifest, &state, planner::WorksetMode::UpdateRoots).unwrap();
         let predicted =
             crate::sync::predicted_dangling_after_workset(&state, &manifest, &workset, &declared)
                 .unwrap();
@@ -2359,7 +2471,7 @@ mod interrupted_install_tests {
         // and before any removal.
         let state = StateSnapshot::load_for_mutation(&prefix).unwrap().installed;
         let workset =
-            planner::compute_workset(&manifest, &state, planner::WorksetMode::Force).unwrap();
+            planner::compute_workset(&manifest, &state, planner::WorksetMode::UpdateRoots).unwrap();
         let _fault = fault::fail_after_commit_for("app");
         let err = execute_workset(
             &client,
@@ -2399,7 +2511,8 @@ mod interrupted_install_tests {
         // exactly its old keg, never a half-committed extra.
         assert_eq!(recovered.kegs(&PackageName("app".to_string())).len(), 1);
         let retry_workset =
-            planner::compute_workset(&manifest, &recovered, planner::WorksetMode::Force).unwrap();
+            planner::compute_workset(&manifest, &recovered, planner::WorksetMode::UpdateRoots)
+                .unwrap();
         let predicted = crate::sync::predicted_dangling_after_workset(
             &recovered,
             &manifest,

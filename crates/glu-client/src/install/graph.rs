@@ -27,14 +27,24 @@ pub fn dependency_order(
         )?;
     }
 
+    order_selected_packages(manifest, &selected)
+}
+
+/// Orders an already-selected package subset dependency-before-dependent.
+/// Selection may come from a reconciliation pass that inspected roots or the
+/// complete manifest closure without automatically selecting every root.
+pub fn order_selected_packages(
+    manifest: &InstallManifest,
+    selected: &BTreeSet<PackageId>,
+) -> Result<Vec<PackageId>> {
     let mut order = Vec::new();
     let mut ordered = BTreeSet::new();
     let mut ordering = BTreeSet::new();
-    for root in roots {
+    for package in selected {
         order_selected(
-            root,
+            package,
             manifest,
-            &selected,
+            selected,
             &mut ordered,
             &mut ordering,
             &mut order,

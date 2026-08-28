@@ -354,10 +354,10 @@ impl GluClient {
         })
     }
 
-    /// Plans an update from a read-only state snapshot: resolves the target
-    /// set (bare = all declared, `--all` includes automatic packages,
-    /// named = exactly those) and computes what would be removed once the
-    /// new versions land (dependencies a new bottle dropped). The CLI uses
+    /// Plans an update from a read-only state snapshot: named updates select
+    /// declared roots, bare update selects every declared root, and `--all`
+    /// additionally reconciles their complete dependency closure. The plan
+    /// computes what would be removed once the new versions land. The CLI uses
     /// `to_update`/`to_remove` to decide whether to ask for confirmation.
     /// See `install::plan_update`.
     pub async fn plan_update(

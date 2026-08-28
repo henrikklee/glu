@@ -1437,10 +1437,11 @@ fn render_install_plan_output(plan: &InstallPlanOutput, globals: &GlobalOptions)
     if !has_changes {
         println!("Nothing to do.");
     }
-    let install_tree = globals
-        .tree
-        .then(|| install_only_tree(&plan.dependency_tree, &plan.would_install))
-        .unwrap_or_default();
+    let install_tree = if globals.tree {
+        install_only_tree(&plan.dependency_tree, &plan.would_install)
+    } else {
+        Default::default()
+    };
     if !install_tree.nodes.is_empty() {
         println!(
             "Would install {}:",

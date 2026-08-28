@@ -343,7 +343,7 @@ const UPDATE_OPTIONS: &[OptionSpec] = &[
         short: Some('a'),
         kind: OptionKind::Bool,
         scope: OptionScope::CommandSelection,
-        description: "update every outdated package instead of declared/named packages only",
+        description: "update declared roots and their complete dependency closure",
         conflicts_with: &["NAMES"],
     },
     OptionSpec {
@@ -589,7 +589,7 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         group: CommandGroup::PackageManagement,
         aliases: &["up"],
         summary: "Update packages",
-        default_behavior: "With NAMES, updates those packages. With no NAMES, updates declared packages. --all includes automatic dependencies.",
+        default_behavior: "With NAMES, updates those declared roots. With no NAMES, updates every declared root. --all also updates their complete dependency closure.",
         arguments: UPDATE_ARGUMENTS,
         mutates: true,
         default_scope: Some("declared"),

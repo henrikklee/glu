@@ -132,6 +132,18 @@ Plan output shows the meaningful transition: install, update, reinstall, promote
 
 Plan mode is a read-only boundary between decision and execution. Recovery cleanup, lock-protected mutation, and package changes happen only on the execution side. Install and update plans preserve their dependency graph when `--tree` is selected.
 
+### Update scopes
+
+Update has three deliberate scopes:
+
+- `glu update <package...>` updates the named declared roots and changes dependencies only when required for satisfaction;
+- bare `glu update` applies that root-update behavior to every declared root;
+- `glu update --all` also reconciles every package in the declared roots' dependency closure to the registry-selected release.
+
+Normal root updates keep an older dependency when it still satisfies the requiring package. They still install newly required or insufficient dependencies and remove dependencies dropped by the updated roots. `--all` is the explicit request to update satisfying dependencies too. Exact selected releases with matching persisted package facts are not repoured.
+
+The outdated endpoint supplies staleness and presentation data, but does not gate reconciliation. Resolve remains authoritative for changed topology, provider identity, and package facts.
+
 ## Confirmation model
 
 `--yes` approves the computed plan. It does not imply `--force`, `--all`, `--dependents`, or any other broadening behavior.
