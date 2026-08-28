@@ -1,5 +1,7 @@
 use crate::{
-    homebrew_version::PackageVersion, state::package_graph::InstalledPackageGraph,
+    dependency_query::{self, DependencyTreeNode},
+    homebrew_version::PackageVersion,
+    state::package_graph::InstalledPackageGraph,
 };
 use anyhow::{bail, Result};
 use glu_core::{InstalledPackage, PackageId, PackageKey, PackageName, PackageSelector, Prefix};
@@ -41,7 +43,9 @@ pub struct InstalledState {
     /// each package. Receipts remain the durable source of graph facts.
     package_graph: InstalledPackageGraph,
     declared_names: BTreeSet<PackageName>,
+    declared_keys: BTreeSet<PackageKey>,
     deactivated_names: BTreeSet<PackageName>,
+    deactivated_keys: BTreeSet<PackageKey>,
 }
 
 impl InstalledState {
@@ -100,20 +104,31 @@ impl InstalledState {
         let mut by_name: BTreeMap<PackageName, Vec<InstalledPackage>> = BTreeMap::new();
         let mut by_key: BTreeMap<PackageKey, Vec<InstalledPackage>> = BTreeMap::new();
         let mut selector_index: HashMap<PackageSelector, PackageKey> = HashMap::new();
-        for package in packages {
-            let current = package.name.clone();
+        let exact_selectors: BTreeSet<PackageSelector> = packages
+            .iter()
+            .map(|package| PackageSelector(package.name.0.clone()))
+            .collect();
+        for package in &packages {
             insert_selector_mapping(
                 &mut selector_index,
-                PackageSelector(current.0.clone()),
+                PackageSelector(package.name.0.clone()),
                 &package.package_key,
             )?;
+        }
+        for package in &packages {
             for selector in package.aliases.iter().chain(&package.oldnames) {
+                if exact_selectors.contains(selector) {
+                    continue;
+                }
                 insert_selector_mapping(
                     &mut selector_index,
                     selector.clone(),
                     &package.package_key,
                 )?;
             }
+        }
+        for package in packages {
+            let current = package.name.clone();
             by_key
                 .entry(package.package_key.clone())
                 .or_default()
@@ -127,6 +142,22 @@ impl InstalledState {
             kegs.sort_by(|a, b| compare_installed(b, a));
         }
         let package_graph = InstalledPackageGraph::from_packages(&by_key)?;
+        let declared_keys = declared_names
+            .iter()
+            .filter_map(|name| {
+                selector_index
+                    .get(&PackageSelector(name.0.clone()))
+                    .cloned()
+            })
+            .collect();
+        let deactivated_keys = deactivated_names
+            .iter()
+            .filter_map(|name| {
+                selector_index
+                    .get(&PackageSelector(name.0.clone()))
+                    .cloned()
+            })
+            .collect();
         Ok(Self {
             prefix,
             by_name,
@@ -134,7 +165,9 @@ impl InstalledState {
             selector_index,
             package_graph,
             declared_names,
+            declared_keys,
             deactivated_names,
+            deactivated_keys,
         })
     }
 
@@ -146,6 +179,11 @@ impl InstalledState {
 
     pub fn find_by_key(&self, key: &PackageKey) -> Option<&InstalledPackage> {
         self.by_key.get(key).and_then(|kegs| kegs.first())
+    }
+
+    /// The selected installed release for every stable package identity.
+    pub fn current_packages(&self) -> impl Iterator<Item = &InstalledPackage> {
+        self.by_key.values().filter_map(|kegs| kegs.first())
     }
 
     pub fn resolve_selector(&self, selector: &PackageSelector) -> Option<&InstalledPackage> {
@@ -190,10 +228,9 @@ impl InstalledState {
     /// sorted like `list()`. The keg-level view of the declaration: what the
     /// user asked for, at the versions they asked for.
     pub fn declared(&self) -> Vec<InstalledPackage> {
-        let names = self.declared_name_set();
         self.list()
             .into_iter()
-            .filter(|package| names.contains(&package.name))
+            .filter(|package| self.declared_keys.contains(&package.package_key))
             .collect()
     }
 
@@ -209,9 +246,17 @@ impl InstalledState {
     }
 
     /// Whether `selector` resolves to a currently deactivated package.
+    pub fn is_declared_key(&self, package_key: &PackageKey) -> bool {
+        self.declared_keys.contains(package_key)
+    }
+
+    pub fn is_deactivated_key(&self, package_key: &PackageKey) -> bool {
+        self.deactivated_keys.contains(package_key)
+    }
+
     pub fn is_deactivated(&self, selector: &PackageSelector) -> bool {
         self.resolve_selector(selector)
-            .is_some_and(|package| self.deactivated_names.contains(&package.name))
+            .is_some_and(|package| self.is_deactivated_key(&package.package_key))
             || self
                 .deactivated_names
                 .contains(&PackageName(selector.0.clone()))
@@ -304,201 +349,54 @@ impl InstalledState {
     /// This keeps dense graphs readable while staying complete: every
     /// package appears exactly once with its deps.
     pub fn dependency_tree(&self) -> Vec<DependencyTreeNode> {
-        let roots = self.declared();
-        let mut seen: BTreeSet<PackageKey> = BTreeSet::new();
-        roots
-            .iter()
-            .map(|root| {
-                let name = root.name.0.clone();
-                seen.insert(root.package_key.clone());
-                DependencyTreeNode {
-                    name,
-                    version: root.keg_version.0.clone(),
-                    children: dependency_tree_children(root, self, &mut seen),
-                    already_shown: false,
-                    requires: None,
-                }
-            })
-            .collect()
+        dependency_query::installed_forward_forest(
+            self.current_packages(),
+            self.declared()
+                .into_iter()
+                .map(|package| package.package_key),
+        )
     }
 
     /// Like `dependency_tree`, but also roots every dangling package —
     /// installed, not declared, and unreachable from anything declared — so
     /// the tree covers *everything* installed (`glu ls --all --tree`).
     pub fn dependency_tree_all(&self) -> Vec<DependencyTreeNode> {
-        let mut nodes = self.dependency_tree();
-        let mut seen: BTreeSet<PackageKey> = self
+        let mut roots: Vec<PackageKey> = self
             .declared()
             .into_iter()
             .map(|package| package.package_key)
+            .chain(
+                self.dangling()
+                    .into_iter()
+                    .map(|package| package.package_key),
+            )
             .collect();
-        for package in self.dangling() {
-            if !seen.insert(package.package_key.clone()) {
-                continue;
-            }
-            let Some(installed) = self.find_by_key(&package.package_key) else {
-                continue;
-            };
-            nodes.push(DependencyTreeNode {
-                name: package.name.0.clone(),
-                version: package.keg_version.0.clone(),
-                children: dependency_tree_children(installed, self, &mut seen),
-                already_shown: false,
-                requires: None,
-            });
-        }
+        roots.sort();
+        roots.dedup();
+        let mut nodes = dependency_query::installed_forward_forest(self.current_packages(), roots);
         nodes.sort_by_key(|node| node.name.to_lowercase());
         nodes
     }
 
     /// `glu deps`: the dependency subtree of one installed package (the
-    /// newest keg of that name) — receipts only, so it answers "what does
+    /// newest keg of that identity) — receipts only, so it answers "what does
     /// this pull in on my system" offline and exact.
     pub fn dependency_tree_for(&self, selector: &PackageSelector) -> Option<DependencyTreeNode> {
         let root = self.resolve_selector(selector)?;
-        let mut seen: BTreeSet<PackageKey> = BTreeSet::new();
-        seen.insert(root.package_key.clone());
-        Some(DependencyTreeNode {
-            name: root.name.0.clone(),
-            version: root.keg_version.0.clone(),
-            children: dependency_tree_children(root, self, &mut seen),
-            already_shown: false,
-            requires: None,
-        })
+        dependency_query::installed_forward_tree(self.current_packages(), &root.package_key)
     }
 
     /// `glu why`: the reverse dependency tree of one installed package —
     /// the target at the root, its direct dependents as children, and their
-    /// dependents recursed (cycle-guarded). `None` when nothing installed
-    /// depends on it.
+    /// dependents recursed (cycle-guarded). `None` when the selector is not
+    /// installed.
     pub fn reverse_dependents_tree(
         &self,
         selector: &PackageSelector,
     ) -> Option<DependencyTreeNode> {
         let root = self.resolve_selector(selector)?;
-        let mut seen: BTreeSet<PackageKey> = BTreeSet::new();
-        seen.insert(root.package_key.clone());
-        Some(DependencyTreeNode {
-            name: root.name.0.clone(),
-            version: root.keg_version.0.clone(),
-            children: reverse_dependents_children(self, &root.package_key, &mut seen),
-            already_shown: false,
-            requires: None,
-        })
+        dependency_query::installed_reverse_tree(self.current_packages(), &root.package_key)
     }
-}
-
-/// One node of the `glu ls --all` dependency tree: a package (the newest
-/// installed keg of that name), its children, and whether it was already
-/// expanded elsewhere (its subtree is shown above, so it renders as a leaf
-/// with a `(*)` marker).
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct DependencyTreeNode {
-    pub name: String,
-    pub version: String,
-    pub children: Vec<DependencyTreeNode>,
-    pub already_shown: bool,
-    /// The requirement the parent's edge places on this package, rendered
-    /// under `--verbose` (e.g. `>= 2.84.3`). `None` for roots.
-    pub requires: Option<String>,
-}
-
-/// Children of `package` in the `glu ls --all` tree: its declared deps (from
-/// the receipt), each carrying the newest installed keg's version. A dep
-/// already in `seen` — expanded from another parent, or an ancestor on the
-/// current branch (a cycle) — is marked `already_shown` and not re-expanded;
-/// otherwise it is inserted and its subtree recursed.
-fn dependency_tree_children(
-    package: &InstalledPackage,
-    state: &InstalledState,
-    seen: &mut BTreeSet<PackageKey>,
-) -> Vec<DependencyTreeNode> {
-    let mut deps: Vec<_> = state
-        .package_graph()
-        .dependencies(&package.package_key)
-        .iter()
-        .collect();
-    deps.sort_by_key(|dep| dep.requested.0.to_lowercase());
-    let mut children = Vec::new();
-    for dep in deps {
-        let provider = state.find_by_key(&dep.provider);
-        let mut child = DependencyTreeNode {
-            // Display the exact dependency spelling persisted by the
-            // dependent's receipt, not the provider's canonical name.
-            name: dep.requested.0.clone(),
-            version: provider
-                .map(|package| package.keg_version.0.clone())
-                .unwrap_or_default(),
-            children: Vec::new(),
-            already_shown: false,
-            requires: format_minimum_version(package.dependency_requirements.get(&dep.provider)),
-        };
-        if let Some(provider_package) = provider {
-            if seen.insert(dep.provider.clone()) {
-                child.children = dependency_tree_children(provider_package, state, seen);
-            } else if !state.package_graph().dependencies(&dep.provider).is_empty() {
-                child.already_shown = true;
-            }
-        }
-        children.push(child);
-    }
-    children
-}
-
-/// A package-level dependency floor as a display string — `>= 2.84.3` or
-/// `>= 2.84.3_1` for a revisioned floor.
-pub(crate) fn format_minimum_version(minimum: Option<&glu_core::MinimumVersion>) -> Option<String> {
-    let minimum = minimum?;
-    let mut floor = format!(">= {}", minimum.version);
-    if let Some(revision) = minimum.revision.filter(|revision| *revision > 0) {
-        floor.push_str(&format!("_{revision}"));
-    }
-    Some(floor)
-}
-
-/// Children of `package` in the reverse dependency tree (`glu why`): every
-/// installed package that directly depends on `name`, sorted by name. A
-/// dependent already on the ancestry path (a cycle) is marked and not
-/// re-expanded.
-fn reverse_dependents_children(
-    state: &InstalledState,
-    package_key: &PackageKey,
-    seen: &mut BTreeSet<PackageKey>,
-) -> Vec<DependencyTreeNode> {
-    let mut parent_keys: Vec<_> = state
-        .package_graph()
-        .dependents(package_key)
-        .iter()
-        .map(|edge| &edge.dependent)
-        .collect();
-    parent_keys.sort();
-    parent_keys.dedup();
-    let mut parents: Vec<&InstalledPackage> = parent_keys
-        .into_iter()
-        .filter_map(|key| state.find_by_key(key))
-        .collect();
-    parents.sort_by_key(|parent| parent.name.0.to_lowercase());
-    let mut children = Vec::new();
-    for parent in parents {
-        let mut node = DependencyTreeNode {
-            name: parent.name.0.clone(),
-            version: parent.keg_version.0.clone(),
-            children: Vec::new(),
-            already_shown: false,
-            requires: format_minimum_version(parent.dependency_requirements.get(package_key)),
-        };
-        if seen.insert(parent.package_key.clone()) {
-            node.children = reverse_dependents_children(state, &parent.package_key, seen);
-        } else if has_dependents(state, &parent.package_key) {
-            node.already_shown = true;
-        }
-        children.push(node);
-    }
-    children
-}
-
-fn has_dependents(state: &InstalledState, package_key: &PackageKey) -> bool {
-    !state.package_graph().dependents(package_key).is_empty()
 }
 
 fn insert_selector_mapping(
@@ -522,8 +420,7 @@ fn insert_selector_mapping(
 }
 
 fn compare_installed(a: &InstalledPackage, b: &InstalledPackage) -> std::cmp::Ordering {
-    PackageVersion::new(&a.version, a.revision)
-        .compare(PackageVersion::new(&b.version, b.revision))
+    PackageVersion::new(&a.version, a.revision).compare(PackageVersion::new(&b.version, b.revision))
 }
 
 #[cfg(test)]
@@ -775,8 +672,8 @@ mod tests {
     }
 
     #[test]
-    fn installed_state_fails_closed_when_oldname_collides_with_current_name() {
-        let err = InstalledState::from_loaded_packages(
+    fn installed_exact_name_wins_over_another_packages_oldname() {
+        let state = InstalledState::from_loaded_packages(
             vec![
                 installed_pkg_with_oldnames("foo", &[], "1.0"),
                 installed_pkg_with_oldnames("bar", &["foo"], "1.0"),
@@ -785,11 +682,12 @@ mod tests {
             BTreeSet::new(),
             BTreeSet::new(),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(err
-            .to_string()
-            .contains("installed selector 'foo' belongs to both"));
+        let selected = state
+            .resolve_selector(&PackageSelector("foo".to_string()))
+            .unwrap();
+        assert_eq!(selected.package_key.0, "package:foo");
     }
 
     #[test]

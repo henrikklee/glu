@@ -1,5 +1,5 @@
-use crate::state::installed::DependencyTreeNode;
-use glu_core::PackageName;
+use crate::dependency_query::DependencyTreeNode;
+use glu_core::PackageKey;
 use std::collections::BTreeMap;
 
 /// Where a `glu deps` answer came from — offline receipts (the installed
@@ -22,7 +22,7 @@ pub struct DepsView {
     /// for an installed package).
     pub installed: bool,
     pub root: DependencyTreeNode,
-    pub statuses: BTreeMap<PackageName, PackageStatus>,
+    pub statuses: BTreeMap<PackageKey, PackageStatus>,
 }
 
 /// `glu why <name>` result. The status map travels with the graph so
@@ -30,7 +30,7 @@ pub struct DepsView {
 #[derive(Debug)]
 pub struct ReverseDepsView {
     pub root: Option<DependencyTreeNode>,
-    pub statuses: BTreeMap<PackageName, PackageStatus>,
+    pub statuses: BTreeMap<PackageKey, PackageStatus>,
 }
 
 #[derive(Debug, Clone, Default)]

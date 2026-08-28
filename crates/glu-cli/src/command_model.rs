@@ -1,5 +1,5 @@
-use glu_client::state::installed::DependencyTreeNode;
-use glu_core::{InstalledPackage, PackageName};
+use glu_client::dependency_query::DependencyTreeNode;
+use glu_core::InstalledPackage;
 
 pub(crate) fn generated_schema<T: schemars::JsonSchema>() -> serde_json::Value {
     // The public contract describes emitted JSON, not accepted input. On fields
@@ -1640,9 +1640,8 @@ pub(crate) enum ListScope {
 pub(crate) struct ListOutput {
     pub(crate) scope: ListScope,
     pub(crate) view: ListView,
-    pub(crate) statuses: std::collections::BTreeMap<PackageName, glu_client::deps::PackageStatus>,
-    pub(crate) declared_names: Vec<PackageName>,
-    pub(crate) deactivated_names: Vec<PackageName>,
+    pub(crate) statuses:
+        std::collections::BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
     pub(crate) hidden_dependencies: usize,
     pub(crate) show_dependency_hint: bool,
 }
@@ -1659,7 +1658,7 @@ pub(crate) struct DepsOutput {
     pub(crate) status: bool,
     pub(crate) root: DependencyTreeNode,
     pub(crate) statuses:
-        std::collections::BTreeMap<glu_core::PackageName, glu_client::deps::PackageStatus>,
+        std::collections::BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
@@ -1676,7 +1675,7 @@ pub(crate) struct ReverseDepsOutput {
     pub(crate) direct: bool,
     pub(crate) root: Option<DependencyTreeNode>,
     pub(crate) statuses:
-        std::collections::BTreeMap<glu_core::PackageName, glu_client::deps::PackageStatus>,
+        std::collections::BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
@@ -1934,6 +1933,9 @@ pub(crate) struct CleanupPlanOutput {
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
 pub(crate) struct MutationPackageRecord {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(required)]
+    pub(crate) package_key: Option<String>,
     pub(crate) name: String,
     pub(crate) version: String,
     pub(crate) status: MutationStatus,
@@ -1968,6 +1970,7 @@ pub(crate) struct MutationPackageRecord {
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
 pub(crate) struct RenamePackageRecord {
+    pub(crate) package_key: String,
     pub(crate) old_name: String,
     pub(crate) new_name: String,
     pub(crate) version: String,
@@ -1976,6 +1979,7 @@ pub(crate) struct RenamePackageRecord {
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
 pub(crate) struct UpdatePackageRecord {
+    pub(crate) package_key: String,
     pub(crate) name: String,
     pub(crate) current: String,
     pub(crate) latest: String,

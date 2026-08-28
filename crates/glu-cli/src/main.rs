@@ -23,13 +23,10 @@ use command_model::{
     ReverseDepsSource, UnsupportedOptionDetails, UpdateConfirmationDetails, COMMAND_SPECS,
 };
 use glu_client::{config::ClientConfig, install::InstallOptions, GluClient};
-use glu_core::{PackageName, PackageSelector};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    future::Future,
-    io::IsTerminal,
-    time::Duration,
-};
+#[cfg(test)]
+use glu_core::PackageName;
+use glu_core::PackageSelector;
+use std::{collections::BTreeMap, future::Future, io::IsTerminal, time::Duration};
 
 #[tokio::main]
 async fn main() {
@@ -503,8 +500,6 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
         } => {
             let query = client.query_state(events.as_ref())?;
             let installed_scope = installed || all;
-            let deactivated_names = query.deactivated_names();
-            let declared_names = query.declared_names();
             let statuses = if null {
                 BTreeMap::new()
             } else {
@@ -537,8 +532,6 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                 scope,
                 view,
                 statuses,
-                declared_names,
-                deactivated_names,
                 hidden_dependencies,
                 show_dependency_hint: !explicit_declared,
             }));
@@ -596,38 +589,19 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
         }
         Command::Info { names } => {
             let query = client.query_state(events.as_ref())?;
-            let declared_names: BTreeSet<PackageName> =
-                query.declared_names().into_iter().collect();
-            let deactivated_names: BTreeSet<PackageName> =
-                query.deactivated_names().into_iter().collect();
-
             if names.len() == 1 {
                 let requested = PackageSelector(names.into_iter().next().expect("one info name"));
                 let (info, installed) =
                     while_resolving(show_resolution, client.info(&query, requested.clone()))
                         .await??;
-                let requested_name = PackageName(requested.0);
-                let declared =
-                    declared_names.contains(&info.name) || declared_names.contains(&requested_name);
-                let deactivated = deactivated_names.contains(&info.name)
-                    || deactivated_names.contains(&requested_name);
+                let status = query.package_status(&info.package_key);
                 final_output = Some(CommandOutput::Info(Box::new(InfoOutput {
                     package: info,
                     installed,
-                    declared,
-                    deactivated,
+                    declared: status.as_ref().is_some_and(|status| status.declared),
+                    deactivated: status.is_some_and(|status| status.deactivated),
                 })));
             } else {
-                let mut installed_by_key = BTreeMap::new();
-                let mut installed_by_selector = BTreeMap::new();
-                for package in query.list() {
-                    installed_by_key.insert(package.package_key.clone(), package.clone());
-                    installed_by_selector.insert(package.name.0.clone(), package.clone());
-                    for selector in package.aliases.iter().chain(&package.oldnames) {
-                        installed_by_selector.insert(selector.0.clone(), package.clone());
-                    }
-                }
-
                 let config = client.config().clone();
                 let registry = glu_client::registry::resolve_client::HttpResolveClient::new(
                     &config.registry_base_url,
@@ -655,31 +629,29 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                 for result in results {
                     match result {
                         Ok((name, Ok(info))) => {
-                            let requested = PackageName(name.clone());
-                            let installed = installed_by_key.get(&info.package_key).cloned();
-                            let declared = declared_names.contains(&info.name)
-                                || declared_names.contains(&requested);
-                            let deactivated = deactivated_names.contains(&info.name)
-                                || deactivated_names.contains(&requested);
+                            let installed = query.find_by_key(&info.package_key).cloned();
+                            let status = query.package_status(&info.package_key);
                             packages.push(InfoPackageResult {
                                 requested: name,
                                 found: true,
                                 package: Some(info),
                                 installed,
-                                declared,
-                                deactivated,
+                                declared: status.as_ref().is_some_and(|status| status.declared),
+                                deactivated: status.is_some_and(|status| status.deactivated),
                                 error: None,
                             });
                         }
                         Ok((name, Err(error))) => {
-                            let requested = PackageName(name.clone());
+                            let selector = PackageSelector(name.clone());
+                            let installed = query.resolve_selector(&selector).cloned();
+                            let status = query.package_status_for_selector(&selector);
                             packages.push(InfoPackageResult {
                                 requested: name,
                                 found: false,
                                 package: None,
-                                installed: installed_by_selector.get(&requested.0).cloned(),
-                                declared: declared_names.contains(&requested),
-                                deactivated: deactivated_names.contains(&requested),
+                                installed,
+                                declared: status.as_ref().is_some_and(|status| status.declared),
+                                deactivated: status.is_some_and(|status| status.deactivated),
                                 error: Some(InfoPackageError {
                                     code: ErrorCode::PackageInfoFailed,
                                     message: error.to_string(),
@@ -731,11 +703,11 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
             let query = client.query_state(events.as_ref())?;
             let mut outdated = while_resolving(show_resolution, client.outdated(&query)).await??;
             let scope = if declared {
-                let declared_names: std::collections::BTreeSet<_> =
-                    query.declared_names().into_iter().collect();
-                outdated
-                    .packages
-                    .retain(|package| declared_names.contains(&package.name));
+                outdated.packages.retain(|package| {
+                    query
+                        .package_status(&package.package_key)
+                        .is_some_and(|status| status.declared)
+                });
                 "declared"
             } else {
                 "installed"

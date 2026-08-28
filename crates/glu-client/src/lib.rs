@@ -1,6 +1,7 @@
 pub mod activation;
 pub mod bottle;
 pub mod config;
+pub mod dependency_query;
 pub mod deps;
 pub mod download;
 pub mod error;
@@ -60,11 +61,11 @@ impl LocalQuery {
         self.snapshot.installed.total_kegs()
     }
 
-    pub fn list_tree(&self) -> Vec<state::installed::DependencyTreeNode> {
+    pub fn list_tree(&self) -> Vec<dependency_query::DependencyTreeNode> {
         self.snapshot.installed.dependency_tree()
     }
 
-    pub fn list_tree_all(&self) -> Vec<state::installed::DependencyTreeNode> {
+    pub fn list_tree_all(&self) -> Vec<dependency_query::DependencyTreeNode> {
         self.snapshot.installed.dependency_tree_all()
     }
 
@@ -76,8 +77,21 @@ impl LocalQuery {
         self.snapshot.installed.resolve_selector(selector)
     }
 
-    pub fn package_statuses(&self) -> std::collections::BTreeMap<PackageName, deps::PackageStatus> {
-        deps_statuses(&self.snapshot.installed, &self.snapshot.declaration)
+    pub fn package_statuses(&self) -> std::collections::BTreeMap<PackageKey, deps::PackageStatus> {
+        deps_statuses(&self.snapshot.installed)
+    }
+
+    pub fn package_status(&self, key: &PackageKey) -> Option<deps::PackageStatus> {
+        let package = self.snapshot.installed.find_by_key(key)?;
+        Some(package_status(&self.snapshot.installed, package))
+    }
+
+    pub fn package_status_for_selector(
+        &self,
+        selector: &PackageSelector,
+    ) -> Option<deps::PackageStatus> {
+        let package = self.snapshot.installed.resolve_selector(selector)?;
+        Some(package_status(&self.snapshot.installed, package))
     }
 
     pub fn why(&self, selector: &PackageSelector, include_statuses: bool) -> deps::ReverseDepsView {
@@ -278,7 +292,7 @@ impl GluClient {
             .first()
             .map(|root| &root.package)
             .ok_or_else(|| anyhow::anyhow!("registry returned nothing for '{}'", selector.0))?;
-        let root = install::dependency_tree_from_slim(&manifest, root_id)
+        let root = dependency_query::dependency_tree_from_slim(&manifest, root_id)
             .ok_or_else(|| anyhow::anyhow!("registry result is missing '{}'", selector.0))?;
         Ok(deps::DepsView {
             source: deps::DepsSource::Resolved,
@@ -296,14 +310,14 @@ impl GluClient {
         &self,
         selector: PackageSelector,
         direct: bool,
-    ) -> Result<Option<state::installed::DependencyTreeNode>> {
+    ) -> Result<Option<dependency_query::DependencyTreeNode>> {
         let resolve =
             registry::resolve_client::HttpResolveClient::new(&self.config.registry_base_url)?;
         let response = resolve
             .uses(&selector, &self.config.target, direct)
             .await
             .with_context(|| format!("could not look up what depends on '{}'", selector.0))?;
-        Ok(install::reverse_tree_from_uses(&response))
+        Ok(dependency_query::reverse_tree_from_uses(&response))
     }
 
     /// The dangling packages of this prefix — installed, not declared, and
@@ -407,26 +421,24 @@ impl GluClient {
 
 fn deps_statuses(
     state: &state::installed::InstalledState,
-    declaration: &state::Declaration,
-) -> std::collections::BTreeMap<PackageName, deps::PackageStatus> {
-    let mut statuses = std::collections::BTreeMap::new();
-    // InstalledState::list returns the newest keg first for each name. Keep
-    // that first entry so verbose dependency output never reports an older
-    // sibling keg as the active installed version.
-    for package in state.list() {
-        let declared = declaration.contains(&package.name);
-        let deactivated = state.is_deactivated(&PackageSelector(package.name.0.clone()));
-        statuses
-            .entry(package.name.clone())
-            .or_insert_with(|| deps::PackageStatus {
-                installed: true,
-                installed_version: Some(package.keg_version.0.clone()),
-                linked: package.linked,
-                declared,
-                deactivated,
-                download_bytes: package.download_bytes,
-                installed_bytes: package.installed_bytes,
-            });
+) -> std::collections::BTreeMap<PackageKey, deps::PackageStatus> {
+    state
+        .current_packages()
+        .map(|package| (package.package_key.clone(), package_status(state, package)))
+        .collect()
+}
+
+fn package_status(
+    state: &state::installed::InstalledState,
+    package: &InstalledPackage,
+) -> deps::PackageStatus {
+    deps::PackageStatus {
+        installed: true,
+        installed_version: Some(package.keg_version.0.clone()),
+        linked: package.linked,
+        declared: state.is_declared_key(&package.package_key),
+        deactivated: state.is_deactivated_key(&package.package_key),
+        download_bytes: package.download_bytes,
+        installed_bytes: package.installed_bytes,
     }
-    statuses
 }

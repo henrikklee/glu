@@ -34,7 +34,7 @@ Installed state includes:
 
 Other subsystems do not hand-parse receipts, scan the Cellar for their own state model, or write declaration changes directly. They ask the state store for snapshots or use state-store methods for receipt/declaration writes.
 
-Read commands receive one immutable `LocalQuery` backed by one loaded snapshot. Counts, trees, selector lookups, status annotations, and local joins for that invocation derive from the same value. Mutation planning owns separate snapshots, and reads after a write load fresh state.
+Read commands receive one immutable `LocalQuery` backed by one loaded snapshot. Counts, trees, selector lookups, status annotations, and local joins for that invocation derive from the same value. Declaration, deactivation, installation, and link statuses are indexed by stable `PackageKey`; aliases and old names resolve at the selector boundary and do not become status keys. Mutation planning owns separate snapshots, and reads after a write load fresh state.
 
 This keeps the boundary simple:
 
@@ -81,7 +81,7 @@ Selector aliases and filesystem opt-link names are independent facts. An alias c
 
 Only complete receipts count as installed. Incomplete receipts are ignored by state reads and cleaned before mutating commands plan work. Unsupported receipt schemas fail closed; there is no compatibility or migration path for pre-release receipt shapes.
 
-Receipts do not decide why a package is installed. `glu.json` decides user intent. Installed state resolves receipt selectors against the complete installed package set, then traverses the resulting package-key graph for reachability.
+Receipts do not decide why a package is installed. `glu.json` decides user intent. Installed state resolves receipt selectors against the complete installed package set, then traverses the resulting package-key graph for reachability. Exact installed names take precedence over another package's alias or old name; ambiguous non-exact selector claims fail closed.
 
 ## Declared, automatic, and dangling
 

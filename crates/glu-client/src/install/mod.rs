@@ -1,6 +1,7 @@
 #[cfg(test)]
 use crate::events::SilentExecutionEvents;
 use crate::{
+    dependency_query::{dependency_forest_from_manifest, DependencyTreeNode},
     events::{ExecutionEvents, NodeCompletionStatus, ProgressEvent, ProgressFinishStatus},
     install::{
         orchestrator::{execute_install_plan, ExecuteInstallPlanInput},
@@ -9,7 +10,6 @@ use crate::{
     },
     postinstall::structured::PostinstallPlans,
     registry::resolve_client::HttpResolveClient,
-    state::installed::DependencyTreeNode,
     state::Declaration,
     state::{snapshot::StateSnapshot, store::InstalledStateStore},
     trace::writer::write_install_trace,
@@ -62,6 +62,7 @@ pub enum PackageChangeStatus {
 
 #[derive(Debug, Clone)]
 pub struct PackageChange {
+    pub package_key: glu_core::PackageKey,
     pub name: PackageName,
     pub version: String,
     pub status: PackageChangeStatus,
@@ -78,6 +79,7 @@ pub struct PackageChange {
 
 #[derive(Debug, Clone)]
 pub struct RenameChange {
+    pub package_key: glu_core::PackageKey,
     pub old_name: PackageName,
     pub new_name: PackageName,
     pub version: String,
@@ -174,11 +176,7 @@ impl InstallPlan {
     /// The resolved plan graph, kept semantic so presentation layers can
     /// render human or machine tree views without re-resolving.
     pub fn dependency_tree(&self) -> Vec<DependencyTreeNode> {
-        self.manifest
-            .roots
-            .iter()
-            .filter_map(|root| dependency_tree_from_manifest(&self.manifest, &root.package))
-            .collect()
+        dependency_forest_from_manifest(&self.manifest)
     }
 
     pub fn resolved_version(&self, name: &PackageName) -> Option<&str> {
@@ -564,6 +562,7 @@ fn package_change_for_id(
     let cache = crate::download::cache::ArtifactCache::new(context.prefix);
     let depth = context.depths.get(id).copied().unwrap_or(usize::MAX);
     Some(PackageChange {
+        package_key: package.package_key.clone(),
         name: package.name.clone(),
         version: version_override.unwrap_or_else(|| package.keg_version.0.clone()),
         status,
@@ -622,6 +621,7 @@ fn rename_changes_for_workset(
                 .packages
                 .get(&rename.package)
                 .map(|package| RenameChange {
+                    package_key: package.package_key.clone(),
                     old_name: rename.old_name.clone(),
                     new_name: package.name.clone(),
                     version: package.keg_version.0.clone(),
@@ -635,6 +635,7 @@ fn rename_changes_for_workset(
 /// what resolution produced.
 #[derive(Debug, Clone)]
 pub struct PlannedUpdate {
+    pub package_key: glu_core::PackageKey,
     pub name: PackageName,
     pub current: String,
     pub latest: String,
@@ -689,13 +690,7 @@ impl UpdatePlan {
     pub fn dependency_tree(&self) -> Vec<DependencyTreeNode> {
         self.manifest
             .as_ref()
-            .map(|manifest| {
-                manifest
-                    .roots
-                    .iter()
-                    .filter_map(|root| dependency_tree_from_manifest(manifest, &root.package))
-                    .collect()
-            })
+            .map(dependency_forest_from_manifest)
             .unwrap_or_default()
     }
 }
@@ -932,6 +927,7 @@ pub async fn plan_update(
             Some(package.keg_version.0.clone()),
         );
         to_update.push(PlannedUpdate {
+            package_key: package.package_key.clone(),
             name: package.name.clone(),
             current,
             latest: package.keg_version.0.clone(),
@@ -1058,192 +1054,6 @@ pub(crate) async fn resolve_manifest(
     planner::validate_manifest(&manifest)?;
     validate_client_support(&manifest, &client.config().prefix)?;
     Ok(manifest)
-}
-
-/// `glu deps` on a package that isn't installed: the forward dependency
-/// tree from a resolve manifest's edges.
-pub fn dependency_tree_from_manifest(
-    manifest: &glu_core::InstallManifest,
-    root_id: &glu_core::PackageId,
-) -> Option<crate::state::installed::DependencyTreeNode> {
-    use crate::state::installed::DependencyTreeNode;
-    let root = manifest.packages.get(root_id)?;
-    let mut seen: std::collections::BTreeSet<glu_core::PackageKey> =
-        std::collections::BTreeSet::new();
-    seen.insert(root.package_key.clone());
-    Some(DependencyTreeNode {
-        name: root.name.0.clone(),
-        version: root.keg_version.0.clone(),
-        children: manifest_tree_children(manifest, root_id, &mut seen),
-        already_shown: false,
-        requires: None,
-    })
-}
-
-fn manifest_tree_children(
-    manifest: &glu_core::InstallManifest,
-    package_id: &glu_core::PackageId,
-    seen: &mut std::collections::BTreeSet<glu_core::PackageKey>,
-) -> Vec<crate::state::installed::DependencyTreeNode> {
-    use crate::state::installed::DependencyTreeNode;
-    let Some(package) = manifest.packages.get(package_id) else {
-        return Vec::new();
-    };
-    let mut deps = package.deps.clone();
-    deps.sort_by_key(|dep| dep.package_key.0.to_lowercase());
-    let mut children = Vec::new();
-    for dep in deps {
-        let Some(dep_package) = manifest.packages.get(&dep.package) else {
-            continue;
-        };
-        let mut child = DependencyTreeNode {
-            name: dep_package.name.0.clone(),
-            version: dep_package.keg_version.0.clone(),
-            children: Vec::new(),
-            already_shown: false,
-            requires: crate::state::installed::format_minimum_version(
-                package.dependency_requirements.get(&dep.package_key),
-            ),
-        };
-        if seen.insert(dep.package_key.clone()) {
-            child.children = manifest_tree_children(manifest, &dep.package, seen);
-        } else {
-            child.already_shown = !dep_package.deps.is_empty();
-        }
-        children.push(child);
-    }
-    children
-}
-
-/// `glu deps` on a not-installed package: the forward dependency tree from
-/// a slim resolve (`?slim=true`). Same structure as
-/// `dependency_tree_from_manifest`, over the slim package shape.
-pub fn dependency_tree_from_slim(
-    manifest: &glu_core::SlimManifest,
-    root_id: &glu_core::PackageId,
-) -> Option<crate::state::installed::DependencyTreeNode> {
-    use crate::state::installed::DependencyTreeNode;
-    let root = manifest.packages.get(root_id)?;
-    let mut seen: std::collections::BTreeSet<glu_core::PackageKey> =
-        std::collections::BTreeSet::new();
-    seen.insert(root.package_key.clone());
-    Some(DependencyTreeNode {
-        name: root.name.0.clone(),
-        version: root.keg_version.0.clone(),
-        children: slim_tree_children(&manifest.packages, root_id, &mut seen),
-        already_shown: false,
-        requires: None,
-    })
-}
-
-fn slim_tree_children(
-    packages: &std::collections::BTreeMap<glu_core::PackageId, glu_core::SlimPackage>,
-    package_id: &glu_core::PackageId,
-    seen: &mut std::collections::BTreeSet<glu_core::PackageKey>,
-) -> Vec<crate::state::installed::DependencyTreeNode> {
-    use crate::state::installed::DependencyTreeNode;
-    let Some(package) = packages.get(package_id) else {
-        return Vec::new();
-    };
-    let mut deps = package.deps.clone();
-    deps.sort_by_key(|dep| dep.package_key.0.to_lowercase());
-    let mut children = Vec::new();
-    for dep in deps {
-        let Some(dep_package) = packages.get(&dep.package) else {
-            continue;
-        };
-        let mut child = DependencyTreeNode {
-            name: dep_package.name.0.clone(),
-            version: dep_package.keg_version.0.clone(),
-            children: Vec::new(),
-            already_shown: false,
-            requires: crate::state::installed::format_minimum_version(
-                package.dependency_requirements.get(&dep.package_key),
-            ),
-        };
-        if seen.insert(dep.package_key.clone()) {
-            child.children = slim_tree_children(packages, &dep.package, seen);
-        } else {
-            child.already_shown = !dep_package.deps.is_empty();
-        }
-        children.push(child);
-    }
-    children
-}
-
-/// `glu uses`: the reverse dependency tree from a `/v1/uses` response — the
-/// target at the root, its direct dependents as children (packages whose
-/// `deps` include it), recursed upward and cycle-guarded. `None` when the
-/// target is absent (the registry found no dependents).
-pub fn reverse_tree_from_uses(
-    uses: &glu_core::UsesResponse,
-) -> Option<crate::state::installed::DependencyTreeNode> {
-    use crate::state::installed::DependencyTreeNode;
-    let selection = uses.roots.first()?;
-    let root = uses.packages.get(&selection.package)?;
-    if root.package_key != selection.package_key {
-        return None;
-    }
-    let mut seen: std::collections::BTreeSet<glu_core::PackageKey> =
-        std::collections::BTreeSet::new();
-    seen.insert(root.package_key.clone());
-    Some(DependencyTreeNode {
-        name: root.name.0.clone(),
-        version: root.keg_version.0.clone(),
-        children: uses_reverse_children(&uses.packages, &root.package_key, &mut seen),
-        already_shown: false,
-        requires: None,
-    })
-}
-
-fn uses_reverse_children(
-    packages: &std::collections::BTreeMap<glu_core::PackageId, glu_core::SlimPackage>,
-    package_key: &glu_core::PackageKey,
-    seen: &mut std::collections::BTreeSet<glu_core::PackageKey>,
-) -> Vec<crate::state::installed::DependencyTreeNode> {
-    use crate::state::installed::DependencyTreeNode;
-    let mut parents: Vec<&glu_core::SlimPackage> = packages
-        .values()
-        .filter(|package| {
-            package
-                .deps
-                .iter()
-                .any(|dep| &dep.package_key == package_key)
-        })
-        .collect();
-    parents.sort_by_key(|parent| parent.name.0.to_lowercase());
-    let mut children = Vec::new();
-    for parent in parents {
-        let requires = crate::state::installed::format_minimum_version(
-            parent.dependency_requirements.get(package_key),
-        );
-        let mut node = DependencyTreeNode {
-            name: parent.name.0.clone(),
-            version: parent.keg_version.0.clone(),
-            children: Vec::new(),
-            already_shown: false,
-            requires,
-        };
-        if seen.insert(parent.package_key.clone()) {
-            node.children = uses_reverse_children(packages, &parent.package_key, seen);
-        } else if has_slim_dependents(packages, &parent.package_key) {
-            node.already_shown = true;
-        }
-        children.push(node);
-    }
-    children
-}
-
-fn has_slim_dependents(
-    packages: &std::collections::BTreeMap<glu_core::PackageId, glu_core::SlimPackage>,
-    package_key: &glu_core::PackageKey,
-) -> bool {
-    packages.values().any(|package| {
-        package
-            .deps
-            .iter()
-            .any(|dep| &dep.package_key == package_key)
-    })
 }
 
 fn canonicalize_declaration_renames(
@@ -1932,7 +1742,7 @@ mod tree_tests {
             "pcre2",
         );
 
-        let tree = reverse_tree_from_uses(&response).unwrap();
+        let tree = crate::dependency_query::reverse_tree_from_uses(&response).unwrap();
         assert_eq!(tree.name, "pcre2");
         let children: Vec<&str> = tree.children.iter().map(|n| n.name.as_str()).collect();
         assert_eq!(children, vec!["direct", "glib"]);
@@ -1948,7 +1758,7 @@ mod tree_tests {
     fn reverse_tree_from_uses_none_when_target_absent() {
         let (_id, glib) = slim("glib", "2.88", vec![]);
         let response = uses_response(vec![(_id, glib)], "pcre2");
-        assert!(reverse_tree_from_uses(&response).is_none());
+        assert!(crate::dependency_query::reverse_tree_from_uses(&response).is_none());
     }
 
     #[test]
@@ -1973,7 +1783,11 @@ mod tree_tests {
             packages,
         };
 
-        let tree = dependency_tree_from_slim(&manifest, &manifest.roots[0].package).unwrap();
+        let tree = crate::dependency_query::dependency_tree_from_slim(
+            &manifest,
+            &manifest.roots[0].package,
+        )
+        .unwrap();
         assert_eq!(tree.name, "vips");
         assert_eq!(tree.children.len(), 1);
         assert_eq!(tree.children[0].name, "pcre2");

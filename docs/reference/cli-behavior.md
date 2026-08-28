@@ -114,9 +114,9 @@ A command rejects shared options it does not support instead of silently ignorin
 
 Dependency-aware commands can render flat or tree-shaped output.
 
-Flat output is a deduplicated set view. Tree output preserves dependency shape and may mark repeated graph nodes as already shown.
+Flat output is a deduplicated set view. Deduplication uses stable package identity, so two distinct packages are not merged merely because they have the same displayed spelling. Tree output preserves dependency shape and may mark repeated graph nodes as already shown. Forward dependency text and NUL output preserve the exact selector recorded on each edge, including aliases and old names.
 
-JSON tree output preserves structure as data rather than exposing box-drawing text as the contract. List-like JSON results are object-shaped so their scope, view, and future metadata can evolve without changing the result root type.
+JSON tree output preserves structure as data rather than exposing box-drawing text as the contract. Node-map keys are concrete package IDs, nodes include stable package keys and canonical names, and edges include their exact `requested_as` selector plus whether reverse traversal produced the edge. Flat dependency records retain package key, concrete package ID, and edge selector too. List-like JSON results are object-shaped so their scope, view, and future metadata can evolve without changing the result root type.
 
 ## Output ownership
 

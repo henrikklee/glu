@@ -44,6 +44,7 @@ Each phase has a narrow boundary:
 - the DAG describes executable work;
 - the orchestrator runs nodes and records typed lifecycle events;
 - state code is the only durable-state authority;
+- dependency queries project one authority into identity-bearing nodes and edges;
 - the CLI presentation host selects human, JSON, NUL, or raw output once.
 
 ## Complete manifests
@@ -73,6 +74,14 @@ The planner produces the meaningful transition: install, keep, promote, rename, 
 Dependency reuse is context-sensitive. For each package being expanded as an installer root, the planner applies that package's complete selected-artifact requirement map throughout its topology closure. It continues through satisfied intermediates, and packages selected for installation are expanded again with their own maps. Selection from multiple contexts is merged before dependency ordering and DAG construction.
 
 Plain `glu install` is idempotent by installed root name. It records or promotes intent without upgrading an already installed package. Update, reinstall, and force modes are the paths that repour roots.
+
+## Query projection boundary
+
+Dependency queries never reduce graph nodes to display strings. The shared projection retains each stable `PackageKey`, selected `PackageId`, canonical name, concrete version, and exact edge `requested_as` selector until presentation. Flat and repeated-node deduplication uses `PackageKey`; JSON graph node IDs use `PackageId`.
+
+Installed queries project only the receipt-backed installed graph. Registry queries project only full resolve, slim resolve, or uses responses. These sources share projection and rendering code but are never merged: they answer different questions and retain separate authority.
+
+Forward human and NUL output uses the exact selector recorded on each dependency edge. Reverse output names the dependent package while structured output retains the reversed edge's original selector. Local installed, declared, deactivated, and link annotations join by `PackageKey`, not by a requested or displayed name.
 
 ## Execution boundary
 

@@ -131,7 +131,7 @@ fn resolve_targets_before_mutation(
             missing.push(PackageName(selector.0.clone()));
             continue;
         };
-        if seen.insert(package.name.clone()) {
+        if seen.insert(package.package_key.clone()) {
             packages.push(package.clone());
         }
     }

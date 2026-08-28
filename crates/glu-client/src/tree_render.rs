@@ -1,4 +1,4 @@
-use crate::{state::installed::DependencyTreeNode, style};
+use crate::{dependency_query::DependencyTreeNode, style};
 use std::collections::BTreeSet;
 
 /// How root nodes should be drawn when rendering a decorated tree.
@@ -73,7 +73,7 @@ pub fn render_dependency_tree(
 pub fn render_dependency_tree_with_context(
     nodes: &[DependencyTreeNode],
     options: TreeRenderOptions,
-    context: &BTreeSet<(String, String)>,
+    context: &BTreeSet<(glu_core::PackageKey, String)>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     render_nodes(nodes, "", 0, options, context, &mut lines);
@@ -85,7 +85,7 @@ fn render_nodes(
     prefix: &str,
     depth: usize,
     options: TreeRenderOptions,
-    context: &BTreeSet<(String, String)>,
+    context: &BTreeSet<(glu_core::PackageKey, String)>,
     lines: &mut Vec<String>,
 ) {
     for (index, node) in nodes.iter().enumerate() {
@@ -123,7 +123,7 @@ fn render_node_line(
     prefix: &str,
     last: bool,
     options: TreeRenderOptions,
-    context: &BTreeSet<(String, String)>,
+    context: &BTreeSet<(glu_core::PackageKey, String)>,
 ) -> String {
     let version = (options.show_versions && !node.version.is_empty()).then_some(&node.version);
     let requirement = options.verbose.then_some(node.requires.as_ref()).flatten();
@@ -161,7 +161,7 @@ fn render_node_line(
             .unwrap_or_default();
         format!("{version}{requirement}")
     };
-    let is_context = context.contains(&(node.name.clone(), node.version.clone()));
+    let is_context = context.contains(&(node.package_key.clone(), node.version.clone()));
     if !options.decorated || plain_root {
         let line = format!(
             "{}{}{}",
@@ -200,10 +200,14 @@ mod tests {
 
     fn node(name: &str, children: Vec<DependencyTreeNode>) -> DependencyTreeNode {
         DependencyTreeNode {
+            package_key: glu_core::PackageKey(format!("package:{name}")),
+            package: glu_core::PackageId(format!("pkg:test/{name}@{name}-1")),
             name: name.to_string(),
+            canonical_name: glu_core::PackageName(name.to_string()),
             version: format!("{name}-1"),
             children,
             already_shown: false,
+            incoming: None,
             requires: None,
         }
     }
@@ -260,7 +264,10 @@ mod tests {
             "root",
             vec![node("context", vec![node("work", vec![])])],
         )];
-        let context = BTreeSet::from([("context".to_string(), "context-1".to_string())]);
+        let context = BTreeSet::from([(
+            glu_core::PackageKey("package:context".to_string()),
+            "context-1".to_string(),
+        )]);
         let lines = render_dependency_tree_with_context(
             &tree,
             TreeRenderOptions::decorated(RootStyle::Plain),

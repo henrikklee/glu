@@ -15,14 +15,16 @@ use anyhow::Result;
 use glu_client::activation::{
     ActivationResult, ActivationStatus, DeactivationResult, DeactivationStatus,
 };
+use glu_client::dependency_query::DependencyTreeNode;
 use glu_client::download::cache::{CacheCleanupPlan, CacheCleanupResult, CachedBottle};
 use glu_client::remove::{KeptDeclaredPackage, RemovedPackage};
-use glu_client::state::installed::DependencyTreeNode;
 use glu_client::tree_render::{
     render_dependency_tree, render_dependency_tree_with_context, RootStyle, TreeRenderOptions,
 };
 use glu_client::{shell::SetupResult, GluClient, LocalQuery};
-use glu_core::{InfoResponse, InstalledPackage, PackageName};
+#[cfg(test)]
+use glu_core::PackageName;
+use glu_core::{InfoResponse, InstalledPackage};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
 
@@ -221,19 +223,16 @@ fn render_list_output(list: &ListOutput, globals: &GlobalOptions) {
             }
         }
         ListView::Tree(tree) => print_list_tree(tree),
-        ListView::Flat(packages) if globals.is_json() => print_list_json(
-            list.scope,
-            packages,
-            &list.declared_names,
-            &list.deactivated_names,
-        ),
+        ListView::Flat(packages) if globals.is_json() => {
+            print_list_json(list.scope, packages, &list.statuses)
+        }
         ListView::Flat(packages) if globals.is_null() => {
             for package in packages {
                 print!("{}\0", package.name.0);
             }
         }
         ListView::Flat(packages) => {
-            print_list(packages, &list.deactivated_names);
+            print_list(packages, &list.statuses);
             if list.scope == ListScope::Declared
                 && list.hidden_dependencies > 0
                 && list.show_dependency_hint
@@ -478,6 +477,12 @@ struct ReverseDepsFlatResult<'a> {
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
 struct DependencyRecord {
+    package_key: String,
+    package: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(required)]
+    requested_as: Option<String>,
+    reversed: bool,
     name: String,
     version: String,
     installed: bool,
@@ -499,9 +504,9 @@ struct DependencyRecord {
 fn dependency_records(
     nodes: &[DependencyTreeNode],
     direct_only: bool,
-    statuses: &BTreeMap<PackageName, glu_client::deps::PackageStatus>,
+    statuses: &BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
 ) -> Vec<DependencyRecord> {
-    let mut seen = BTreeSet::new();
+    let mut seen = BTreeMap::new();
     let mut records = Vec::new();
     collect_dependency_records(nodes, direct_only, statuses, 1, &mut seen, &mut records);
     records
@@ -510,18 +515,22 @@ fn dependency_records(
 fn collect_dependency_records(
     nodes: &[DependencyTreeNode],
     direct_only: bool,
-    statuses: &BTreeMap<PackageName, glu_client::deps::PackageStatus>,
+    statuses: &BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
     depth: usize,
-    seen: &mut BTreeSet<String>,
+    seen: &mut BTreeMap<glu_core::PackageKey, usize>,
     records: &mut Vec<DependencyRecord>,
 ) {
     for node in nodes {
-        let id = dependency_node_id(node);
-        if seen.insert(id) {
+        if let Some(index) = seen.get(&node.package_key).copied() {
+            if depth == 1 {
+                records[index].direct = true;
+                records[index].transitive = false;
+            }
+        } else {
+            seen.insert(node.package_key.clone(), records.len());
             records.push(dependency_record(
-                &node.name,
-                &node.version,
-                statuses.get(&PackageName(node.name.clone())),
+                node,
+                statuses.get(&node.package_key),
                 depth,
             ));
         }
@@ -539,14 +548,20 @@ fn collect_dependency_records(
 }
 
 fn dependency_record(
-    name: &str,
-    version: &str,
+    node: &DependencyTreeNode,
     status: Option<&glu_client::deps::PackageStatus>,
     depth: usize,
 ) -> DependencyRecord {
     DependencyRecord {
-        name: name.to_string(),
-        version: version.to_string(),
+        package_key: node.package_key.0.clone(),
+        package: node.package.0.clone(),
+        requested_as: node
+            .incoming
+            .as_ref()
+            .map(|edge| edge.requested_as.0.clone()),
+        reversed: node.incoming.as_ref().is_some_and(|edge| edge.reversed),
+        name: node.name.clone(),
+        version: node.version.clone(),
         installed: status.is_some_and(|status| status.installed),
         linked: status.map(|status| status.linked),
         declared: status.is_some_and(|status| status.declared),
@@ -618,6 +633,7 @@ pub(crate) fn install_output(summary: &glu_client::install::InstallSummary) -> I
             .renamed
             .iter()
             .map(|rename| RenamePackageRecord {
+                package_key: rename.package_key.0.clone(),
                 old_name: rename.old_name.0.clone(),
                 new_name: rename.new_name.0.clone(),
                 version: rename.version.clone(),
@@ -652,6 +668,7 @@ pub(crate) fn install_plan_output(plan: &glu_client::install::InstallPlan) -> In
             .renamed
             .iter()
             .map(|rename| RenamePackageRecord {
+                package_key: rename.package_key.0.clone(),
                 old_name: rename.old_name.0.clone(),
                 new_name: rename.new_name.0.clone(),
                 version: rename.version.clone(),
@@ -695,6 +712,7 @@ pub(crate) fn reinstall_output(summary: &glu_client::install::InstallSummary) ->
             .renamed
             .iter()
             .map(|rename| RenamePackageRecord {
+                package_key: rename.package_key.0.clone(),
                 old_name: rename.old_name.0.clone(),
                 new_name: rename.new_name.0.clone(),
                 version: rename.version.clone(),
@@ -726,6 +744,7 @@ pub(crate) fn reinstall_plan_output(
             .renamed
             .iter()
             .map(|rename| RenamePackageRecord {
+                package_key: rename.package_key.0.clone(),
                 old_name: rename.old_name.0.clone(),
                 new_name: rename.new_name.0.clone(),
                 version: rename.version.clone(),
@@ -762,6 +781,7 @@ fn update_package_record(
     status: MutationStatus,
 ) -> UpdatePackageRecord {
     UpdatePackageRecord {
+        package_key: update.package_key.0.clone(),
         name: update.name.0.clone(),
         current: update.current.clone(),
         latest: update.latest.clone(),
@@ -780,6 +800,7 @@ fn update_package_record(
 
 fn package_change_record(change: &glu_client::install::PackageChange) -> MutationPackageRecord {
     MutationPackageRecord {
+        package_key: Some(change.package_key.0.clone()),
         name: change.name.0.clone(),
         version: change.version.clone(),
         status: change.status.into(),
@@ -801,6 +822,7 @@ fn plain_mutation_package_record(
     status: MutationStatus,
 ) -> MutationPackageRecord {
     MutationPackageRecord {
+        package_key: None,
         name,
         version,
         status,
@@ -1161,7 +1183,7 @@ struct InstallPlanTreeResult<'a> {
 impl<'a> InstallPlanTreeResult<'a> {
     fn new(
         plan: &'a InstallPlanOutput,
-        statuses: &BTreeMap<PackageName, glu_client::deps::PackageStatus>,
+        statuses: &BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
     ) -> Self {
         let DependencyGraphJson {
             nodes,
@@ -1219,7 +1241,7 @@ struct UpdatePlanTreeResult<'a> {
 impl<'a> UpdatePlanTreeResult<'a> {
     fn new(
         plan: &'a UpdatePlanOutput,
-        statuses: &BTreeMap<PackageName, glu_client::deps::PackageStatus>,
+        statuses: &BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
     ) -> Self {
         let DependencyGraphJson {
             nodes,
@@ -1288,15 +1310,11 @@ pub(crate) fn render_install_execution_plan(
                 "Will {label} {}:",
                 glu_client::format::plural(total, "package")
             );
-            let included: BTreeSet<(&str, &str)> = plan
+            let included: BTreeSet<glu_core::PackageKey> = plan
                 .would_install
                 .iter()
-                .map(|package| (package.name.0.as_str(), package.version.as_str()))
-                .chain(
-                    plan.renamed
-                        .iter()
-                        .map(|rename| (rename.new_name.0.as_str(), rename.version.as_str())),
-                )
+                .map(|package| package.package_key.clone())
+                .chain(plan.renamed.iter().map(|rename| rename.package_key.clone()))
                 .collect();
             let install_tree = filter_package_tree(&plan.dependency_tree(), &included);
             for line in render_dependency_tree_with_context(
@@ -1355,9 +1373,9 @@ pub(crate) fn render_update_execution_plan(plan: &glu_client::install::UpdatePla
         .iter()
         .map(|update| {
             (
-                update.name.0.as_str(),
-                update.current.as_str(),
-                update.latest.as_str(),
+                update.package_key.clone(),
+                update.current.clone(),
+                update.latest.clone(),
             )
         })
         .collect();
@@ -1561,9 +1579,9 @@ fn render_update_plan_output(plan: &UpdatePlanOutput, globals: &GlobalOptions) {
                     .iter()
                     .map(|update| {
                         (
-                            update.name.as_str(),
-                            update.current.as_str(),
-                            update.latest.as_str(),
+                            glu_core::PackageKey(update.package_key.clone()),
+                            update.current.clone(),
+                            update.latest.clone(),
                         )
                     })
                     .collect::<Vec<_>>(),
@@ -1629,18 +1647,18 @@ fn print_rename_section(heading: &str, renames: &[RenamePackageRecord]) {
 #[derive(Default)]
 struct MutationTree {
     nodes: Vec<DependencyTreeNode>,
-    context: BTreeSet<(String, String)>,
+    context: BTreeSet<(glu_core::PackageKey, String)>,
 }
 
 fn filter_package_tree(
     nodes: &[DependencyTreeNode],
-    included: &BTreeSet<(&str, &str)>,
+    included: &BTreeSet<glu_core::PackageKey>,
 ) -> MutationTree {
     let mut result = MutationTree::default();
     for node in nodes {
         let mut children = filter_package_tree(&node.children, included);
         result.context.append(&mut children.context);
-        if included.contains(&(node.name.as_str(), node.version.as_str())) {
+        if included.contains(&node.package_key) {
             let mut node = node.clone();
             node.children = children.nodes;
             result.nodes.push(node);
@@ -1649,7 +1667,7 @@ fn filter_package_tree(
             // dependency edges between visible mutation nodes.
             result
                 .context
-                .insert((node.name.clone(), node.version.clone()));
+                .insert((node.package_key.clone(), node.version.clone()));
             let mut node = node.clone();
             node.children = children.nodes;
             result.nodes.push(node);
@@ -1662,9 +1680,9 @@ fn install_only_tree(
     tree: &[DependencyTreeNode],
     would_install: &[MutationPackageRecord],
 ) -> MutationTree {
-    let included: BTreeSet<(&str, &str)> = would_install
+    let included: BTreeSet<glu_core::PackageKey> = would_install
         .iter()
-        .map(|package| (package.name.as_str(), package.version.as_str()))
+        .filter_map(|package| package.package_key.clone().map(glu_core::PackageKey))
         .collect();
     filter_package_tree(tree, &included)
 }
@@ -1683,19 +1701,27 @@ fn print_mutation_tree(tree: &MutationTree) {
     }
 }
 
-fn update_only_tree(tree: &[DependencyTreeNode], changes: &[(&str, &str, &str)]) -> MutationTree {
-    let changes: BTreeMap<(&str, &str), &str> = changes
+fn update_only_tree(
+    tree: &[DependencyTreeNode],
+    changes: &[(glu_core::PackageKey, String, String)],
+) -> MutationTree {
+    let changes: BTreeMap<glu_core::PackageKey, (&str, &str)> = changes
         .iter()
-        .map(|(name, current, latest)| ((*name, *latest), *current))
+        .map(|(package_key, current, latest)| {
+            (package_key.clone(), (current.as_str(), latest.as_str()))
+        })
         .collect();
 
-    let included: BTreeSet<(&str, &str)> = changes.keys().copied().collect();
+    let included: BTreeSet<glu_core::PackageKey> = changes.keys().cloned().collect();
     let mut tree = filter_package_tree(tree, &included);
 
-    fn add_transitions(nodes: &mut [DependencyTreeNode], changes: &BTreeMap<(&str, &str), &str>) {
+    fn add_transitions(
+        nodes: &mut [DependencyTreeNode],
+        changes: &BTreeMap<glu_core::PackageKey, (&str, &str)>,
+    ) {
         for node in nodes {
-            if let Some(current) = changes.get(&(node.name.as_str(), node.version.as_str())) {
-                node.version = format!("{current} → {}", node.version);
+            if let Some((current, latest)) = changes.get(&node.package_key) {
+                node.version = format!("{current} → {latest}");
             }
             add_transitions(&mut node.children, changes);
         }
@@ -1707,7 +1733,7 @@ fn update_only_tree(tree: &[DependencyTreeNode], changes: &[(&str, &str, &str)])
 pub(crate) fn print_update_tree(
     action: &str,
     tree: &[DependencyTreeNode],
-    changes: &[(&str, &str, &str)],
+    changes: &[(glu_core::PackageKey, String, String)],
 ) -> bool {
     let tree = update_only_tree(tree, changes);
     if tree.nodes.is_empty() {
@@ -1723,12 +1749,12 @@ pub(crate) fn print_update_tree(
 
 fn mutation_plan_statuses<'a>(
     records: impl IntoIterator<Item = &'a MutationPackageRecord>,
-) -> BTreeMap<PackageName, glu_client::deps::PackageStatus> {
+) -> BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus> {
     records
         .into_iter()
-        .map(|record| {
-            (
-                PackageName(record.name.clone()),
+        .filter_map(|record| {
+            Some((
+                glu_core::PackageKey(record.package_key.clone()?),
                 glu_client::deps::PackageStatus {
                     installed: record.installed.unwrap_or(false),
                     installed_version: None,
@@ -1738,19 +1764,19 @@ fn mutation_plan_statuses<'a>(
                     download_bytes: record.download_bytes,
                     installed_bytes: record.installed_bytes,
                 },
-            )
+            ))
         })
         .collect()
 }
 
 fn update_plan_statuses(
     records: &[UpdatePackageRecord],
-) -> BTreeMap<PackageName, glu_client::deps::PackageStatus> {
+) -> BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus> {
     records
         .iter()
         .map(|record| {
             (
-                PackageName(record.name.clone()),
+                glu_core::PackageKey(record.package_key.clone()),
                 glu_client::deps::PackageStatus {
                     installed: record.installed.unwrap_or(false),
                     installed_version: None,
@@ -2032,13 +2058,18 @@ fn render_status_output(status: &StatusOutput, globals: &GlobalOptions) {
 /// `glu list`: plain `name version` rows. TTY output may color versions and
 /// state labels, but it does not add headers or bullets, so the command stays
 /// a list primitive.
-pub(crate) fn print_list(packages: &[InstalledPackage], deactivated: &[PackageName]) {
-    let deactivated: BTreeSet<&PackageName> = deactivated.iter().collect();
+pub(crate) fn print_list(
+    packages: &[InstalledPackage],
+    statuses: &BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
+) {
     let items: Vec<_> = packages
         .iter()
         .map(|package| {
             let item = PackageListItem::package(&package.name.0, &package.keg_version.0);
-            if deactivated.contains(&package.name) {
+            if statuses
+                .get(&package.package_key)
+                .is_some_and(|status| status.deactivated)
+            {
                 item.annotated("deactivated")
             } else {
                 item
@@ -2048,29 +2079,41 @@ pub(crate) fn print_list(packages: &[InstalledPackage], deactivated: &[PackageNa
     package_list::print_primitive(&items);
 }
 
-/// Flat view of a tree: every node once, deduped by name and sorted — no
-/// indentation, just the set (`glu deps vips` flat = everything vips pulls
-/// in). `direct` stops after the first level (the roots' children).
+/// Flat view of a tree: every stable package identity once, sorted by its
+/// displayed spelling. Distinct packages with the same display string remain
+/// distinct. `direct` stops after the first level.
 pub(crate) fn flatten_tree_unique(
     nodes: &[DependencyTreeNode],
     direct: bool,
     out: &mut Vec<(String, String)>,
 ) {
-    fn walk(nodes: &[DependencyTreeNode], direct: bool, out: &mut Vec<(String, String)>) {
+    fn walk<'a>(
+        nodes: &'a [DependencyTreeNode],
+        direct: bool,
+        out: &mut Vec<&'a DependencyTreeNode>,
+    ) {
         for node in nodes {
-            out.push((node.name.clone(), node.version.clone()));
+            out.push(node);
             if !direct {
                 walk(&node.children, direct, out);
             }
         }
     }
-    let mut seen: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut by_identity = std::collections::BTreeMap::new();
     let mut flat = Vec::new();
     walk(nodes, direct, &mut flat);
-    for (name, version) in flat {
-        seen.entry(name).or_insert(version);
+    for node in flat {
+        by_identity
+            .entry(node.package_key.clone())
+            .or_insert_with(|| (node.name.clone(), node.version.clone()));
     }
-    *out = seen.into_iter().collect();
+    let mut unique: Vec<_> = by_identity.into_values().collect();
+    unique.sort_by(|a, b| {
+        a.0.to_lowercase()
+            .cmp(&b.0.to_lowercase())
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    *out = unique;
 }
 
 /// Flat query output uses the same bare `name version` primitive as `glu ls`.
@@ -2084,7 +2127,7 @@ pub(crate) fn print_flat(items: &[(String, String)]) {
 
 fn print_deps_flat(
     records: &[DependencyRecord],
-    statuses: &BTreeMap<PackageName, glu_client::deps::PackageStatus>,
+    statuses: &BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
     verbose: bool,
     show_status: bool,
 ) {
@@ -2097,7 +2140,7 @@ fn print_deps_flat(
 
 fn print_dependency_status(
     records: &[DependencyRecord],
-    statuses: &BTreeMap<PackageName, glu_client::deps::PackageStatus>,
+    statuses: &BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
     verbose: bool,
 ) {
     if records.is_empty() {
@@ -2113,12 +2156,12 @@ fn print_dependency_status(
 
 fn deps_list_item(
     record: &DependencyRecord,
-    statuses: &BTreeMap<PackageName, glu_client::deps::PackageStatus>,
+    statuses: &BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
     verbose: bool,
     show_status: bool,
 ) -> PackageListItem {
     let installed_version = statuses
-        .get(&PackageName(record.name.clone()))
+        .get(&glu_core::PackageKey(record.package_key.clone()))
         .and_then(|status| status.installed_version.as_deref());
     let mut annotation = Vec::new();
     if verbose {
@@ -2143,19 +2186,19 @@ fn deps_list_item(
 
 fn print_deps_tree(
     root: &DependencyTreeNode,
-    statuses: &BTreeMap<PackageName, glu_client::deps::PackageStatus>,
+    statuses: &BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
     direct: bool,
     verbose: bool,
 ) {
     fn local_versions(
         node: &DependencyTreeNode,
-        statuses: &BTreeMap<PackageName, glu_client::deps::PackageStatus>,
+        statuses: &BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
         verbose: bool,
     ) -> DependencyTreeNode {
         let mut node = node.clone();
         node.version = if verbose {
             statuses
-                .get(&PackageName(node.name.clone()))
+                .get(&node.package_key)
                 .and_then(|status| status.installed_version.clone())
                 .unwrap_or_default()
         } else {
@@ -2226,7 +2269,7 @@ pub(crate) fn print_list_tree(tree: &[DependencyTreeNode]) {
 pub(crate) fn print_list_tree_json(
     scope: ListScope,
     tree: &[DependencyTreeNode],
-    statuses: &BTreeMap<PackageName, glu_client::deps::PackageStatus>,
+    statuses: &BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
 ) {
     let result = ListResult::Tree(ListTreeResult {
         scope,
@@ -2280,6 +2323,7 @@ struct DependencyGraphJson {
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
 struct DependencyGraphNode {
+    package_key: String,
     name: String,
     version: String,
     installed: bool,
@@ -2301,6 +2345,8 @@ struct DependencyGraphNode {
 #[derive(serde::Serialize, schemars::JsonSchema)]
 struct DependencyGraphEdge {
     to: String,
+    requested_as: String,
+    reversed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(required)]
     requires: Option<String>,
@@ -2309,7 +2355,7 @@ struct DependencyGraphEdge {
 fn dependency_graph_json(
     nodes: &[DependencyTreeNode],
     direct: bool,
-    statuses: &BTreeMap<PackageName, glu_client::deps::PackageStatus>,
+    statuses: &BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
 ) -> DependencyGraphJson {
     let mut graph_nodes = BTreeMap::new();
     let mut edges: BTreeMap<String, Vec<DependencyGraphEdge>> = BTreeMap::new();
@@ -2332,14 +2378,20 @@ fn collect_dependency_graph(
     node: &DependencyTreeNode,
     direct: bool,
     depth: usize,
-    statuses: &BTreeMap<PackageName, glu_client::deps::PackageStatus>,
+    statuses: &BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
     nodes: &mut BTreeMap<String, DependencyGraphNode>,
     edges: &mut BTreeMap<String, Vec<DependencyGraphEdge>>,
 ) {
     let id = dependency_node_id(node);
-    nodes
+    let graph_node = nodes
         .entry(id.clone())
         .or_insert_with(|| dependency_graph_node(node, statuses, depth));
+    if depth == 1 {
+        graph_node.direct = true;
+        graph_node.transitive = false;
+    } else if depth > 1 && !graph_node.direct {
+        graph_node.transitive = true;
+    }
 
     if direct && depth >= 1 {
         return;
@@ -2347,14 +2399,25 @@ fn collect_dependency_graph(
 
     for child in &node.children {
         let child_id = dependency_node_id(child);
-        nodes
+        let graph_node = nodes
             .entry(child_id.clone())
             .or_insert_with(|| dependency_graph_node(child, statuses, depth + 1));
+        if depth == 0 {
+            graph_node.direct = true;
+            graph_node.transitive = false;
+        } else if !graph_node.direct {
+            graph_node.transitive = true;
+        }
         edges
             .entry(id.clone())
             .or_default()
             .push(DependencyGraphEdge {
                 to: child_id,
+                requested_as: child
+                    .incoming
+                    .as_ref()
+                    .map_or_else(|| child.name.clone(), |edge| edge.requested_as.0.clone()),
+                reversed: child.incoming.as_ref().is_some_and(|edge| edge.reversed),
                 requires: child.requires.clone(),
             });
         if !child.already_shown {
@@ -2364,17 +2427,18 @@ fn collect_dependency_graph(
 }
 
 fn dependency_node_id(node: &DependencyTreeNode) -> String {
-    format!("{}@{}", node.name, node.version)
+    node.package.0.clone()
 }
 
 fn dependency_graph_node(
     node: &DependencyTreeNode,
-    statuses: &BTreeMap<PackageName, glu_client::deps::PackageStatus>,
+    statuses: &BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
     depth: usize,
 ) -> DependencyGraphNode {
-    let status = statuses.get(&PackageName(node.name.clone()));
+    let status = statuses.get(&node.package_key);
     DependencyGraphNode {
-        name: node.name.clone(),
+        package_key: node.package_key.0.clone(),
+        name: node.canonical_name.0.clone(),
         version: node.version.clone(),
         installed: status.is_some_and(|status| status.installed),
         linked: status.map(|status| status.linked),
@@ -2425,19 +2489,19 @@ struct ListFlatResult {
 pub(crate) fn print_list_json(
     scope: ListScope,
     packages: &[InstalledPackage],
-    declared_names: &[PackageName],
-    deactivated: &[PackageName],
+    statuses: &BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
 ) {
-    let declared_names: BTreeSet<&PackageName> = declared_names.iter().collect();
-    let deactivated: BTreeSet<&PackageName> = deactivated.iter().collect();
     let records: Vec<ListRecord> = packages
         .iter()
-        .map(|package| ListRecord {
-            name: package.name.0.clone(),
-            version: package.keg_version.0.clone(),
-            keg_only: package.keg_only,
-            declared: declared_names.contains(&package.name),
-            active: !deactivated.contains(&package.name),
+        .map(|package| {
+            let status = statuses.get(&package.package_key);
+            ListRecord {
+                name: package.name.0.clone(),
+                version: package.keg_version.0.clone(),
+                keg_only: package.keg_only,
+                declared: status.is_some_and(|status| status.declared),
+                active: !status.is_some_and(|status| status.deactivated),
+            }
         })
         .collect();
     let result = ListResult::Flat(ListFlatResult {
@@ -2538,10 +2602,14 @@ mod tests {
 
     fn node(name: &str, version: &str, children: Vec<DependencyTreeNode>) -> DependencyTreeNode {
         DependencyTreeNode {
+            package_key: glu_core::PackageKey(format!("package:{name}")),
+            package: glu_core::PackageId(format!("pkg:test/{name}@{version}")),
             name: name.to_string(),
+            canonical_name: glu_core::PackageName(name.to_string()),
             version: version.to_string(),
             children,
             already_shown: false,
+            incoming: None,
             requires: None,
         }
     }
@@ -2549,11 +2617,9 @@ mod tests {
     #[test]
     fn dependency_graph_json_dedupes_nodes_but_keeps_edges() {
         let repeated = DependencyTreeNode {
-            name: "shared".to_string(),
-            version: "1.0".to_string(),
-            children: Vec::new(),
             already_shown: true,
             requires: Some(">= 1.0".to_string()),
+            ..node("shared", "1.0", Vec::new())
         };
         let tree = vec![node(
             "root",
@@ -2563,14 +2629,65 @@ mod tests {
 
         let graph = dependency_graph_json(&tree, false, &BTreeMap::new());
         assert_eq!(graph.nodes.len(), 2);
-        assert_eq!(graph.roots, vec!["root@2.0"]);
-        assert!(graph.nodes.contains_key("root@2.0"));
-        assert!(graph.nodes.contains_key("shared@1.0"));
-        let edges = graph.edges.get("root@2.0").unwrap();
+        assert_eq!(graph.roots, vec!["pkg:test/root@2.0"]);
+        assert!(graph.nodes.contains_key("pkg:test/root@2.0"));
+        assert!(graph.nodes.contains_key("pkg:test/shared@1.0"));
+        let edges = graph.edges.get("pkg:test/root@2.0").unwrap();
         assert_eq!(edges.len(), 2);
-        assert_eq!(edges[0].to, "shared@1.0");
-        assert_eq!(edges[1].to, "shared@1.0");
+        assert_eq!(edges[0].to, "pkg:test/shared@1.0");
+        assert_eq!(edges[1].to, "pkg:test/shared@1.0");
         assert_eq!(edges[1].requires.as_deref(), Some(">= 1.0"));
+    }
+
+    #[test]
+    fn query_outputs_keep_edge_selector_and_dedupe_by_package_identity() {
+        let mut alias = node("llvm", "22.1", Vec::new());
+        alias.name = "llvm@22".to_string();
+        alias.incoming = Some(glu_client::dependency_query::DependencyTreeEdge {
+            requested_as: glu_core::PackageSelector("llvm@22".to_string()),
+            reversed: false,
+            minimum: Some(glu_core::MinimumVersion {
+                version: "22.1".to_string(),
+                revision: None,
+            }),
+        });
+        alias.requires = Some(">= 22.1".to_string());
+        let tree = vec![node("rust", "1.0", vec![alias])];
+
+        let lines = render_dependency_tree(&tree, TreeRenderOptions::plain());
+        assert_eq!(lines, vec!["rust 1.0", "llvm@22 22.1"]);
+
+        let records = dependency_records(&tree[0].children, false, &BTreeMap::new());
+        assert_eq!(records[0].package_key, "package:llvm");
+        assert_eq!(records[0].package, "pkg:test/llvm@22.1");
+        assert_eq!(records[0].name, "llvm@22");
+        assert_eq!(records[0].requested_as.as_deref(), Some("llvm@22"));
+
+        let graph = dependency_graph_json(&tree, false, &BTreeMap::new());
+        let edge = &graph.edges["pkg:test/rust@1.0"][0];
+        assert_eq!(edge.to, "pkg:test/llvm@22.1");
+        assert_eq!(edge.requested_as, "llvm@22");
+        assert_eq!(graph.nodes["pkg:test/llvm@22.1"].name, "llvm");
+        assert_eq!(
+            graph.nodes["pkg:test/llvm@22.1"].package_key,
+            "package:llvm"
+        );
+    }
+
+    #[test]
+    fn flat_and_nul_projection_does_not_merge_colliding_display_names() {
+        let first = node("first", "1.0", Vec::new());
+        let mut second = node("second", "2.0", Vec::new());
+        second.name = first.name.clone();
+        let mut flat = Vec::new();
+
+        flatten_tree_unique(&[first, second], false, &mut flat);
+
+        assert_eq!(flat.len(), 2);
+        assert_eq!(flat[0].0, "first");
+        assert_eq!(flat[1].0, "first");
+        assert_eq!(flat[0].1, "1.0");
+        assert_eq!(flat[1].1, "2.0");
     }
 
     #[test]
@@ -2586,17 +2703,24 @@ mod tests {
         )];
 
         let graph = dependency_graph_json(&tree, true, &BTreeMap::new());
-        assert_eq!(graph.roots, vec!["root@1.0"]);
-        assert_eq!(graph.edges.get("root@1.0").unwrap().len(), 1);
-        assert_eq!(graph.edges.get("root@1.0").unwrap()[0].to, "child@1.0");
-        assert!(!graph.edges.contains_key("child@1.0"));
-        assert!(!graph.nodes.contains_key("grandchild@1.0"));
+        assert_eq!(graph.roots, vec!["pkg:test/root@1.0"]);
+        assert_eq!(graph.edges.get("pkg:test/root@1.0").unwrap().len(), 1);
+        assert_eq!(
+            graph.edges.get("pkg:test/root@1.0").unwrap()[0].to,
+            "pkg:test/child@1.0"
+        );
+        assert!(!graph.edges.contains_key("pkg:test/child@1.0"));
+        assert!(!graph.nodes.contains_key("pkg:test/grandchild@1.0"));
     }
 
     #[test]
     fn verbose_deps_uses_local_version_not_resolved_candidate() {
         let record = DependencyRecord {
-            name: "glib".to_string(),
+            package_key: "package:glib".to_string(),
+            package: "pkg:test/glib@9.9-candidate".to_string(),
+            requested_as: Some("glib@2".to_string()),
+            reversed: false,
+            name: "glib@2".to_string(),
             version: "9.9-candidate".to_string(),
             installed: true,
             linked: Some(true),
@@ -2608,7 +2732,7 @@ mod tests {
             installed_bytes: None,
         };
         let statuses = BTreeMap::from([(
-            PackageName("glib".to_string()),
+            glu_core::PackageKey("package:glib".to_string()),
             glu_client::deps::PackageStatus {
                 installed: true,
                 installed_version: Some("2.82.0".to_string()),
@@ -2622,11 +2746,11 @@ mod tests {
 
         assert_eq!(
             package_list::render_primitive(&[deps_list_item(&record, &statuses, false, false)]),
-            "glib"
+            "glib@2"
         );
         assert_eq!(
             package_list::render_primitive(&[deps_list_item(&record, &statuses, true, false)]),
-            "glib (2.82.0 installed)"
+            "glib@2 (2.82.0 installed)"
         );
     }
 
@@ -2638,7 +2762,7 @@ mod tests {
             vec![node("transitive", "2.0", Vec::new())],
         )];
         let statuses = BTreeMap::from([(
-            PackageName("direct".to_string()),
+            glu_core::PackageKey("package:direct".to_string()),
             glu_client::deps::PackageStatus {
                 installed: true,
                 installed_version: Some("1.0".to_string()),
@@ -2671,7 +2795,7 @@ mod tests {
             vec![node("installed-dep", "1.0", Vec::new())],
         )];
         let statuses = BTreeMap::from([(
-            PackageName("installed-dep".to_string()),
+            glu_core::PackageKey("package:installed-dep".to_string()),
             glu_client::deps::PackageStatus {
                 installed: true,
                 installed_version: Some("1.0".to_string()),
@@ -2697,10 +2821,13 @@ mod tests {
         let value = serde_json::to_value(InstallPlanTreeResult::new(&plan, &statuses)).unwrap();
 
         assert_eq!(value["view"], "tree");
-        assert_eq!(value["roots"], serde_json::json!(["root@2.0"]));
-        assert_eq!(value["nodes"]["root@2.0"]["direct"], false);
-        assert_eq!(value["nodes"]["installed-dep@1.0"]["direct"], true);
-        assert_eq!(value["nodes"]["installed-dep@1.0"]["installed"], true);
+        assert_eq!(value["roots"], serde_json::json!(["pkg:test/root@2.0"]));
+        assert_eq!(value["nodes"]["pkg:test/root@2.0"]["direct"], false);
+        assert_eq!(value["nodes"]["pkg:test/installed-dep@1.0"]["direct"], true);
+        assert_eq!(
+            value["nodes"]["pkg:test/installed-dep@1.0"]["installed"],
+            true
+        );
     }
 
     fn assert_result_valid<T: serde::Serialize>(name: &str, result: &T) {
@@ -3016,8 +3143,21 @@ mod tests {
                 node("unchanged", "1.0", Vec::new()),
             ],
         )];
-        let filtered =
-            update_only_tree(&tree, &[("root", "1.0", "2.0"), ("updated", "2.0", "3.0")]);
+        let filtered = update_only_tree(
+            &tree,
+            &[
+                (
+                    glu_core::PackageKey("package:root".to_string()),
+                    "1.0".to_string(),
+                    "2.0".to_string(),
+                ),
+                (
+                    glu_core::PackageKey("package:updated".to_string()),
+                    "2.0".to_string(),
+                    "3.0".to_string(),
+                ),
+            ],
+        );
 
         assert_eq!(filtered.nodes.len(), 1);
         assert_eq!(filtered.nodes[0].name, "root");
@@ -3042,7 +3182,7 @@ mod tests {
                 ),
             ],
         )];
-        let would_install = vec![
+        let mut would_install = vec![
             plain_mutation_package_record(
                 "root".to_string(),
                 "1.0".to_string(),
@@ -3059,6 +3199,9 @@ mod tests {
                 MutationStatus::WouldInstall,
             ),
         ];
+        for record in &mut would_install {
+            record.package_key = Some(format!("package:{}", record.name));
+        }
 
         let filtered = install_only_tree(&tree, &would_install);
         assert_eq!(filtered.nodes.len(), 1);
@@ -3075,9 +3218,10 @@ mod tests {
             filtered.nodes[0].children[1].children[0].name,
             "new-transitive"
         );
-        assert!(filtered
-            .context
-            .contains(&("already-installed".to_string(), "1.0".to_string())));
+        assert!(filtered.context.contains(&(
+            glu_core::PackageKey("package:already-installed".to_string()),
+            "1.0".to_string(),
+        )));
     }
 
     #[test]
