@@ -34,6 +34,63 @@ use std::{
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+/// Transient first-line feedback while an interactive command waits for the
+/// registry. It deliberately does not hide the cursor or print a completion
+/// line: clearing the current line hands a pristine terminal to the command's
+/// real output or the install footer.
+pub struct ResolutionSpinner {
+    term: Term,
+    frame: usize,
+    drawn: bool,
+}
+
+impl ResolutionSpinner {
+    pub fn new() -> Self {
+        Self {
+            term: Term::stdout(),
+            frame: 0,
+            drawn: false,
+        }
+    }
+
+    pub fn start(&mut self) {
+        self.draw();
+    }
+
+    pub fn tick(&mut self) {
+        self.frame = (self.frame + 1) % SPINNER.len();
+        self.draw();
+    }
+
+    pub fn clear(&mut self) {
+        if self.drawn {
+            let _ = self.term.clear_line();
+            let _ = self.term.flush();
+            self.drawn = false;
+        }
+    }
+
+    fn draw(&mut self) {
+        if self.drawn {
+            let _ = self.term.clear_line();
+        }
+        let _ = self.term.write_str(&resolution_text(self.frame));
+        let _ = self.term.flush();
+        self.drawn = true;
+    }
+}
+
+fn resolution_text(frame: usize) -> String {
+    let dots = ".".repeat(frame % 3 + 1);
+    format!("{} Resolving{dots}", SPINNER[frame % SPINNER.len()])
+}
+
+impl Drop for ResolutionSpinner {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PhaseKind {
     Download,
@@ -982,6 +1039,14 @@ mod tests {
         );
         let running = state.render();
         assert!(running[0].contains("Installing 1/3 (from cache)"));
+    }
+
+    #[test]
+    fn resolution_spinner_animates_its_ellipsis() {
+        assert_eq!(resolution_text(0), "⠋ Resolving.");
+        assert_eq!(resolution_text(1), "⠙ Resolving..");
+        assert_eq!(resolution_text(2), "⠹ Resolving...");
+        assert_eq!(resolution_text(3), "⠸ Resolving.");
     }
 
     #[test]

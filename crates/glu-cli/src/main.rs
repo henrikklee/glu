@@ -24,7 +24,12 @@ use command_model::{
 };
 use glu_client::{config::ClientConfig, install::InstallOptions, GluClient};
 use glu_core::{PackageName, PackageSelector};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    io::IsTerminal,
+    time::Duration,
+};
 
 #[tokio::main]
 async fn main() {
@@ -137,6 +142,53 @@ impl From<anyhow::Error> for CliFailure {
     }
 }
 
+#[derive(Debug)]
+struct ResolutionInterrupted;
+
+impl std::fmt::Display for ResolutionInterrupted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("interrupted while resolving registry request (Ctrl+C)")
+    }
+}
+
+impl std::error::Error for ResolutionInterrupted {}
+
+/// Runs a registry-bound future with transient first-line feedback. Machine
+/// output and non-interactive output await the future without touching the
+/// terminal. Dropping the future clears the spinner through its RAII guard.
+async fn while_resolving<F>(enabled: bool, future: F) -> Result<F::Output, CliFailure>
+where
+    F: Future,
+{
+    if !enabled {
+        return Ok(future.await);
+    }
+
+    let mut spinner = progress::ResolutionSpinner::new();
+    spinner.start();
+
+    let start = tokio::time::Instant::now() + Duration::from_millis(80);
+    let mut ticker = tokio::time::interval_at(start, Duration::from_millis(80));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(future);
+    tokio::pin!(interrupt);
+
+    loop {
+        tokio::select! {
+            output = &mut future => {
+                spinner.clear();
+                return Ok(output);
+            }
+            _ = ticker.tick() => spinner.tick(),
+            _ = &mut interrupt => {
+                spinner.clear();
+                return Err(anyhow::Error::new(ResolutionInterrupted).into());
+            }
+        }
+    }
+}
+
 async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOptions), CliFailure> {
     let globals = GlobalOptions::from_args(cli.globals);
     let json = globals.is_json();
@@ -145,6 +197,7 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
     let verbose = globals.verbose;
     let plan = globals.plan;
     let yes = globals.yes;
+    let show_resolution = !json && !null && std::io::stdout().is_terminal();
     let Some(command) = cli.command else {
         // Bare JSON is the discoverable machine contract; bare human output
         // remains the grouped overview.
@@ -223,7 +276,8 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                 verbose,
                 ..Default::default()
             };
-            let install_plan = client.plan_install(names, options).await?;
+            let install_plan =
+                while_resolving(show_resolution, client.plan_install(names, options)).await??;
             if plan {
                 final_output = Some(CommandOutput::InstallPlan(output::install_plan_output(
                     &install_plan,
@@ -259,7 +313,8 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                 verbose: false,
                 declared_policy: glu_client::install::DeclaredPolicy::Preserve,
             };
-            let install_plan = client.plan_install(names, options).await?;
+            let install_plan =
+                while_resolving(show_resolution, client.plan_install(names, options)).await??;
             if plan {
                 final_output = Some(CommandOutput::ReinstallPlan(output::reinstall_plan_output(
                     &install_plan,
@@ -486,9 +541,13 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
             online,
         } => {
             let query = client.query_state(events.as_ref())?;
-            let view = client
-                .deps(&query, PackageSelector(name), online, !null)
-                .await?;
+            let selector = PackageSelector(name);
+            let queries_registry = online || query.resolve_selector(&selector).is_none();
+            let view = while_resolving(
+                show_resolution && queries_registry,
+                client.deps(&query, selector, online, !null),
+            )
+            .await??;
             final_output = Some(CommandOutput::Deps(output::deps_output(
                 view, direct, status,
             )));
@@ -512,7 +571,9 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
             } else {
                 client.query_state(events.as_ref())?.package_statuses()
             };
-            let Some(root) = client.uses(selector, direct).await? else {
+            let Some(root) =
+                while_resolving(show_resolution, client.uses(selector, direct)).await??
+            else {
                 return Err(anyhow!("registry returned nothing for '{name}'").into());
             };
             final_output = Some(CommandOutput::ReverseDeps(ReverseDepsOutput {
@@ -533,7 +594,9 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
 
             if names.len() == 1 {
                 let requested = PackageSelector(names.into_iter().next().expect("one info name"));
-                let (info, installed) = client.info(&query, requested.clone()).await?;
+                let (info, installed) =
+                    while_resolving(show_resolution, client.info(&query, requested.clone()))
+                        .await??;
                 let requested_name = PackageName(requested.0);
                 let declared =
                     declared_names.contains(&info.name) || declared_names.contains(&requested_name);
@@ -571,9 +634,17 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                     }));
                 }
 
+                let results = while_resolving(show_resolution, async {
+                    let mut results = Vec::with_capacity(handles.len());
+                    for handle in handles {
+                        results.push(handle.await);
+                    }
+                    results
+                })
+                .await?;
                 let mut packages = Vec::new();
-                for handle in handles {
-                    match handle.await {
+                for result in results {
+                    match result {
                         Ok((name, Ok(info))) => {
                             let requested = PackageName(name.clone());
                             let installed = installed_by_key.get(&info.package_key).cloned();
@@ -649,7 +720,7 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
             all: _,
         } => {
             let query = client.query_state(events.as_ref())?;
-            let mut outdated = client.outdated(&query).await?;
+            let mut outdated = while_resolving(show_resolution, client.outdated(&query)).await??;
             let scope = if declared {
                 let declared_names: std::collections::BTreeSet<_> =
                     query.declared_names().into_iter().collect();
@@ -675,7 +746,9 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
             // same removal-triggered rule as install/reinstall.
             let is_broad = all || names.is_empty();
             let names = names.into_iter().map(PackageSelector).collect();
-            let plan_result = client.plan_update(names, all, dependents).await?;
+            let plan_result =
+                while_resolving(show_resolution, client.plan_update(names, all, dependents))
+                    .await??;
             if plan {
                 final_output = Some(CommandOutput::UpdatePlan(output::update_plan_output(
                     &plan_result,
@@ -935,6 +1008,15 @@ fn cli_error_for_failure(error: &CliFailure) -> CliError {
 fn runtime_cli_error(error: &anyhow::Error) -> CliError {
     if let Some(unknown) = error.downcast_ref::<help::UnknownHelpCommand>() {
         CliError::runtime(ErrorCode::ParseError, unknown.to_string(), Vec::new(), None)
+    } else if let Some(interrupted) = error.downcast_ref::<ResolutionInterrupted>() {
+        CliError::runtime(
+            ErrorCode::Interrupted,
+            interrupted.to_string(),
+            Vec::new(),
+            Some(CliErrorDetails::Operation(OperationErrorDetails {
+                operation: "resolve".to_string(),
+            })),
+        )
     } else if let Some(interrupted) = error.downcast_ref::<glu_client::error::InterruptedError>() {
         CliError::runtime(
             ErrorCode::Interrupted,
@@ -1017,9 +1099,10 @@ fn failure_exit_class(error: &CliFailure) -> ExitClass {
             ExitClass::Usage
         }
         CliFailure::Runtime(error)
-            if error
-                .downcast_ref::<glu_client::error::InterruptedError>()
-                .is_some() =>
+            if error.downcast_ref::<ResolutionInterrupted>().is_some()
+                || error
+                    .downcast_ref::<glu_client::error::InterruptedError>()
+                    .is_some() =>
         {
             ExitClass::Interrupted
         }
@@ -1569,6 +1652,24 @@ mod tests {
         .unwrap();
         assert_eq!(value["error"]["code"], "interrupted");
         assert_eq!(value["error"]["details"]["operation"], "install");
+        assert_error_envelope_valid(&value);
+    }
+
+    #[test]
+    fn resolution_interruption_maps_to_exit_130_without_a_trace() {
+        let failure = CliFailure::Runtime(anyhow::Error::new(ResolutionInterrupted));
+
+        assert_eq!(failure_exit_class(&failure), ExitClass::Interrupted);
+        let value = serde_json::to_value(
+            cli_error_for_failure(&failure).envelope(None, InvocationInfo::default()),
+        )
+        .unwrap();
+        assert_eq!(value["error"]["code"], "interrupted");
+        assert_eq!(value["error"]["details"]["operation"], "resolve");
+        assert!(!value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Trace:"));
         assert_error_envelope_valid(&value);
     }
 
