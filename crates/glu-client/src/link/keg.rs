@@ -579,6 +579,7 @@ mod tests {
                 linked,
                 link_overwrite: Vec::new(),
                 deps: Vec::new(),
+                min_versions: Default::default(),
             },
         };
         crate::state::store::InstalledStateStore::write_receipt_at_keg(&keg, &receipt).unwrap();

@@ -28,6 +28,7 @@ fn package_with_steps(steps: Vec<Value>) -> ResolvedPackage {
         revision: 0,
         keg_version: KegVersion("1.2.3".to_string()),
         deps: Vec::<RuntimeDependencyRequirement>::new(),
+        min_versions: Default::default(),
         artifact: ArtifactId("art:test:fixture".to_string()),
         install: PackageInstallMetadata {
             opt_names: Vec::new(),

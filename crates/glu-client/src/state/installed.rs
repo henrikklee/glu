@@ -401,6 +401,9 @@ fn dependency_tree_children(
 /// The `requires` floor of a dependency edge, as a display string —
 /// `>= 2.84.3` or `>= 2.84.3_1` for a revisioned floor.
 pub(crate) fn format_requires(requires: &glu_core::DependencyRequires) -> Option<String> {
+    if requires.version.is_empty() {
+        return None;
+    }
     let mut floor = format!(">= {}", requires.version);
     if requires.revision > 0 {
         floor.push_str(&format!("_{}", requires.revision));
@@ -738,6 +741,7 @@ mod tests {
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: vec![],
+                min_versions: Default::default(),
             },
         };
         let path = InstalledStateStore::receipt_path_for_keg(&keg);

@@ -209,6 +209,7 @@ mod tests {
                 linked: !deactivated,
                 link_overwrite: Vec::new(),
                 deps: Vec::new(),
+                min_versions: Default::default(),
             },
         };
         InstalledStateStore::write_receipt_at_keg(&keg, &receipt).unwrap();

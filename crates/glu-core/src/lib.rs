@@ -112,6 +112,11 @@ pub struct ResolvedPackage {
     pub keg_version: KegVersion,
     #[serde(default)]
     pub deps: Vec<RuntimeDependencyRequirement>,
+    /// Complete flattened minimum versions recorded by this package's
+    /// selected artifact. These constraints belong to the package, not to
+    /// its direct dependency edges.
+    #[serde(default)]
+    pub min_versions: BTreeMap<String, MinimumVersion>,
     pub artifact: ArtifactId,
     pub install: PackageInstallMetadata,
 }
@@ -149,6 +154,14 @@ pub struct RuntimeDependencyRequirement {
 pub struct DependencyRequires {
     pub version: String,
     pub revision: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MinimumVersion {
+    pub version: String,
+    /// Older package metadata may omit revision entirely. That is distinct
+    /// from an explicitly recorded revision zero.
+    pub revision: Option<u32>,
 }
 
 fn default_true() -> bool {

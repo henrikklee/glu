@@ -1236,6 +1236,7 @@ mod declaration_rename_tests {
                 revision: 0,
                 keg_version: KegVersion("1.1".to_string()),
                 deps: Vec::new(),
+                min_versions: Default::default(),
                 artifact: ArtifactId("art:test".to_string()),
                 install: PackageInstallMetadata {
                     opt_names: Vec::new(),
@@ -2586,6 +2587,7 @@ mod interrupted_install_tests {
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: Vec::new(),
+                min_versions: Default::default(),
             },
         };
         InstalledStateStore::write_receipt_at_keg(&keg, &receipt).unwrap();
@@ -2651,6 +2653,7 @@ mod interrupted_install_tests {
             revision: 0,
             keg_version: KegVersion("1.0".to_string()),
             deps,
+            min_versions: Default::default(),
             artifact,
             install: PackageInstallMetadata {
                 opt_names: Vec::new(),

@@ -560,15 +560,19 @@ mod tests {
                 linked: false,
                 link_overwrite: Vec::new(),
                 deps: deps
+                    .iter()
+                    .map(|(dep_name, _)| glu_core::PackageSelector((*dep_name).to_string()))
+                    .collect(),
+                min_versions: deps
                     .into_iter()
-                    .map(|(dep_name, dep_id)| RuntimeDependencyRequirement {
-                        package_key: glu_core::PackageKey(format!("package:{dep_name}")),
-                        package: PackageId(dep_id.to_string()),
-                        requested_as: glu_core::PackageSelector(dep_name.to_string()),
-                        requires: DependencyRequires {
-                            version: "1.0".to_string(),
-                            revision: 0,
-                        },
+                    .map(|(dep_name, _)| {
+                        (
+                            dep_name.to_string(),
+                            glu_core::MinimumVersion {
+                                version: "1.0".to_string(),
+                                revision: Some(0),
+                            },
+                        )
                     })
                     .collect(),
             },

@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use glu_core::{
-    ArtifactId, InstalledPackage, KegVersion, PackageId, PackageKey, PackageLinkMetadata,
-    PackageName, PackageSelector, RuntimeDependencyRequirement,
+    ArtifactId, InstalledPackage, KegVersion, MinimumVersion, PackageId, PackageKey,
+    PackageLinkMetadata, PackageName, PackageSelector,
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -81,15 +82,14 @@ pub struct ReceiptInstall {
     /// required to reconstruct activation locally without resolving online.
     #[serde(default)]
     pub link_overwrite: Vec<String>,
-    /// This package's own direct runtime dependencies, pinned to the exact
-    /// resolved version/revision it was installed against — not the full
-    /// transitive closure (unlike Homebrew's Tab
-    /// `runtime_dependencies`). Direct-only is sufficient here: `rm`'s
-    /// dependents check walks transitive reachability across installed
-    /// receipts' direct edges at check time instead of storing a precomputed
-    /// closure per receipt.
+    /// Exact direct dependency spellings from the resolved package. Provider
+    /// identity is deliberately not persisted on the dependent's receipt.
     #[serde(default)]
-    pub deps: Vec<RuntimeDependencyRequirement>,
+    pub deps: Vec<PackageSelector>,
+    /// This installed package's complete flattened minimum-version map.
+    /// It is separate from direct graph topology.
+    #[serde(default)]
+    pub min_versions: BTreeMap<String, MinimumVersion>,
 }
 
 impl GluInstallReceipt {
@@ -107,7 +107,10 @@ impl GluInstallReceipt {
             opt_path: self.paths.opt.clone(),
             keg_only: self.install.keg_only,
             linked: self.install.linked,
-            deps: self.install.deps.clone(),
+            // Provider identities are resolved across the complete receipt
+            // set by InstalledStateStore. One receipt alone only knows the
+            // exact dependency spellings it persisted.
+            deps: Vec::new(),
             download_bytes: self.sizes.download_bytes,
             installed_bytes: self.sizes.installed_bytes,
         }
@@ -177,6 +180,44 @@ mod tests {
 
         assert!(package.aliases.is_empty());
         assert!(package.oldnames.is_empty());
+    }
+
+    #[test]
+    fn receipt_keeps_requested_dependencies_and_flattened_minimum_versions_separate() {
+        let install = ReceiptInstall {
+            keg_only: false,
+            linked: true,
+            link_overwrite: Vec::new(),
+            deps: vec![PackageSelector("llvm@22".to_string())],
+            min_versions: BTreeMap::from([
+                (
+                    "llvm".to_string(),
+                    MinimumVersion {
+                        version: "22.1.0".to_string(),
+                        revision: Some(2),
+                    },
+                ),
+                (
+                    "zstd".to_string(),
+                    MinimumVersion {
+                        version: "1.5.7".to_string(),
+                        revision: None,
+                    },
+                ),
+            ]),
+        };
+
+        let json = serde_json::to_value(&install).unwrap();
+        let decoded: ReceiptInstall = serde_json::from_value(json.clone()).unwrap();
+
+        assert_eq!(decoded.deps, vec![PackageSelector("llvm@22".to_string())]);
+        assert_eq!(decoded.min_versions["llvm"].revision, Some(2));
+        assert_eq!(decoded.min_versions["zstd"].revision, None);
+        assert_eq!(json["deps"][0], "llvm@22");
+        assert_eq!(
+            json["min_versions"]["zstd"]["revision"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]

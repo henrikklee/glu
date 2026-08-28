@@ -178,7 +178,12 @@ fn write_receipt_at(
             keg_only: package.install.keg_only,
             linked,
             link_overwrite: package.install.link_overwrite.clone(),
-            deps: package.deps.clone(),
+            deps: package
+                .deps
+                .iter()
+                .map(|dependency| dependency.requested_as.clone())
+                .collect(),
+            min_versions: package.min_versions.clone(),
         },
     };
 
@@ -256,6 +261,7 @@ mod tests {
             revision: 0,
             keg_version: KegVersion(version.to_string()),
             deps: Vec::<RuntimeDependencyRequirement>::new(),
+            min_versions: Default::default(),
             artifact: ArtifactId(format!("art:test:{name}:{version}")),
             install: PackageInstallMetadata {
                 opt_names: Vec::new(),
@@ -361,6 +367,22 @@ mod tests {
                 revision: 1,
             },
         }];
+        pkg.min_versions = std::collections::BTreeMap::from([
+            (
+                "glib".to_string(),
+                glu_core::MinimumVersion {
+                    version: "2.0".to_string(),
+                    revision: Some(1),
+                },
+            ),
+            (
+                "pcre2".to_string(),
+                glu_core::MinimumVersion {
+                    version: "10.44".to_string(),
+                    revision: None,
+                },
+            ),
+        ]);
 
         let keg_path = prefix.0.join("Cellar/vips/1.0");
         touch(&keg_path.join("bin/vips"));
@@ -393,16 +415,18 @@ mod tests {
         assert_eq!(receipt.sizes.installed_bytes, Some(7));
         assert_eq!(installed.download_bytes, Some(1));
         assert_eq!(installed.installed_bytes, Some(7));
-        assert_eq!(installed.deps.len(), 1);
         assert_eq!(
-            installed.deps[0].package_key,
-            glu_core::PackageKey("package:glib".to_string())
+            receipt.install.deps,
+            vec![glu_core::PackageSelector("glib".to_string())]
         );
-        assert_eq!(
-            installed.deps[0].package,
-            PackageId("pkg:homebrew/core/glib@2.0_1".to_string())
-        );
-        assert_eq!(installed.deps[0].requires.revision, 1);
+        assert_eq!(receipt.install.min_versions.len(), 2);
+        assert_eq!(receipt.install.min_versions["glib"].revision, Some(1));
+        assert_eq!(receipt.install.min_versions["pcre2"].revision, None);
+
+        let json = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(json["install"]["deps"][0], "glib");
+        assert!(json["install"]["deps"][0].get("package_key").is_none());
+        assert!(json["install"]["deps"][0].get("package").is_none());
     }
 
     #[test]

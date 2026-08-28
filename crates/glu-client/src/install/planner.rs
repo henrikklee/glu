@@ -421,6 +421,7 @@ mod tests {
                     },
                 })
                 .collect(),
+            min_versions: Default::default(),
             artifact: ArtifactId(format!("art:sha256:{name}")),
             install: PackageInstallMetadata {
                 opt_names: Vec::new(),
@@ -623,6 +624,7 @@ mod tests {
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: vec![],
+                min_versions: Default::default(),
             },
         };
         std::fs::write(
@@ -694,6 +696,7 @@ mod tests {
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: vec![],
+                min_versions: Default::default(),
             },
         };
         std::fs::write(
@@ -761,6 +764,7 @@ mod tests {
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: vec![],
+                min_versions: Default::default(),
             },
         };
         std::fs::write(

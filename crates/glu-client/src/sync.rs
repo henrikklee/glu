@@ -194,6 +194,7 @@ mod tests {
                         },
                     })
                     .collect(),
+                min_versions: Default::default(),
                 artifact: ArtifactId(format!("artifact:{name}")),
                 install: PackageInstallMetadata {
                     opt_names: Vec::new(),

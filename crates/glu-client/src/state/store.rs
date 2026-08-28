@@ -3,9 +3,13 @@ use crate::state::{
     installed::InstalledState,
     receipts::{self, GluInstallReceipt, ReceiptStatus},
 };
-use anyhow::{Context, Result};
-use glu_core::{InstalledPackage, KegVersion, PackageLinkMetadata, PackageName, Prefix};
+use anyhow::{bail, Context, Result};
+use glu_core::{
+    DependencyRequires, InstalledPackage, KegVersion, PackageId, PackageKey, PackageLinkMetadata,
+    PackageName, PackageSelector, Prefix, RuntimeDependencyRequirement,
+};
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -154,11 +158,92 @@ impl InstalledStateStore {
     }
 
     fn load_installed_packages(&self, warnings: &mut Vec<String>) -> Result<Vec<InstalledPackage>> {
-        Ok(self
-            .load_complete_receipts(warnings)?
-            .into_iter()
-            .map(|receipt| receipt.installed_package())
-            .collect())
+        let receipts = self.load_complete_receipts(warnings)?;
+        let mut packages: Vec<InstalledPackage> = receipts
+            .iter()
+            .map(GluInstallReceipt::installed_package)
+            .collect();
+
+        // Receipts persist what each package asked for, not which package
+        // happened to provide that selector at install time. Resolve those
+        // selectors against the complete installed package set when building
+        // the in-memory state. Exact installed names always beat aliases.
+        let mut providers: HashMap<PackageSelector, (PackageKey, PackageId)> = HashMap::new();
+        let mut exact_names = HashSet::new();
+        for package in &packages {
+            let selector = PackageSelector(package.name.0.clone());
+            exact_names.insert(selector.clone());
+            match providers.get(&selector) {
+                Some((key, _)) if key != &package.package_key => bail!(
+                    "installed exact selector '{}' belongs to both {} and {}",
+                    selector.0,
+                    key.0,
+                    package.package_key.0
+                ),
+                _ => {
+                    providers.insert(selector, (package.package_key.clone(), package.id.clone()));
+                }
+            }
+        }
+        for package in &packages {
+            for selector in package.aliases.iter().chain(&package.oldnames) {
+                if exact_names.contains(selector) {
+                    continue;
+                }
+                match providers.get(selector) {
+                    Some((key, _)) if key != &package.package_key => bail!(
+                        "installed selector '{}' belongs to both {} and {}",
+                        selector.0,
+                        key.0,
+                        package.package_key.0
+                    ),
+                    _ => {
+                        providers.insert(
+                            selector.clone(),
+                            (package.package_key.clone(), package.id.clone()),
+                        );
+                    }
+                }
+            }
+        }
+
+        for (package, receipt) in packages.iter_mut().zip(&receipts) {
+            package.deps = receipt
+                .install
+                .deps
+                .iter()
+                .map(|requested_as| {
+                    let (package_key, package_id) =
+                        providers.get(requested_as).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "installed package {} requires missing selector {}",
+                                receipt.package.name.0,
+                                requested_as.0
+                            )
+                        })?;
+                    let requires = receipt
+                        .install
+                        .min_versions
+                        .get(&requested_as.0)
+                        .map(|minimum| DependencyRequires {
+                            version: minimum.version.clone(),
+                            revision: minimum.revision.unwrap_or(0),
+                        })
+                        .unwrap_or(DependencyRequires {
+                            version: String::new(),
+                            revision: 0,
+                        });
+                    Ok(RuntimeDependencyRequirement {
+                        package_key: package_key.clone(),
+                        package: package_id.clone(),
+                        requested_as: requested_as.clone(),
+                        requires,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+        }
+
+        Ok(packages)
     }
 
     /// Reads every complete keg receipt under `prefix/Cellar`. Missing Cellar
@@ -325,6 +410,7 @@ mod tests {
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: vec![],
+                min_versions: Default::default(),
             },
         };
         std::fs::write(

@@ -827,6 +827,7 @@ mod tests {
                     },
                 })
                 .collect(),
+            min_versions: Default::default(),
             artifact: artifact.clone(),
             install: PackageInstallMetadata {
                 opt_names: Vec::new(),

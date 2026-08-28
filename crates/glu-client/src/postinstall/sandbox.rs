@@ -627,6 +627,7 @@ mod tests {
             revision: 0,
             keg_version: KegVersion("1.0".to_string()),
             deps: Vec::<RuntimeDependencyRequirement>::new(),
+            min_versions: Default::default(),
             artifact: ArtifactId("art:test:fixture".to_string()),
             install: PackageInstallMetadata {
                 opt_names: Vec::new(),
