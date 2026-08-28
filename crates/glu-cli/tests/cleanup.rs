@@ -186,6 +186,26 @@ fn cleanup_empty_cache_is_a_successful_noop() {
 }
 
 #[test]
+fn cleanup_human_execution_lists_downloads_once_before_mutation() {
+    let prefix = tempfile::tempdir().unwrap();
+    write_cache(prefix.path());
+
+    let output = run(prefix.path(), &["cleanup", "--yes"]);
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        concat!(
+            "Will remove 3 cached downloads:\n",
+            "  ▪ demo 1.0 (3 B)\n",
+            "  ▪ Unassociated (2 downloads, 8 B)\n",
+            "Will reclaim: 11 B\n",
+            "Reclaimed: 11 B\n",
+        )
+    );
+}
+
+#[test]
 fn cleanup_human_plan_reports_package_names_and_total() {
     let prefix = tempfile::tempdir().unwrap();
     write_cache(prefix.path());

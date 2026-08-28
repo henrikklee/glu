@@ -135,6 +135,17 @@ fn autoremove_plan_json_reports_dangling_without_mutating() {
 }
 
 #[test]
+fn autoremove_execution_prints_the_package_list_once_before_mutation() {
+    let prefix = tempfile::tempdir().unwrap();
+    write_declaration(prefix.path(), &[("root", "1.0")]);
+    write_receipt(prefix.path(), "root", "1.0", &[]);
+    write_receipt(prefix.path(), "dep", "1.0", &[]);
+
+    let output = human_command(prefix.path(), &["autoremove", "-y"]);
+    assert_eq!(output, "Will remove 1 unused package:\n  ▪ dep 1.0\n");
+}
+
+#[test]
 fn autoremove_json_execution_reports_executed_mode() {
     let prefix = tempfile::tempdir().unwrap();
     write_declaration(prefix.path(), &[("root", "1.0")]);

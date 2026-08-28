@@ -287,6 +287,9 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
             if !json {
                 output::render_install_preflight(&install_plan);
             }
+            if !json {
+                output::render_install_execution_plan(&install_plan, "install", tree);
+            }
             if install_plan.requires_confirmation && !yes {
                 if json {
                     return Err(install_confirmation_failure(&install_plan, "install"));
@@ -294,9 +297,6 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                 if !confirm::confirm_install(&install_plan, "install")? {
                     return Ok((None, globals));
                 }
-            }
-            if !json {
-                output::render_install_execution_plan(&install_plan, "install", tree);
             }
             let summary = client
                 .execute_install(install_plan, options, events.clone())
@@ -324,6 +324,9 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
             if !json {
                 output::render_install_preflight(&install_plan);
             }
+            if !json {
+                output::render_install_execution_plan(&install_plan, "reinstall", false);
+            }
             if install_plan.requires_confirmation && !yes {
                 if json {
                     return Err(install_confirmation_failure(&install_plan, "reinstall"));
@@ -331,9 +334,6 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                 if !confirm::confirm_install(&install_plan, "reinstall")? {
                     return Ok((None, globals));
                 }
-            }
-            if !json {
-                output::render_install_execution_plan(&install_plan, "reinstall", false);
             }
             let summary = client
                 .execute_install(install_plan, options, events.clone())
@@ -351,6 +351,9 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
             if dangling.is_empty() {
                 final_output = Some(CommandOutput::Autoremove(output::autoremove_output(&[])));
                 return Ok((final_output, globals));
+            }
+            if !json {
+                output::render_autoremove_execution_plan(&dangling);
             }
             if !yes {
                 if json {
@@ -393,6 +396,9 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                     &glu_client::download::cache::CacheCleanupResult::default(),
                 )));
                 return Ok((final_output, globals));
+            }
+            if !json {
+                output::render_cleanup_execution_plan(&cleanup_plan);
             }
             if !yes {
                 if json {
@@ -768,6 +774,9 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                 final_output = Some(CommandOutput::Update(output::update_output(&summary)));
                 return Ok((final_output, globals));
             }
+            if !json {
+                output::render_update_execution_plan(&plan, tree);
+            }
             if !yes && (is_broad || !plan.to_remove.is_empty()) {
                 if json {
                     let planned_updates = plan
@@ -801,7 +810,7 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                         ),
                     )));
                 }
-                if !confirm::confirm_update(&plan, tree)? {
+                if !confirm::confirm_update(&plan)? {
                     return Ok((None, globals));
                 }
             }

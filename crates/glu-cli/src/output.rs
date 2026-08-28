@@ -1282,47 +1282,54 @@ pub(crate) fn render_install_execution_plan(
     tree: bool,
 ) {
     let total = plan.would_install.len() + plan.renamed.len();
-    if total == 0 {
-        return;
-    }
-    if tree {
-        println!(
-            "Will {label} {}:",
-            glu_client::format::plural(total, "package")
-        );
-        let included: BTreeSet<(&str, &str)> = plan
-            .would_install
-            .iter()
-            .map(|package| (package.name.0.as_str(), package.version.as_str()))
-            .chain(
-                plan.renamed
-                    .iter()
-                    .map(|rename| (rename.new_name.0.as_str(), rename.version.as_str())),
-            )
-            .collect();
-        let install_tree = filter_package_tree(&plan.dependency_tree(), &included);
-        for line in render_dependency_tree_with_context(
-            &install_tree.nodes,
-            TreeRenderOptions::decorated(RootStyle::AlwaysLast),
-            &install_tree.context,
-        ) {
-            println!("{line}");
+    if total > 0 {
+        if tree {
+            println!(
+                "Will {label} {}:",
+                glu_client::format::plural(total, "package")
+            );
+            let included: BTreeSet<(&str, &str)> = plan
+                .would_install
+                .iter()
+                .map(|package| (package.name.0.as_str(), package.version.as_str()))
+                .chain(
+                    plan.renamed
+                        .iter()
+                        .map(|rename| (rename.new_name.0.as_str(), rename.version.as_str())),
+                )
+                .collect();
+            let install_tree = filter_package_tree(&plan.dependency_tree(), &included);
+            for line in render_dependency_tree_with_context(
+                &install_tree.nodes,
+                TreeRenderOptions::decorated(RootStyle::AlwaysLast),
+                &install_tree.context,
+            ) {
+                println!("{line}");
+            }
+        } else {
+            let mut items: Vec<_> = plan
+                .renamed
+                .iter()
+                .map(|rename| {
+                    PackageListItem::rename(&rename.old_name.0, &rename.new_name.0, &rename.version)
+                })
+                .collect();
+            items.extend(plan.would_install.iter().map(|package| {
+                PackageListItem::package(&package.name.0, &package.version)
+                    .emphasized(package.direct == Some(true))
+            }));
+            package_list::print_section(&format!("Will {label}"), &items);
         }
-    } else {
-        let mut items: Vec<_> = plan
-            .renamed
-            .iter()
-            .map(|rename| {
-                PackageListItem::rename(&rename.old_name.0, &rename.new_name.0, &rename.version)
-            })
-            .collect();
-        items.extend(plan.would_install.iter().map(|package| {
-            PackageListItem::package(&package.name.0, &package.version)
-                .emphasized(package.direct == Some(true))
-        }));
-        package_list::print_section(&format!("Will {label}"), &items);
     }
-    println!();
+    let removals: Vec<_> = plan
+        .would_remove
+        .iter()
+        .map(|package| PackageListItem::package(&package.name.0, &package.keg_version.0))
+        .collect();
+    package_list::print_counted_section("Will also remove", "unused package", &removals);
+    if total > 0 || !removals.is_empty() {
+        println!();
+    }
 }
 
 pub(crate) fn render_update_preflight(plan: &glu_client::install::UpdatePlan) {
@@ -1341,13 +1348,62 @@ pub(crate) fn render_update_preflight(plan: &glu_client::install::UpdatePlan) {
     package_list::print_counted_section("Also updating", "outdated dependent", &dependents);
 }
 
-pub(crate) fn render_removal_execution_plan(plan: &glu_client::remove::RemovalPlan) {
-    let items: Vec<_> = plan
+pub(crate) fn render_update_execution_plan(plan: &glu_client::install::UpdatePlan, tree: bool) {
+    let update_tree = plan.dependency_tree();
+    let changes: Vec<_> = plan
+        .to_update
+        .iter()
+        .map(|update| {
+            (
+                update.name.0.as_str(),
+                update.current.as_str(),
+                update.latest.as_str(),
+            )
+        })
+        .collect();
+    if !(tree && print_update_tree("Will update", &update_tree, &changes)) {
+        let items: Vec<_> = plan
+            .to_update
+            .iter()
+            .map(|update| {
+                PackageListItem::update(&update.name.0, &update.current, &update.latest)
+                    .emphasized(update.direct == Some(true))
+            })
+            .collect();
+        package_list::print_section("Will update", &items);
+    }
+    let removals: Vec<_> = plan
         .to_remove
         .iter()
         .map(|package| PackageListItem::package(&package.name.0, &package.keg_version.0))
         .collect();
-    package_list::print_section("Will remove", &items);
+    package_list::print_section("Will also remove", &removals);
+}
+
+pub(crate) fn render_removal_execution_plan(plan: &glu_client::remove::RemovalPlan) {
+    let removals: Vec<_> = plan
+        .to_remove
+        .iter()
+        .map(|package| PackageListItem::package(&package.name.0, &package.keg_version.0))
+        .collect();
+    package_list::print_section("Will remove", &removals);
+    let retained: Vec<_> = plan
+        .kept
+        .iter()
+        .map(|kept| {
+            PackageListItem::package(&kept.package.name.0, &kept.package.keg_version.0)
+                .annotated(format!("needed by {}", kept.needed_by.join(", ")))
+        })
+        .collect();
+    package_list::print_section("Will retain", &retained);
+}
+
+pub(crate) fn render_autoremove_execution_plan(packages: &[InstalledPackage]) {
+    let items: Vec<_> = packages
+        .iter()
+        .map(|package| PackageListItem::package(&package.name.0, &package.keg_version.0))
+        .collect();
+    package_list::print_counted_section("Will remove", "unused package", &items);
 }
 
 fn render_install_output(install: &InstallOutput, globals: &GlobalOptions) {
@@ -1355,9 +1411,6 @@ fn render_install_output(install: &InstallOutput, globals: &GlobalOptions) {
         print_json_success(CommandId::Install, &InstallResult::Executed(install));
         return;
     }
-    print_package_section("Promoted to declared", &install.promoted);
-    print_rename_section("Renamed", &install.renamed);
-    print_sync_removed_packages(&install.removed);
     render_execution_summary(&install.execution, globals);
 }
 
@@ -1409,9 +1462,6 @@ fn render_reinstall_output(reinstall: &ReinstallOutput, globals: &GlobalOptions)
         print_json_success(CommandId::Reinstall, &ReinstallResult::Executed(reinstall));
         return;
     }
-    print_package_section("Reinstalled", &reinstall.reinstalled);
-    print_rename_section("Renamed", &reinstall.renamed);
-    print_sync_removed_packages(&reinstall.removed);
     render_execution_summary(&reinstall.execution, globals);
 }
 
@@ -1442,9 +1492,6 @@ fn render_update_output(update: &UpdateOutput, globals: &GlobalOptions) {
     if update.updates.is_empty() && update.execution.trace_path.is_none() && update.broad {
         println!("Already up to date.");
     }
-    let updates: Vec<_> = update.updates.iter().map(update_list_item).collect();
-    package_list::print_section("Updated", &updates);
-    print_sync_removed_packages(&update.removed);
     render_execution_summary(&update.execution, globals);
     if !update.updates.is_empty() || update.broad {
         if let Some(hint) = glu_client::outdated::glu_update_hint(
@@ -1488,10 +1535,6 @@ fn render_execution_summary(execution: &ExecutionSummaryRecord, globals: &Global
         None => format!("Done in {:.1}s", execution.elapsed_seconds),
     };
     println!("{}", glu_client::style::dim(&summary));
-}
-
-fn print_sync_removed_packages(packages: &[MutationPackageRecord]) {
-    print_package_section("Removed", packages);
 }
 
 fn render_update_plan_output(plan: &UpdatePlanOutput, globals: &GlobalOptions) {
@@ -1777,17 +1820,6 @@ fn render_removal_output(removal: &RemovalOutput, globals: &GlobalOptions) {
         print_json_success(CommandId::Remove, &RemovalResult::Executed(removal));
         return;
     }
-    let kept: Vec<_> = removal
-        .kept
-        .iter()
-        .map(|kept| {
-            PackageListItem::package(&kept.name, &kept.version).annotated(format!(
-                "removed from your packages; retained because needed by {}",
-                kept.needed_by.join(", ")
-            ))
-        })
-        .collect();
-    package_list::print_section("Retained", &kept);
     if !removal.leftover_config_files.is_empty() {
         println!();
         println!(
@@ -1840,13 +1872,7 @@ fn render_autoremove_output(autoremove: &AutoremoveOutput, globals: &GlobalOptio
     }
     if autoremove.packages.is_empty() {
         println!("No unused packages to remove.");
-    } else {
-        print_removed_packages(&autoremove.packages);
     }
-}
-
-fn print_removed_packages(packages: &[MutationPackageRecord]) {
-    print_package_section("Removed", packages);
 }
 
 fn render_autoremove_plan_output(plan: &AutoremovePlanOutput, globals: &GlobalOptions) {
@@ -1894,6 +1920,11 @@ fn cached_bottle_items(
     items
 }
 
+pub(crate) fn render_cleanup_execution_plan(plan: &CacheCleanupPlan) {
+    let plan = cleanup_plan_output(plan);
+    print_cleanup_plan(&plan, "Will remove", "Will reclaim");
+}
+
 fn render_cleanup_output(cleanup: &CleanupOutput, globals: &GlobalOptions) {
     if globals.is_json() {
         print_json_success(CommandId::Cleanup, &CleanupResult::Executed(cleanup));
@@ -1903,16 +1934,6 @@ fn render_cleanup_output(cleanup: &CleanupOutput, globals: &GlobalOptions) {
         println!("No cached downloads to remove.");
         return;
     }
-    package_list::print_counted_section_with_total(
-        "Removed",
-        "cached download",
-        cleanup.removed_downloads,
-        &cached_bottle_items(
-            &cleanup.removed,
-            cleanup.unassociated_downloads,
-            cleanup.unassociated_bytes,
-        ),
-    );
     println!(
         "Reclaimed: {}",
         glu_client::format::human_bytes(cleanup.reclaimed_bytes)
@@ -1924,12 +1945,16 @@ fn render_cleanup_plan_output(plan: &CleanupPlanOutput, globals: &GlobalOptions)
         print_json_success(CommandId::Cleanup, &CleanupResult::Plan(plan));
         return;
     }
+    print_cleanup_plan(plan, "Would remove", "Would reclaim");
+}
+
+fn print_cleanup_plan(plan: &CleanupPlanOutput, heading: &str, reclaim_label: &str) {
     if plan.would_remove_downloads == 0 {
         println!("No cached downloads to remove.");
         return;
     }
     package_list::print_counted_section_with_total(
-        "Would remove",
+        heading,
         "cached download",
         plan.would_remove_downloads,
         &cached_bottle_items(
@@ -1939,7 +1964,7 @@ fn render_cleanup_plan_output(plan: &CleanupPlanOutput, globals: &GlobalOptions)
         ),
     );
     println!(
-        "Would reclaim: {}",
+        "{reclaim_label}: {}",
         glu_client::format::human_bytes(plan.would_reclaim_bytes)
     );
 }
@@ -3055,15 +3080,15 @@ mod tests {
     }
 
     #[test]
-    fn removal_sections_keep_package_details() {
+    fn package_sections_keep_package_details() {
         let many = [
             PackageListItem::package("vips", "8.18.6"),
             PackageListItem::package("glib", "2.88.3"),
         ];
 
         assert_eq!(
-            package_list::render_section("Removed", &many),
-            "Removed 2 packages:\n  ▪ glib 2.88.3\n  ▪ vips 8.18.6"
+            package_list::render_section("Will remove", &many),
+            "Will remove 2 packages:\n  ▪ glib 2.88.3\n  ▪ vips 8.18.6"
         );
     }
 

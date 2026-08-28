@@ -1,17 +1,10 @@
-use crate::{
-    output::print_update_tree,
-    package_list::{self, PackageListItem},
-};
 use anyhow::{bail, Result};
 use console::{Key, Term};
 use glu_client::download::cache::CacheCleanupPlan;
 use glu_client::install::UpdatePlan;
 use glu_client::remove::RemovalPlan;
 use glu_core::InstalledPackage;
-use std::{
-    collections::BTreeMap,
-    io::{BufRead, IsTerminal, Write},
-};
+use std::io::{BufRead, IsTerminal, Write};
 
 pub(super) fn confirm_install(
     plan: &glu_client::install::InstallPlan,
@@ -23,12 +16,6 @@ pub(super) fn confirm_install(
             glu_client::format::plural(plan.would_remove.len(), "unused package")
         );
     }
-    let items: Vec<_> = plan
-        .would_remove
-        .iter()
-        .map(|package| PackageListItem::package(&package.name.0, &package.keg_version.0))
-        .collect();
-    package_list::print_counted_section("Will also remove", "unused package", &items);
     ask_yes_no()
 }
 
@@ -45,7 +32,7 @@ pub(super) fn confirm_removal(plan: &RemovalPlan) -> Result<bool> {
 /// Confirmation gate for `glu up`: the command always presents its plan
 /// (version bumps plus any removals from dropped dependencies) before doing
 /// anything. Non-interactive use refuses and points at `-y`.
-pub(super) fn confirm_update(plan: &UpdatePlan, tree: bool) -> Result<bool> {
+pub(super) fn confirm_update(plan: &UpdatePlan) -> Result<bool> {
     if !std::io::stdin().is_terminal() {
         let removals = if plan.to_remove.is_empty() {
             String::new()
@@ -60,35 +47,6 @@ pub(super) fn confirm_update(plan: &UpdatePlan, tree: bool) -> Result<bool> {
             glu_client::format::plural(plan.to_update.len(), "package")
         );
     }
-    let update_tree = plan.dependency_tree();
-    let changes: Vec<_> = plan
-        .to_update
-        .iter()
-        .map(|update| {
-            (
-                update.name.0.as_str(),
-                update.current.as_str(),
-                update.latest.as_str(),
-            )
-        })
-        .collect();
-    if !(tree && print_update_tree("Will update", &update_tree, &changes)) {
-        let items: Vec<_> = plan
-            .to_update
-            .iter()
-            .map(|update| {
-                PackageListItem::update(&update.name.0, &update.current, &update.latest)
-                    .emphasized(update.direct == Some(true))
-            })
-            .collect();
-        package_list::print_section("Will update", &items);
-    }
-    let removals: Vec<_> = plan
-        .to_remove
-        .iter()
-        .map(|package| PackageListItem::package(&package.name.0, &package.keg_version.0))
-        .collect();
-    package_list::print_section("Will also remove", &removals);
     ask_yes_no()
 }
 
@@ -102,11 +60,6 @@ pub(super) fn confirm_autoremove(packages: &[InstalledPackage]) -> Result<bool> 
             glu_client::format::plural(packages.len(), "package")
         );
     }
-    let items: Vec<_> = packages
-        .iter()
-        .map(|package| PackageListItem::package(&package.name.0, &package.keg_version.0))
-        .collect();
-    package_list::print_counted_section("Will remove", "unused package", &items);
     ask_yes_no()
 }
 
@@ -117,53 +70,6 @@ pub(super) fn confirm_cleanup(plan: &CacheCleanupPlan) -> Result<bool> {
             glu_client::format::plural(plan.bottles().len(), "cached download")
         );
     }
-    let mut packages = BTreeMap::<(String, String), (usize, u64)>::new();
-    let mut unassociated_bottles = 0;
-    let mut unassociated_bytes = 0_u64;
-    for bottle in plan.bottles() {
-        if let Some(package) = bottle.package() {
-            let summary = packages
-                .entry((package.name.0.clone(), package.keg_version.0.clone()))
-                .or_default();
-            summary.0 += 1;
-            summary.1 += bottle.bytes();
-        } else {
-            unassociated_bottles += 1;
-            unassociated_bytes += bottle.bytes();
-        }
-    }
-    let mut items: Vec<_> = packages
-        .into_iter()
-        .map(|((name, version), (bottles, bytes))| {
-            let annotation = if bottles == 1 {
-                glu_client::format::human_bytes(bytes)
-            } else {
-                format!(
-                    "{}, {}",
-                    glu_client::format::plural(bottles, "download"),
-                    glu_client::format::human_bytes(bytes)
-                )
-            };
-            PackageListItem::package(name, version).annotated(annotation)
-        })
-        .collect();
-    if unassociated_bottles > 0 {
-        items.push(PackageListItem::name("Unassociated").annotated(format!(
-            "{}, {}",
-            glu_client::format::plural(unassociated_bottles, "download"),
-            glu_client::format::human_bytes(unassociated_bytes)
-        )));
-    }
-    package_list::print_counted_section_with_total(
-        "Will remove",
-        "cached download",
-        plan.bottles().len(),
-        &items,
-    );
-    println!(
-        "Will reclaim: {}",
-        glu_client::format::human_bytes(plan.reclaimable_bytes())
-    );
     ask_yes_no()
 }
 
