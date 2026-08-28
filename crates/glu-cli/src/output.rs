@@ -1341,12 +1341,20 @@ pub(crate) fn render_update_preflight(plan: &glu_client::install::UpdatePlan) {
     package_list::print_counted_section("Also updating", "outdated dependent", &dependents);
 }
 
+pub(crate) fn render_removal_execution_plan(plan: &glu_client::remove::RemovalPlan) {
+    let items: Vec<_> = plan
+        .to_remove
+        .iter()
+        .map(|package| PackageListItem::package(&package.name.0, &package.keg_version.0))
+        .collect();
+    package_list::print_section("Will remove", &items);
+}
+
 fn render_install_output(install: &InstallOutput, globals: &GlobalOptions) {
     if globals.is_json() {
         print_json_success(CommandId::Install, &InstallResult::Executed(install));
         return;
     }
-    print_package_section("Installed", &install.installed);
     print_package_section("Promoted to declared", &install.promoted);
     print_rename_section("Renamed", &install.renamed);
     print_sync_removed_packages(&install.removed);
@@ -1769,7 +1777,6 @@ fn render_removal_output(removal: &RemovalOutput, globals: &GlobalOptions) {
         print_json_success(CommandId::Remove, &RemovalResult::Executed(removal));
         return;
     }
-    print_removed_packages(&removal.removed);
     let kept: Vec<_> = removal
         .kept
         .iter()

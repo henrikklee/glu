@@ -439,6 +439,9 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                 )));
                 return Ok((final_output, globals));
             }
+            if !json {
+                output::render_removal_execution_plan(&removal_plan);
+            }
             if !yes && removal_plan.to_remove.len() > removal_plan.named.len() {
                 if json {
                     let named = removal_plan

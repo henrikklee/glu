@@ -39,12 +39,6 @@ pub(super) fn confirm_removal(plan: &RemovalPlan) -> Result<bool> {
             glu_client::format::plural(plan.to_remove.len(), "package")
         );
     }
-    let items: Vec<_> = plan
-        .to_remove
-        .iter()
-        .map(|package| PackageListItem::package(&package.name.0, &package.keg_version.0))
-        .collect();
-    package_list::print_section("Will remove", &items);
     ask_yes_no()
 }
 

@@ -46,14 +46,17 @@ fn remove_plan_human_uses_the_shared_package_list() {
 }
 
 #[test]
-fn remove_completion_keeps_the_full_package_list() {
+fn remove_execution_prints_the_package_list_once_before_mutation() {
     let prefix = tempfile::tempdir().unwrap();
     write_declaration(prefix.path(), &[("root", "1.0")]);
     write_receipt(prefix.path(), "root", "1.0", &["dep"]);
     write_receipt(prefix.path(), "dep", "1.0", &[]);
 
     let output = human_command(prefix.path(), &["rm", "-y", "root"]);
-    assert_eq!(output, "Removed 2 packages:\n  ▪ dep 1.0\n  ▪ root 1.0\n");
+    assert_eq!(
+        output,
+        "Will remove 2 packages:\n  ▪ dep 1.0\n  ▪ root 1.0\n"
+    );
 }
 
 #[test]
