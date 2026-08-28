@@ -35,13 +35,14 @@ use std::{
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// Transient first-line feedback while an interactive command waits for the
-/// registry. It deliberately does not hide the cursor or print a completion
+/// registry. It hides the cursor while active and does not print a completion
 /// line: clearing the current line hands a pristine terminal to the command's
 /// real output or the install footer.
 pub struct ResolutionSpinner {
     term: Term,
     frame: usize,
     drawn: bool,
+    cursor_hidden: bool,
 }
 
 impl ResolutionSpinner {
@@ -50,10 +51,12 @@ impl ResolutionSpinner {
             term: Term::stdout(),
             frame: 0,
             drawn: false,
+            cursor_hidden: false,
         }
     }
 
     pub fn start(&mut self) {
+        self.cursor_hidden = self.term.hide_cursor().is_ok();
         self.draw();
     }
 
@@ -65,9 +68,13 @@ impl ResolutionSpinner {
     pub fn clear(&mut self) {
         if self.drawn {
             let _ = self.term.clear_line();
-            let _ = self.term.flush();
             self.drawn = false;
         }
+        if self.cursor_hidden {
+            let _ = self.term.show_cursor();
+            self.cursor_hidden = false;
+        }
+        let _ = self.term.flush();
     }
 
     fn draw(&mut self) {
@@ -81,8 +88,7 @@ impl ResolutionSpinner {
 }
 
 fn resolution_text(frame: usize) -> String {
-    let dots = ".".repeat(frame % 3 + 1);
-    format!("{} Resolving{dots}", SPINNER[frame % SPINNER.len()])
+    format!("{} Resolving...", SPINNER[frame % SPINNER.len()])
 }
 
 impl Drop for ResolutionSpinner {
@@ -1042,11 +1048,10 @@ mod tests {
     }
 
     #[test]
-    fn resolution_spinner_animates_its_ellipsis() {
-        assert_eq!(resolution_text(0), "⠋ Resolving.");
-        assert_eq!(resolution_text(1), "⠙ Resolving..");
+    fn resolution_spinner_keeps_three_ascii_dots() {
+        assert_eq!(resolution_text(0), "⠋ Resolving...");
+        assert_eq!(resolution_text(1), "⠙ Resolving...");
         assert_eq!(resolution_text(2), "⠹ Resolving...");
-        assert_eq!(resolution_text(3), "⠸ Resolving.");
     }
 
     #[test]
