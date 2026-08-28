@@ -71,6 +71,21 @@ impl InstalledState {
         .unwrap()
     }
 
+    /// Build a hypothetical installed-state snapshot from predicted receipt
+    /// facts. Simulation uses the same selector precedence, current-keg
+    /// selection, and package graph as state loaded from disk.
+    pub(crate) fn from_simulated_packages(
+        packages: Vec<InstalledPackage>,
+        declared_names: BTreeSet<PackageName>,
+    ) -> Result<Self> {
+        Self::from_loaded_packages(
+            packages,
+            Prefix(PathBuf::new()),
+            declared_names,
+            BTreeSet::new(),
+        )
+    }
+
     /// Index already-read receipts as an in-memory installed-state database.
     /// Rows are grouped by current receipt name; the resolver maps every name
     /// that package owns (current name + old names) to that current group.
@@ -181,7 +196,7 @@ impl InstalledState {
     }
 
     /// Names of declared packages, per the declaration file. Name-level,
-    /// matching the reachability semantics of `dangling_packages`.
+    /// matching the graph roots used by `dangling`.
     pub fn declared_names(&self) -> Vec<PackageName> {
         self.declared_name_set().into_iter().collect()
     }
@@ -208,12 +223,65 @@ impl InstalledState {
         self.declared_names.clone()
     }
 
-    /// Packages no longer required by anything declared: see
-    /// `dangling_packages`.
+    /// Packages no longer required by anything declared, plus superseded
+    /// kegs for reachable package identities.
     pub fn dangling(&self) -> Vec<InstalledPackage> {
-        let installed = self.list();
-        let declared = self.declared_name_set();
-        dangling_packages(&installed, &declared)
+        self.dangling_for_declared(&self.declared_names)
+    }
+
+    /// Compute dangling packages against an alternate declaration while using
+    /// this snapshot's canonical selector index and package graph. Removal
+    /// planning uses this to model declaration changes without rebuilding
+    /// topology through a second traversal implementation.
+    pub(crate) fn dangling_for_declared(
+        &self,
+        declared: &BTreeSet<PackageName>,
+    ) -> Vec<InstalledPackage> {
+        let roots = declared.iter().filter_map(|name| {
+            self.selector_index
+                .get(&PackageSelector(name.0.clone()))
+                .cloned()
+        });
+        let reachable = self.package_graph.reachable_from(roots);
+        let retained: BTreeSet<PackageId> = reachable
+            .iter()
+            .filter_map(|key| self.find_by_key(key))
+            .map(|package| package.id.clone())
+            .collect();
+
+        let mut dangling: Vec<InstalledPackage> = self
+            .list()
+            .into_iter()
+            .filter(|package| !retained.contains(&package.id))
+            .collect();
+        dangling.sort_by(|a, b| {
+            a.name
+                .0
+                .to_lowercase()
+                .cmp(&b.name.0.to_lowercase())
+                .then_with(|| compare_installed(b, a))
+        });
+        dangling
+    }
+
+    /// Whether `start` depends directly or transitively on any selected
+    /// installed package. Selectors resolve once at the graph boundary; graph
+    /// traversal then uses stable package identities exclusively.
+    pub(crate) fn depends_on_any(
+        &self,
+        start: &InstalledPackage,
+        target_names: &BTreeSet<PackageName>,
+    ) -> bool {
+        let targets: BTreeSet<PackageKey> = target_names
+            .iter()
+            .filter_map(|name| {
+                self.selector_index
+                    .get(&PackageSelector(name.0.clone()))
+                    .cloned()
+            })
+            .collect();
+        self.package_graph
+            .depends_on_any(&start.package_key, &targets)
     }
 
     /// Total number of installed kegs across all packages — the `glu ls`
@@ -431,87 +499,6 @@ fn has_dependents(state: &InstalledState, package_key: &PackageKey) -> bool {
     !state.package_graph().dependents(package_key).is_empty()
 }
 
-/// Whether `start` depends, directly or transitively, on any selected
-/// installed package. Selector resolution happens once up front; the walk is
-/// exclusively over stable package keys, so independently updated concrete
-/// package IDs do not break reachability.
-pub(crate) fn depends_on_any(
-    installed: &[InstalledPackage],
-    start: &InstalledPackage,
-    target_names: &BTreeSet<PackageName>,
-) -> bool {
-    let Some(selector_index) = installed_selector_index(installed) else {
-        return true;
-    };
-    let key_index = installed_key_index(installed);
-    let target_keys: BTreeSet<PackageKey> = target_names
-        .iter()
-        .filter_map(|name| selector_index.get(&PackageSelector(name.0.clone())))
-        .cloned()
-        .collect();
-
-    let mut visited: BTreeSet<PackageKey> = BTreeSet::new();
-    let mut stack: Vec<PackageKey> = start
-        .deps
-        .iter()
-        .map(|dep| dep.package_key.clone())
-        .collect();
-    while let Some(package_key) = stack.pop() {
-        if target_keys.contains(&package_key) {
-            return true;
-        }
-        if !visited.insert(package_key.clone()) {
-            continue;
-        }
-        let Some(package) = key_index
-            .get(&package_key)
-            .and_then(|ix| installed.get(*ix))
-        else {
-            continue;
-        };
-        stack.extend(package.deps.iter().map(|dep| dep.package_key.clone()));
-    }
-    false
-}
-
-fn installed_selector_index(
-    installed: &[InstalledPackage],
-) -> Option<HashMap<PackageSelector, PackageKey>> {
-    let mut index = HashMap::new();
-    for package in installed {
-        let current = PackageSelector(package.name.0.clone());
-        if !insert_slice_selector_mapping(&mut index, current, &package.package_key) {
-            return None;
-        }
-        for selector in package.aliases.iter().chain(&package.oldnames) {
-            if !insert_slice_selector_mapping(&mut index, selector.clone(), &package.package_key) {
-                return None;
-            }
-        }
-    }
-    Some(index)
-}
-
-fn installed_key_index(installed: &[InstalledPackage]) -> HashMap<PackageKey, usize> {
-    let mut index = HashMap::new();
-    for (ix, package) in installed.iter().enumerate() {
-        index.entry(package.package_key.clone()).or_insert(ix);
-    }
-    index
-}
-
-fn insert_slice_selector_mapping(
-    index: &mut HashMap<PackageSelector, PackageKey>,
-    selector: PackageSelector,
-    package_key: &PackageKey,
-) -> bool {
-    if let Some(existing) = index.get(&selector) {
-        return existing == package_key;
-    }
-    index.insert(selector, package_key.clone());
-    true
-}
-
 fn insert_selector_mapping(
     index: &mut HashMap<PackageSelector, PackageKey>,
     selector: PackageSelector,
@@ -542,85 +529,6 @@ fn declared_set(names: &[&str]) -> BTreeSet<PackageName> {
         .iter()
         .map(|name| PackageName((*name).to_string()))
         .collect()
-}
-
-/// Packages that are no longer required by anything, or that a version bump
-/// superseded:
-/// - not reachable — directly or transitively — from any declared
-///   package's dependency edges (the `declared` seed comes from the
-///   declaration file; see `InstalledState::declared_names`), or
-/// - an older keg for a reachable package identity. Declaration selectors are
-///   resolved once, then reachability uses `PackageKey`. The single-version
-///   contract ("One version per package", state-model.md) keeps only the newest
-///   keg per identity — the keg dependency satisfaction and edge walking use
-///   (`installed` must be sorted newest-first, as `list()` and
-///   `simulate_post_install_state` produce). The keg a version bump
-///   replaced is therefore dangling too.
-///
-/// Sync removes these after a version bump drops a dependency (its new
-/// bottle no longer declares it) or replaces an installed version;
-/// removing them is safe because nothing installed links to them by path —
-/// the same stable-path convention that makes version bumps safe for
-/// dependents (see docs/explanation/state-model.md, Sync section). Returns every
-/// dangling keg, sorted like `list()`.
-pub(crate) fn dangling_packages(
-    installed: &[InstalledPackage],
-    declared: &BTreeSet<PackageName>,
-) -> Vec<InstalledPackage> {
-    let Some(selector_index) = installed_selector_index(installed) else {
-        // If two installed packages claim the same selector, removing anything
-        // based on reachability would be a guess. Loaded InstalledState fails
-        // earlier; this slice helper is conservative.
-        return Vec::new();
-    };
-
-    let key_index = installed_key_index(installed);
-    let mut reachable: BTreeSet<PackageKey> = BTreeSet::new();
-    let mut stack: Vec<PackageKey> = Vec::new();
-    for name in declared {
-        let Some(package_key) = selector_index.get(&PackageSelector(name.0.clone())) else {
-            continue;
-        };
-        if reachable.insert(package_key.clone()) {
-            stack.push(package_key.clone());
-        }
-    }
-
-    while let Some(package_key) = stack.pop() {
-        let Some(package) = key_index
-            .get(&package_key)
-            .and_then(|ix| installed.get(*ix))
-        else {
-            continue;
-        };
-        for dep in &package.deps {
-            if reachable.insert(dep.package_key.clone()) {
-                stack.push(dep.package_key.clone());
-            }
-        }
-    }
-
-    // Every reachable identity keeps exactly its newest concrete keg.
-    let retained: BTreeSet<PackageId> = reachable
-        .iter()
-        .filter_map(|key| key_index.get(key))
-        .filter_map(|ix| installed.get(*ix))
-        .map(|package| package.id.clone())
-        .collect();
-
-    let mut dangling: Vec<InstalledPackage> = installed
-        .iter()
-        .filter(|package| !retained.contains(&package.id))
-        .cloned()
-        .collect();
-    dangling.sort_by(|a, b| {
-        a.name
-            .0
-            .to_lowercase()
-            .cmp(&b.name.0.to_lowercase())
-            .then_with(|| compare_installed(b, a))
-    });
-    dangling
 }
 
 pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
@@ -915,12 +823,12 @@ mod tests {
             package: PackageId("pkg:test/bar@1.0".to_string()),
             requested_as: glu_core::PackageSelector("foo".to_string()),
         }];
-        let installed = vec![app, installed_pkg_with_oldnames("bar", &["foo"], "1.0")];
-        let declared = declared_set(&["app"]);
+        let state = InstalledState::from_packages_declared(
+            vec![app, installed_pkg_with_oldnames("bar", &["foo"], "1.0")],
+            declared_set(&["app"]),
+        );
 
-        let dangling = dangling_packages(&installed, &declared);
-
-        assert!(dangling.is_empty());
+        assert!(state.dangling().is_empty());
     }
 
     #[test]
@@ -931,13 +839,14 @@ mod tests {
             package: PackageId("pkg:test/bar@1.0".to_string()),
             requested_as: glu_core::PackageSelector("foo".to_string()),
         }];
-        let installed = vec![
-            app.clone(),
+        let state = InstalledState::from_packages(vec![
+            app,
             installed_pkg_with_oldnames("bar", &["foo"], "1.0"),
-        ];
+        ]);
+        let app = state.find(&PackageName("app".to_string())).unwrap();
         let targets = declared_set(&["bar"]);
 
-        assert!(depends_on_any(&installed, &app, &targets));
+        assert!(state.depends_on_any(app, &targets));
     }
 
     #[test]
@@ -951,12 +860,10 @@ mod tests {
         let mut llvm = installed_pkg_with_oldnames("llvm", &[], "22.1.8");
         llvm.id = PackageId("pkg:homebrew/core/llvm@22.1.8_2".to_string());
         llvm.keg_version = KegVersion("22.1.8_2".to_string());
-        let installed = vec![rust, llvm];
-        let declared = declared_set(&["rust"]);
+        let state =
+            InstalledState::from_packages_declared(vec![rust, llvm], declared_set(&["rust"]));
 
-        let dangling = dangling_packages(&installed, &declared);
-
-        assert!(dangling.is_empty());
+        assert!(state.dangling().is_empty());
     }
 
     #[test]
@@ -970,10 +877,11 @@ mod tests {
         let mut llvm = installed_pkg_with_oldnames("llvm", &[], "22.1.8");
         llvm.id = PackageId("pkg:homebrew/core/llvm@22.1.8_2".to_string());
         llvm.keg_version = KegVersion("22.1.8_2".to_string());
-        let installed = vec![rust.clone(), llvm];
+        let state = InstalledState::from_packages(vec![rust, llvm]);
+        let rust = state.find(&PackageName("rust".to_string())).unwrap();
         let targets = declared_set(&["llvm"]);
 
-        assert!(depends_on_any(&installed, &rust, &targets));
+        assert!(state.depends_on_any(rust, &targets));
     }
 
     #[test]
@@ -1023,8 +931,9 @@ mod tests {
             pkg("pcre2", vec![]),
             pkg("foo", vec![]),
         ];
+        let state = InstalledState::from_packages_declared(installed, declared_set(&["vips"]));
 
-        let dangling = dangling_packages(&installed, &declared_set(&["vips"]));
+        let dangling = state.dangling();
         let names: Vec<&str> = dangling.iter().map(|p| p.name.0.as_str()).collect();
 
         assert_eq!(names, vec!["foo"]);
@@ -1044,10 +953,9 @@ mod tests {
             pkg("glib", vec!["foo"]),
             pkg("foo", vec![]),
         ];
+        let state = InstalledState::from_packages_declared(installed, declared_set(&["vips"]));
 
-        let dangling = dangling_packages(&installed, &declared_set(&["vips"]));
-
-        assert!(dangling.is_empty());
+        assert!(state.dangling().is_empty());
     }
 
     #[test]
@@ -1066,8 +974,9 @@ mod tests {
             pkg("vips", "1.0", vec!["foo"]),
             pkg("foo", "1.0", vec![]),
         ];
+        let state = InstalledState::from_packages_declared(installed, declared_set(&["vips"]));
 
-        let dangling = dangling_packages(&installed, &declared_set(&["vips"]));
+        let dangling = state.dangling();
         let names: Vec<&str> = dangling.iter().map(|p| p.name.0.as_str()).collect();
 
         assert_eq!(names, vec!["foo", "vips"]);

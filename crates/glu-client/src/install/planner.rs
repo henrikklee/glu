@@ -181,15 +181,15 @@ fn finalize_workset(
 pub fn cascade_outdated_dependents(
     target_names: &[PackageName],
     outdated_names: &BTreeSet<PackageName>,
-    installed: &[InstalledPackage],
+    state: &InstalledState,
 ) -> Vec<PackageName> {
     let target_names_set: BTreeSet<PackageName> = target_names.iter().cloned().collect();
     let mut added = Vec::new();
-    for package in installed {
+    for package in state.list() {
         if target_names_set.contains(&package.name) || !outdated_names.contains(&package.name) {
             continue;
         }
-        if crate::state::installed::depends_on_any(installed, package, &target_names_set) {
+        if state.depends_on_any(&package, &target_names_set) {
             added.push(package.name.clone());
         }
     }
@@ -579,12 +579,12 @@ mod tests {
     fn cascade_outdated_dependents_includes_outdated_dependent() {
         let glib = installed_pkg("glib", "2.0", vec![]);
         let vips = installed_pkg("vips", "1.0", vec![("glib", "1.0")]);
-        let all = vec![glib, vips];
+        let state = InstalledState::from_packages(vec![glib, vips]);
         let outdated: BTreeSet<PackageName> =
             [PackageName("vips".to_string())].into_iter().collect();
 
         let added =
-            cascade_outdated_dependents(&[PackageName("glib".to_string())], &outdated, &all);
+            cascade_outdated_dependents(&[PackageName("glib".to_string())], &outdated, &state);
 
         assert_eq!(added, vec![PackageName("vips".to_string())]);
     }
@@ -593,10 +593,13 @@ mod tests {
     fn cascade_outdated_dependents_skips_dependent_that_is_not_outdated() {
         let glib = installed_pkg("glib", "2.0", vec![]);
         let vips = installed_pkg("vips", "1.0", vec![("glib", "1.0")]);
-        let all = vec![glib, vips];
+        let state = InstalledState::from_packages(vec![glib, vips]);
 
-        let added =
-            cascade_outdated_dependents(&[PackageName("glib".to_string())], &BTreeSet::new(), &all);
+        let added = cascade_outdated_dependents(
+            &[PackageName("glib".to_string())],
+            &BTreeSet::new(),
+            &state,
+        );
 
         assert!(added.is_empty());
     }

@@ -83,6 +83,57 @@ impl InstalledPackageGraph {
     pub fn dependency_count(&self) -> usize {
         self.outgoing.values().map(Vec::len).sum()
     }
+
+    /// Every installed package identity reachable from `roots`, including
+    /// roots themselves. Unknown roots are ignored; callers resolve selectors
+    /// before entering the graph.
+    pub fn reachable_from(
+        &self,
+        roots: impl IntoIterator<Item = PackageKey>,
+    ) -> BTreeSet<PackageKey> {
+        let mut reachable = BTreeSet::new();
+        let mut stack = Vec::new();
+        for root in roots {
+            if self.contains(&root) && reachable.insert(root.clone()) {
+                stack.push(root);
+            }
+        }
+
+        while let Some(package) = stack.pop() {
+            for dependency in self.dependencies(&package) {
+                if reachable.insert(dependency.provider.clone()) {
+                    stack.push(dependency.provider.clone());
+                }
+            }
+        }
+        reachable
+    }
+
+    /// Whether `start` depends directly or transitively on any identity in
+    /// `targets`. The starting package itself is not considered a dependency.
+    pub fn depends_on_any(&self, start: &PackageKey, targets: &BTreeSet<PackageKey>) -> bool {
+        let mut visited = BTreeSet::new();
+        let mut stack: Vec<PackageKey> = self
+            .dependencies(start)
+            .iter()
+            .map(|edge| edge.provider.clone())
+            .collect();
+
+        while let Some(package) = stack.pop() {
+            if targets.contains(&package) {
+                return true;
+            }
+            if !visited.insert(package.clone()) {
+                continue;
+            }
+            stack.extend(
+                self.dependencies(&package)
+                    .iter()
+                    .map(|edge| edge.provider.clone()),
+            );
+        }
+        false
+    }
 }
 
 #[cfg(test)]
@@ -140,5 +191,38 @@ mod tests {
         assert_eq!(graph.dependencies(&rust_key)[0].requested.0, "llvm@22");
         assert_eq!(graph.dependencies(&rust_key)[0].provider, llvm_key);
         assert_eq!(graph.dependents(&llvm_key)[0].dependent, rust_key);
+    }
+
+    #[test]
+    fn reachability_handles_diamonds_and_cycles_once() {
+        let app = package("app", &[], &[("left", "left"), ("right", "right")]);
+        let left = package("left", &[], &[("shared", "shared")]);
+        let right = package("right", &[], &[("shared", "shared")]);
+        let shared = package("shared", &[], &[("left", "left")]);
+        let packages = [app, left, right, shared]
+            .into_iter()
+            .map(|package| (package.package_key.clone(), vec![package]))
+            .collect();
+        let graph = InstalledPackageGraph::from_packages(&packages).unwrap();
+
+        let app = PackageKey("package:app".to_string());
+        let shared = PackageKey("package:shared".to_string());
+        let reachable = graph.reachable_from([app.clone()]);
+
+        assert_eq!(reachable.len(), 4);
+        assert!(reachable.contains(&shared));
+        assert!(graph.depends_on_any(&app, &BTreeSet::from([shared])));
+    }
+
+    #[test]
+    fn graph_rejects_an_edge_to_a_removed_provider() {
+        let app = package("app", &[], &[("missing", "missing")]);
+        let packages = BTreeMap::from([(app.package_key.clone(), vec![app])]);
+
+        let err = InstalledPackageGraph::from_packages(&packages).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("requires missing provider missing"));
     }
 }

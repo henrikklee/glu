@@ -79,9 +79,9 @@ pub(crate) fn predicted_dangling_after_workset(
     manifest: &InstallManifest,
     workset: &InstallWorkSet,
     declared: &BTreeSet<PackageName>,
-) -> Vec<InstalledPackage> {
+) -> Result<Vec<InstalledPackage>> {
     let simulated = simulate_post_install_state(state, manifest, workset);
-    crate::state::installed::dangling_packages(&simulated, declared)
+    Ok(InstalledState::from_simulated_packages(simulated, declared.clone())?.dangling())
 }
 
 /// Update may repair a dangling package by installing it. Do not schedule a
@@ -232,7 +232,8 @@ mod tests {
         let declared: BTreeSet<PackageName> =
             [PackageName("app".to_string())].into_iter().collect();
 
-        let dangling = predicted_dangling_after_workset(&state, &manifest, &workset, &declared);
+        let dangling =
+            predicted_dangling_after_workset(&state, &manifest, &workset, &declared).unwrap();
         let names: Vec<&str> = dangling
             .iter()
             .map(|package| package.name.0.as_str())
@@ -270,7 +271,8 @@ mod tests {
         let declared: BTreeSet<PackageName> =
             [PackageName("app".to_string())].into_iter().collect();
 
-        let dangling = predicted_dangling_after_workset(&state, &manifest, &workset, &declared);
+        let dangling =
+            predicted_dangling_after_workset(&state, &manifest, &workset, &declared).unwrap();
         let names: Vec<&str> = dangling
             .iter()
             .map(|package| package.name.0.as_str())

@@ -389,8 +389,12 @@ pub async fn plan_install(
     // and removal therefore use the simulated final graph below, and execution
     // reloads real state before deleting anything.
     let declared_after: BTreeSet<PackageName> = declaration.names();
-    let predicted_dangling =
-        crate::sync::predicted_dangling_after_workset(&state, &manifest, &workset, &declared_after);
+    let predicted_dangling = crate::sync::predicted_dangling_after_workset(
+        &state,
+        &manifest,
+        &workset,
+        &declared_after,
+    )?;
     let deactivated_after = declaration.deactivated_names();
     let would_download_bytes = download_bytes_for_uncached_package_ids(
         &manifest,
@@ -803,14 +807,13 @@ pub async fn plan_update(
 
     let mut cascade_added = Vec::new();
     if dependents && !all {
-        let installed = state.list();
         let outdated_names: BTreeSet<PackageName> = outdated
             .packages
             .iter()
             .map(|package| package.name.clone())
             .collect();
         let added: BTreeSet<PackageName> =
-            planner::cascade_outdated_dependents(&target_names, &outdated_names, &installed)
+            planner::cascade_outdated_dependents(&target_names, &outdated_names, &state)
                 .into_iter()
                 .collect();
         if !added.is_empty() {
@@ -889,9 +892,9 @@ pub async fn plan_update(
     }
 
     // Simulate the post-update installed set: current receipts plus the
-    // receipts this update will write, re-sorted newest-first per name, so
-    // the reachability walk in `dangling_packages` finds the new version of
-    // each updated name (the same way the reloaded state would after
+    // receipts this update will write, then build the same installed graph
+    // as a reloaded snapshot so each updated identity selects its new version
+    // (the same way the reloaded state would after
     // execution). Dependencies the new versions dropped surface as dangling
     // here, before execution.
     let to_remove = crate::sync::without_workset_installs(
@@ -900,7 +903,7 @@ pub async fn plan_update(
             &manifest,
             &workset,
             &existing_declared,
-        ),
+        )?,
         &workset,
     );
 
@@ -1940,8 +1943,7 @@ mod tree_tests {
         // Nothing declared yet (node was never registered): all three look
         // dangling to the pre-command state — the bug's prompt state.
         let pre_declared: BTreeSet<PackageName> = BTreeSet::new();
-        let pre_dangling =
-            crate::state::installed::dangling_packages(&pre_state.list(), &pre_declared);
+        let pre_dangling = pre_state.dangling_for_declared(&pre_declared);
         assert_eq!(pre_dangling.len(), 3);
 
         // Run 2 installs node and writes its receipt, which declares
@@ -1955,8 +1957,7 @@ mod tree_tests {
         // The declaration is node.
         let final_declared: BTreeSet<PackageName> =
             [PackageName("node".to_string())].into_iter().collect();
-        let final_dangling =
-            crate::state::installed::dangling_packages(&final_state.list(), &final_declared);
+        let final_dangling = final_state.dangling_for_declared(&final_declared);
         // ada-url and brotli are reached by node's receipt — kept. Only the
         // genuinely-unused fmt is removed.
         let names: Vec<&str> = final_dangling.iter().map(|p| p.name.0.as_str()).collect();
@@ -2224,7 +2225,8 @@ mod interrupted_install_tests {
         let workset =
             planner::compute_workset(&manifest, &state, planner::WorksetMode::Force).unwrap();
         let predicted =
-            crate::sync::predicted_dangling_after_workset(&state, &manifest, &workset, &declared);
+            crate::sync::predicted_dangling_after_workset(&state, &manifest, &workset, &declared)
+                .unwrap();
         let names: Vec<&str> = predicted
             .iter()
             .map(|package| package.name.0.as_str())
@@ -2273,7 +2275,7 @@ mod interrupted_install_tests {
                 .0,
             "1.0"
         );
-        assert!(crate::state::installed::dangling_packages(&final_list, &declared).is_empty());
+        assert!(final_state.dangling_for_declared(&declared).is_empty());
         assert_eq!(
             prefix.0.join("opt/app").canonicalize().unwrap(),
             prefix.0.join("Cellar/app/1.0").canonicalize().unwrap()
@@ -2403,7 +2405,8 @@ mod interrupted_install_tests {
             &manifest,
             &retry_workset,
             &declared,
-        );
+        )
+        .unwrap();
         assert_eq!(predicted.len(), 1);
         assert_eq!(predicted[0].keg_version.0, "0.9");
 

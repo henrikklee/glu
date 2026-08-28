@@ -1,5 +1,5 @@
 use crate::link::unlink::remove_keg;
-use crate::state::installed::{compare_versions, dangling_packages, depends_on_any};
+use crate::state::installed::InstalledState;
 use crate::state::snapshot::StateSnapshot;
 use crate::state::store::InstalledStateStore;
 use crate::state::Declaration;
@@ -61,14 +61,7 @@ fn plan_removal_from_snapshot(
     snapshot: &StateSnapshot,
     selectors: Vec<String>,
 ) -> Result<RemovalPlan> {
-    let installed = snapshot.installed.list();
-    let declared = snapshot.declaration.names();
-    plan_removal_from_parts(
-        &installed,
-        &declared,
-        snapshot.declaration.clone(),
-        selectors,
-    )
+    plan_removal_from_parts(&snapshot.installed, snapshot.declaration.clone(), selectors)
 }
 
 #[cfg(test)]
@@ -85,16 +78,24 @@ fn plan_removal_from_installed(
                 .insert(package.name.clone(), package.keg_version.0.clone());
         }
     }
-    plan_removal_from_parts(installed, declared, declaration, selectors)
+    let state = InstalledState::from_loaded_packages(
+        installed.to_vec(),
+        Prefix(PathBuf::from("/tmp/glu")),
+        declared.clone(),
+        BTreeSet::new(),
+    )?;
+    plan_removal_from_parts(&state, declaration, selectors)
 }
 
 fn plan_removal_from_parts(
-    installed: &[InstalledPackage],
-    declared: &BTreeSet<PackageName>,
+    state: &InstalledState,
     mut post_declaration: Declaration,
     selectors: Vec<String>,
 ) -> Result<RemovalPlan> {
-    let current_dangling: BTreeSet<PackageName> = dangling_packages(installed, declared)
+    let installed = state.list();
+    let declared: BTreeSet<PackageName> = post_declaration.names();
+    let current_dangling: BTreeSet<PackageName> = state
+        .dangling_for_declared(&declared)
         .into_iter()
         .map(|package| package.name)
         .collect();
@@ -102,7 +103,7 @@ fn plan_removal_from_parts(
     let mut targets: Vec<InstalledPackage> = Vec::new();
     let mut missing: Vec<&str> = Vec::new();
     for selector in &selectors {
-        let matches = resolve_selector(installed, selector);
+        let matches = resolve_selector(&installed, selector);
         if matches.is_empty() {
             missing.push(selector.as_str());
         } else {
@@ -134,16 +135,15 @@ fn plan_removal_from_parts(
         .collect();
 
     let mut kept: Vec<KeptDeclaredPackage> = Vec::new();
-    let mut to_remove: Vec<InstalledPackage> = Vec::new();
     for target in &targets {
         let mut needed_by: BTreeSet<PackageName> = BTreeSet::new();
-        for package in installed {
-            if !remaining_declared.contains(&package.name) {
+        for name in &remaining_declared {
+            let Some(package) = state.resolve_selector(&glu_core::PackageSelector(name.0.clone()))
+            else {
                 continue;
-            }
-            let mut target_names: BTreeSet<PackageName> = BTreeSet::new();
-            target_names.insert(target.name.clone());
-            if depends_on_any(installed, package, &target_names) {
+            };
+            let target_names = BTreeSet::from([target.name.clone()]);
+            if state.depends_on_any(package, &target_names) {
                 needed_by.insert(package.name.clone());
             }
         }
@@ -163,9 +163,7 @@ fn plan_removal_from_parts(
             );
         }
 
-        if needed_by.is_empty() {
-            to_remove.push(target.clone());
-        } else {
+        if !needed_by.is_empty() {
             kept.push(KeptDeclaredPackage {
                 package: target.clone(),
                 needed_by: needed_by.into_iter().map(|name| name.0).collect(),
@@ -173,29 +171,14 @@ fn plan_removal_from_parts(
         }
     }
 
-    // Removal set = the non-kept targets plus everything that becomes
-    // dangling once they are gone.
-    let remove_ids: BTreeSet<PackageId> =
-        to_remove.iter().map(|package| package.id.clone()).collect();
-    let remaining: Vec<InstalledPackage> = installed
-        .iter()
-        .filter(|package| !remove_ids.contains(&package.id))
-        .cloned()
-        .collect();
-    let target_names: BTreeSet<PackageName> =
-        targets.iter().map(|package| package.name.clone()).collect();
-    let post_declared: BTreeSet<PackageName> = declared
-        .iter()
-        .filter(|name| !target_names.contains(*name))
-        .cloned()
-        .collect();
-    to_remove.extend(dangling_packages(&remaining, &post_declared));
-    let mut seen: BTreeSet<PackageId> = BTreeSet::new();
-    to_remove.retain(|package| seen.insert(package.id.clone()));
-    sort_installed(&mut to_remove);
+    // Once named targets leave the declaration, the graph's reachability
+    // result is the complete removal set: unreachable targets, their newly
+    // dangling dependencies, and superseded kegs. Targets still reached by a
+    // remaining declared root are the `kept` set above.
     for target in &targets {
         post_declaration.dependencies.remove(&target.name);
     }
+    let to_remove = state.dangling_for_declared(&post_declaration.names());
 
     Ok(RemovalPlan {
         named: targets,
@@ -383,17 +366,6 @@ fn collect_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
             }
         }
     }
-}
-
-fn sort_installed(packages: &mut [InstalledPackage]) {
-    packages.sort_by(|a, b| {
-        a.name
-            .0
-            .to_lowercase()
-            .cmp(&b.name.0.to_lowercase())
-            .then_with(|| compare_versions(&b.version, &a.version))
-            .then_with(|| b.revision.cmp(&a.revision))
-    });
 }
 
 /// Three-tier resolution against installed state, most specific match
