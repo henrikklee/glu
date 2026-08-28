@@ -382,24 +382,34 @@ fn dependency_tree_children(
     state: &InstalledState,
     seen: &mut BTreeSet<PackageKey>,
 ) -> Vec<DependencyTreeNode> {
-    let mut deps: Vec<_> = state.dependencies(&package.package_key).iter().collect();
-    deps.sort_by_key(|dep| dep.package_key.0.to_lowercase());
+    let mut deps: Vec<_> = state
+        .package_graph()
+        .dependencies(&package.package_key)
+        .iter()
+        .collect();
+    deps.sort_by_key(|dep| dep.requested.0.to_lowercase());
     let mut children = Vec::new();
     for dep in deps {
-        let newest = state.find_by_key(&dep.package_key);
+        let provider = state.find_by_key(&dep.provider);
         let mut child = DependencyTreeNode {
-            name: newest
-                .map(|package| package.name.0.clone())
-                .unwrap_or_else(|| dep.requested_as.0.clone()),
-            version: newest.map(|p| p.keg_version.0.clone()).unwrap_or_default(),
+            // Display the exact dependency spelling persisted by the
+            // dependent's receipt, not the provider's canonical name.
+            name: dep.requested.0.clone(),
+            version: provider
+                .map(|package| package.keg_version.0.clone())
+                .unwrap_or_default(),
             children: Vec::new(),
             already_shown: false,
-            requires: format_requires(&dep.requires),
+            requires: format_minimum_version(dep.minimum_version.as_ref()),
         };
-        if let Some(dep_package) = newest {
-            if seen.insert(dep.package_key.clone()) {
-                child.children = dependency_tree_children(dep_package, state, seen);
-            } else if !dep_package.deps.is_empty() {
+        if let Some(provider_package) = provider {
+            if seen.insert(dep.provider.clone()) {
+                child.children = dependency_tree_children(provider_package, state, seen);
+            } else if !state
+                .package_graph()
+                .dependencies(&dep.provider)
+                .is_empty()
+            {
                 child.already_shown = true;
             }
         }
@@ -421,6 +431,15 @@ pub(crate) fn format_requires(requires: &glu_core::DependencyRequires) -> Option
     Some(floor)
 }
 
+fn format_minimum_version(minimum: Option<&glu_core::MinimumVersion>) -> Option<String> {
+    let minimum = minimum?;
+    let mut floor = format!(">= {}", minimum.version);
+    if let Some(revision) = minimum.revision.filter(|revision| *revision > 0) {
+        floor.push_str(&format!("_{revision}"));
+    }
+    Some(floor)
+}
+
 /// Children of `package` in the reverse dependency tree (`glu why`): every
 /// installed package that directly depends on `name`, sorted by name. A
 /// dependent already on the ancestry path (a cycle) is marked and not
@@ -430,9 +449,16 @@ fn reverse_dependents_children(
     package_key: &PackageKey,
     seen: &mut BTreeSet<PackageKey>,
 ) -> Vec<DependencyTreeNode> {
-    let mut parents: Vec<&InstalledPackage> = state
-        .dependent_keys(package_key)
+    let mut parent_keys: Vec<_> = state
+        .package_graph()
+        .dependents(package_key)
         .iter()
+        .map(|edge| &edge.dependent)
+        .collect();
+    parent_keys.sort();
+    parent_keys.dedup();
+    let mut parents: Vec<&InstalledPackage> = parent_keys
+        .into_iter()
         .filter_map(|key| state.find_by_key(key))
         .collect();
     parents.sort_by_key(|parent| parent.name.0.to_lowercase());
@@ -456,7 +482,7 @@ fn reverse_dependents_children(
 }
 
 fn has_dependents(state: &InstalledState, package_key: &PackageKey) -> bool {
-    !state.dependent_keys(package_key).is_empty()
+    !state.package_graph().dependents(package_key).is_empty()
 }
 
 /// Whether `start` depends, directly or transitively, on any selected
@@ -1034,7 +1060,7 @@ mod tests {
         let deps = state
             .dependency_tree_for(&PackageSelector("rust".to_string()))
             .unwrap();
-        assert_eq!(deps.children[0].name, "llvm");
+        assert_eq!(deps.children[0].name, "llvm@22");
         assert_eq!(deps.children[0].version, "22.1.8_2");
 
         let canonical = state

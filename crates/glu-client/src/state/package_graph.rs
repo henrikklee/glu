@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use glu_core::{InstalledPackage, PackageKey, PackageSelector};
+use glu_core::{InstalledPackage, MinimumVersion, PackageKey, PackageSelector};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One installed dependency relationship. The requested selector is the
@@ -10,6 +10,7 @@ pub struct InstalledDependencyEdge {
     pub dependent: PackageKey,
     pub requested: PackageSelector,
     pub provider: PackageKey,
+    pub minimum_version: Option<MinimumVersion>,
 }
 
 /// The dependency graph of the newest installed package for each stable
@@ -47,6 +48,12 @@ impl InstalledPackageGraph {
                     dependent: dependent.clone(),
                     requested: dependency.requested_as.clone(),
                     provider: dependency.package_key.clone(),
+                    minimum_version: (!dependency.requires.version.is_empty()).then(|| {
+                        MinimumVersion {
+                            version: dependency.requires.version.clone(),
+                            revision: Some(dependency.requires.revision),
+                        }
+                    }),
                 };
                 incoming
                     .entry(edge.provider.clone())
