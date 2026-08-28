@@ -31,6 +31,7 @@ Use these for source-level lookup:
 
 - [CLI behavior](./reference/cli-behavior.md)
 - [Registry contract](./reference/registry-contract.md)
+- [Homebrew compatibility boundary](./reference/homebrew-compatibility.md)
 - [Version ordering](./reference/version-ordering.md)
 - [Tracing](./reference/tracing.md)
 

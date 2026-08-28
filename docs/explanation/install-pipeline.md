@@ -19,6 +19,7 @@ The manifest contains the package closure, dependency edges, artifact facts, ins
 The client validates the manifest before prefix mutation. Validation covers:
 
 - prefix compatibility, including fixed-cellar equal-length requirements;
+- complete root and dependency bindings, with every concrete package ID agreeing with its stable package key;
 - package names, aliases, old names, versions, and keg versions as safe path components;
 - artifact URL, SHA-256, and cellar fields;
 - supported structured postinstall steps;
@@ -32,7 +33,7 @@ The planner compares the manifest with installed state.
 
 Plain `glu install` resolves the requested selector to a package key and treats any installed version of that identity as satisfied. It records or promotes canonical intent in `glu.json` without upgrading that package.
 
-Named and bare updates reconcile selected roots while retaining dependencies that still satisfy the active requirement. `update --all` selects the complete declared-root closure. Reinstall and force modes repour the requested roots or closure according to their command flags.
+Named and bare updates reconcile selected roots while retaining dependencies that still satisfy the active requirement. They still repour a root when its persisted topology or package facts changed, including added, rebound, or dropped providers. The simulated post-update receipt graph identifies dependencies made dangling by those changes before execution. `update --all` selects the complete declared-root closure. Reinstall and force modes repour the requested roots or closure according to their command flags.
 
 Dependency satisfaction is evaluated in installer-root context. The planner carries one selected bottle's complete flattened requirement map through that package's topology closure. Satisfied intermediate packages are not selected for installation, but traversal continues through their children. A dependency selected for installation is expanded again with its own bottle's requirement map. If multiple roots reach the same package, any context that requires replacement wins.
 
@@ -118,7 +119,7 @@ This localizes complexity: package formulas express setup needs, postinstall pla
 
 ## 10. Write installed state
 
-A package counts as installed only after required commit and package-local postinstall work succeed. Complete receipts are written at that boundary.
+A package counts as installed only after required commit and package-local postinstall work succeed. Complete receipts are written at that boundary. They persist exact dependency selectors and the package's typed requirement map; a later state load resolves those selectors against the complete installed package set to rebuild provider bindings.
 
 Incomplete receipts and staging roots are interrupted-install state. Mutating commands clean them before planning.
 

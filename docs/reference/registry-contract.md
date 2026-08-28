@@ -65,7 +65,7 @@ Read-only commands may use slim resolve:
 GET /v1/resolve?...&slim=true
 ```
 
-Slim responses contain graph shape and minimal package records. They are for display and dependency queries. They must not be treated as install manifests.
+Slim responses contain graph shape and minimal package records. Their roots, package identities, and direct topology match full resolve for the same request, but artifact, install, and dependency-requirement facts remain full-only. Slim responses are for display and dependency queries. They must not be treated as install manifests.
 
 ## Dependency topology
 
@@ -100,7 +100,7 @@ The wire contract keeps four concepts separate:
 | `requested_as` | A caller or dependency selector, including aliases and old names. |
 | `name` | Canonical display name. |
 
-Package records advertise selector aliases and old names. The planner validates that each selector has one owner and that every root and dependency edge agrees with its target package record.
+Package records advertise selector aliases and old names. The registry gives exact names precedence over aliases and old names. The client fails closed when package keys have multiple concrete owners or when a root or dependency edge contradicts its target package record.
 
 Old-name transitions are explicit install work. They are not reconstructed independently by individual commands.
 

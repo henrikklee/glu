@@ -1535,6 +1535,37 @@ mod tests {
     }
 
     #[test]
+    fn update_roots_reconciles_a_changed_dependency_provider() {
+        let state = InstalledState::from_packages(vec![
+            installed_pkg("app", "1.0", vec![("old-provider", "1.0")]),
+            installed_pkg("old-provider", "1.0", vec![]),
+        ]);
+        let manifest = manifest(
+            vec!["app"],
+            vec![("app", vec!["new-provider"]), ("new-provider", vec![])],
+        );
+
+        let workset = compute_workset(&manifest, &state, WorksetMode::UpdateRoots).unwrap();
+
+        assert_eq!(workset.install, vec![id("new-provider"), id("app")]);
+        assert!(!workset.install.contains(&id("old-provider")));
+    }
+
+    #[test]
+    fn update_roots_reconciles_a_dropped_dependency() {
+        let state = InstalledState::from_packages(vec![
+            installed_pkg("app", "1.0", vec![("dropped", "1.0")]),
+            installed_pkg("dropped", "1.0", vec![]),
+        ]);
+        let manifest = manifest(vec!["app"], vec![("app", vec![])]);
+
+        let workset = compute_workset(&manifest, &state, WorksetMode::UpdateRoots).unwrap();
+
+        assert_eq!(workset.install, vec![id("app")]);
+        assert!(!workset.install.contains(&id("dropped")));
+    }
+
+    #[test]
     fn force_mode_repours_an_installed_root_and_keeps_satisfied_deps() {
         use glu_core::Prefix;
         use tempfile::TempDir;

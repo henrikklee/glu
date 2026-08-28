@@ -89,7 +89,7 @@ A package in `glu.json` is declared. A package installed only because another pa
 
 A dangling package is automatic and no longer reachable from any package in `glu.json`. Declaration names resolve once through installed receipt selectors; the reachability walk then uses `PackageKey` exclusively.
 
-`autoremove` removes dangling packages. Normal sync-style mutations also account for dangling packages so the prefix converges back to the declaration closure.
+`autoremove` removes dangling packages. Normal sync-style mutations also account for dangling packages so the prefix converges back to the declaration closure. `deps`, `why`, removal planning, autoremove, and post-mutation dangling checks all traverse the same receipt-backed package-key graph.
 
 ## Sync
 
