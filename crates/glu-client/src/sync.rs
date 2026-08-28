@@ -1,4 +1,7 @@
-use crate::{install::planner::InstallWorkSet, state::installed::InstalledState};
+use crate::{
+    homebrew_version::PackageVersion, install::planner::InstallWorkSet,
+    state::installed::InstalledState,
+};
 use anyhow::{bail, Result};
 use glu_core::{InstallManifest, InstalledPackage, PackageId, PackageName, PackageSelector};
 use std::collections::BTreeSet;
@@ -70,8 +73,10 @@ pub(crate) fn simulate_post_install_state(
             .0
             .to_lowercase()
             .cmp(&b.name.0.to_lowercase())
-            .then_with(|| crate::state::installed::compare_versions(&b.version, &a.version))
-            .then_with(|| b.revision.cmp(&a.revision))
+            .then_with(|| {
+                PackageVersion::new(&b.version, b.revision)
+                    .compare(PackageVersion::new(&a.version, a.revision))
+            })
     });
     simulated
 }

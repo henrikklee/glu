@@ -7,6 +7,7 @@ pub mod error;
 pub mod events;
 pub mod format;
 pub mod hash;
+mod homebrew_version;
 pub mod install;
 pub mod link;
 pub mod outdated;

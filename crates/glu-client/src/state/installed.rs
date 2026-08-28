@@ -1,4 +1,6 @@
-use crate::state::package_graph::InstalledPackageGraph;
+use crate::{
+    homebrew_version::PackageVersion, state::package_graph::InstalledPackageGraph,
+};
 use anyhow::{bail, Result};
 use glu_core::{InstalledPackage, PackageId, PackageKey, PackageName, PackageSelector, Prefix};
 use std::{
@@ -520,7 +522,8 @@ fn insert_selector_mapping(
 }
 
 fn compare_installed(a: &InstalledPackage, b: &InstalledPackage) -> std::cmp::Ordering {
-    compare_versions(&a.version, &b.version).then(a.revision.cmp(&b.revision))
+    PackageVersion::new(&a.version, a.revision)
+        .compare(PackageVersion::new(&b.version, b.revision))
 }
 
 #[cfg(test)]
@@ -528,32 +531,6 @@ fn declared_set(names: &[&str]) -> BTreeSet<PackageName> {
     names
         .iter()
         .map(|name| PackageName((*name).to_string()))
-        .collect()
-}
-
-pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-
-    let a_parts = version_parts(a);
-    let b_parts = version_parts(b);
-
-    for (a, b) in a_parts.iter().zip(b_parts.iter()) {
-        let ord = match (a.parse::<u64>(), b.parse::<u64>()) {
-            (Ok(a), Ok(b)) => a.cmp(&b),
-            _ => a.cmp(b),
-        };
-        if ord != Ordering::Equal {
-            return ord;
-        }
-    }
-
-    a_parts.len().cmp(&b_parts.len())
-}
-
-fn version_parts(version: &str) -> Vec<&str> {
-    version
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|part| !part.is_empty())
         .collect()
 }
 
@@ -1308,6 +1285,18 @@ mod tests {
         let newest = state.find(&PackageName("node".to_string())).unwrap();
         assert_eq!(newest.version, "26.7.0");
         assert!(state.find(&PackageName("absent".to_string())).is_none());
+    }
+
+    #[test]
+    fn newest_keg_uses_homebrew_mixed_alphanumeric_ordering() {
+        let state = InstalledState::from_packages(vec![
+            installed_pkg_with_oldnames("jpeg", &[], "9d"),
+            installed_pkg_with_oldnames("jpeg", &[], "10"),
+        ]);
+
+        let newest = state.find(&PackageName("jpeg".to_string())).unwrap();
+
+        assert_eq!(newest.version, "10");
     }
 
     #[test]

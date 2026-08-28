@@ -87,7 +87,7 @@ Each minimum contains a version and an optional revision. An omitted revision me
 
 The planner evaluates these maps in installer-root context. While expanding one package for installation, it carries that package's complete map through the package's full direct-topology closure. Every visited dependency is looked up by its exact `package_key` in that root map, including dependencies below an already-satisfied intermediate package. Alias and old-name spellings are not guessed as requirement keys.
 
-The selected concrete package always satisfies its own resolution. A different installed release is reusable only when the active installer-root map contains a minimum that it satisfies. A dependency selected for installation becomes an installer root in turn, so its own artifact map is also evaluated. Work selected by multiple roots is merged monotonically: a stricter context cannot be undone by a context that can reuse the installed release.
+The selected concrete package always satisfies its own resolution. A different installed release is reusable only when the active installer-root map contains a minimum that it satisfies under the client's [Homebrew-compatible version ordering](./version-ordering.md). A dependency selected for installation becomes an installer root in turn, so its own artifact map is also evaluated. Work selected by multiple roots is merged monotonically: a stricter context cannot be undone by a context that can reuse the installed release.
 
 ## Package identity
 

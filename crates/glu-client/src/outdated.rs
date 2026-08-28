@@ -2,8 +2,7 @@
 //! staleness envelope (`update` = newest installable on this target, what
 //! `glu up` installs; `latest` = newest visible overall).
 
-use crate::state::installed::{compare_versions, InstalledState};
-use crate::style;
+use crate::{homebrew_version::PackageVersion, state::installed::InstalledState, style};
 use glu_core::{OutdatedPackage as OutdatedEnvelope, PackageName, VersionRevision};
 use semver::Version;
 
@@ -76,8 +75,8 @@ pub fn outdated_entries(
         let Some(update) = &envelope.update else {
             continue;
         };
-        let ordering = compare_versions(&update.version, &installed.version)
-            .then(update.revision.cmp(&installed.revision));
+        let ordering = PackageVersion::new(&update.version, update.revision)
+            .compare(PackageVersion::new(&installed.version, installed.revision));
         if ordering.is_gt() {
             out.push(OutdatedPackage {
                 package_key: installed.package_key.clone(),
@@ -236,6 +235,17 @@ mod tests {
         assert_eq!(outdated.len(), 1);
         assert_eq!(outdated[0].update.as_deref(), Some("8.18.5_1"));
         assert_eq!(outdated[0].latest, "8.18.5_1");
+    }
+
+    #[test]
+    fn mixed_alphanumeric_homebrew_update_is_outdated() {
+        let installed = vec![installed("jpeg", "9d", 0)];
+        let latest = envelope_map(vec![("jpeg", Some(("10", 0)), ("10", 0))]);
+
+        let outdated = outdated_entries(&InstalledState::from_packages(installed), &latest);
+
+        assert_eq!(outdated.len(), 1);
+        assert_eq!(outdated[0].update.as_deref(), Some("10"));
     }
 
     #[test]

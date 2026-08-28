@@ -1,6 +1,7 @@
 use crate::{
+    homebrew_version::Version,
     install::{graph, manifest_lookup::ManifestLookup},
-    state::installed::{compare_versions, InstalledState},
+    state::installed::InstalledState,
 };
 use anyhow::{bail, Result};
 use glu_core::{
@@ -574,7 +575,7 @@ fn dependency_requirement_satisfied(
     let Some(minimum) = minimum else {
         return false;
     };
-    match compare_versions(&installed.version, &minimum.version) {
+    match Version::new(&installed.version).compare(Version::new(&minimum.version)) {
         std::cmp::Ordering::Greater => true,
         std::cmp::Ordering::Less => false,
         std::cmp::Ordering::Equal => minimum
@@ -1220,6 +1221,18 @@ mod tests {
 
         assert_eq!(workset.install, vec![id("libuv"), id("node")]);
         assert!(workset.satisfied.is_empty());
+    }
+
+    #[test]
+    fn dependency_floor_uses_homebrew_mixed_alphanumeric_ordering() {
+        let installed = installed_pkg("jpeg", "10", vec![]);
+        let selected = PackageId("pkg:homebrew/core/jpeg@11".to_string());
+
+        assert!(dependency_requirement_satisfied(
+            &installed,
+            &selected,
+            Some(&minimum("9d"))
+        ));
     }
 
     #[test]
