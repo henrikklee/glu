@@ -378,25 +378,38 @@ fn render_deps_output(deps: &DepsOutput, globals: &GlobalOptions) {
 }
 
 fn render_reverse_deps_output(reverse: &ReverseDepsOutput, globals: &GlobalOptions) {
+    let is_why = reverse.command == CommandId::Why;
     if globals.is_json() {
         let result = if globals.tree {
-            let roots = match &reverse.root {
-                Some(root) if reverse.direct => vec![direct_only_root(root)],
-                Some(root) => vec![root.clone()],
-                None => Vec::new(),
+            let (roots, initial_depth) = match &reverse.root {
+                Some(root) if is_why => (root.children.clone(), 1),
+                Some(root) if reverse.direct => (vec![direct_only_root(root)], 0),
+                Some(root) => (vec![root.clone()], 0),
+                None => (Vec::new(), 0),
             };
             ReverseDepsResult::Tree(ReverseDepsTreeResult {
                 target: &reverse.target,
                 source: reverse.source,
                 direct: reverse.direct,
                 view: TreeView::Tree,
-                graph: dependency_graph_json(&roots, reverse.direct, &reverse.statuses),
+                graph: dependency_graph_json_at_depth(
+                    &roots,
+                    reverse.direct,
+                    initial_depth,
+                    &reverse.statuses,
+                ),
             })
         } else {
             let dependents = reverse
                 .root
                 .as_ref()
-                .map(|root| dependency_records(&root.children, reverse.direct, &reverse.statuses))
+                .map(|root| {
+                    if is_why {
+                        why_root_cause_records(root, &reverse.statuses)
+                    } else {
+                        dependency_records(&root.children, reverse.direct, &reverse.statuses)
+                    }
+                })
                 .unwrap_or_default();
             ReverseDepsResult::Flat(ReverseDepsFlatResult {
                 direct: reverse.direct,
@@ -411,12 +424,18 @@ fn render_reverse_deps_output(reverse: &ReverseDepsOutput, globals: &GlobalOptio
     }
 
     if globals.is_null() {
-        let mut items = Vec::new();
         if let Some(root) = &reverse.root {
-            flatten_tree_unique(&root.children, reverse.direct, &mut items);
-        }
-        for (name, _) in items {
-            print!("{name}\0");
+            if is_why {
+                for record in why_root_cause_records(root, &reverse.statuses) {
+                    print!("{}\0", record.name);
+                }
+            } else {
+                let mut items = Vec::new();
+                flatten_tree_unique(&root.children, reverse.direct, &mut items);
+                for (name, _) in items {
+                    print!("{name}\0");
+                }
+            }
         }
         return;
     }
@@ -428,11 +447,75 @@ fn render_reverse_deps_output(reverse: &ReverseDepsOutput, globals: &GlobalOptio
     if root.children.is_empty() {
         println!("Nothing depends on it.");
     } else if globals.tree {
-        print_tree_roots(std::slice::from_ref(root), reverse.direct, globals.verbose);
+        if is_why {
+            print_tree_forest(&root.children, reverse.direct, globals.verbose);
+        } else {
+            print_tree_roots(std::slice::from_ref(root), reverse.direct, globals.verbose);
+        }
     } else {
-        let mut items = Vec::new();
-        flatten_tree_unique(&root.children, reverse.direct, &mut items);
+        let items = if is_why {
+            why_root_cause_records(root, &reverse.statuses)
+                .into_iter()
+                .map(|record| (record.name, record.version))
+                .collect()
+        } else {
+            let mut items = Vec::new();
+            flatten_tree_unique(&root.children, reverse.direct, &mut items);
+            items
+        };
         print_flat(&items);
+    }
+}
+
+fn why_root_cause_records(
+    root: &DependencyTreeNode,
+    statuses: &BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
+) -> Vec<DependencyRecord> {
+    let mut records = Vec::new();
+    let mut seen = BTreeMap::new();
+    collect_why_nodes(&root.children, 1, statuses, &mut seen, &mut records, true);
+    if records.is_empty() {
+        collect_why_nodes(&root.children, 1, statuses, &mut seen, &mut records, false);
+    }
+    records
+}
+
+fn collect_why_nodes(
+    nodes: &[DependencyTreeNode],
+    depth: usize,
+    statuses: &BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
+    seen: &mut BTreeMap<glu_core::PackageKey, usize>,
+    records: &mut Vec<DependencyRecord>,
+    declared_only: bool,
+) {
+    for node in nodes {
+        let status = statuses.get(&node.package_key);
+        let selected = if declared_only {
+            status.is_some_and(|status| status.declared)
+        } else {
+            node.children.is_empty() && !node.already_shown
+        };
+        if selected {
+            if let Some(index) = seen.get(&node.package_key).copied() {
+                if depth == 1 {
+                    records[index].direct = true;
+                    records[index].transitive = false;
+                }
+            } else {
+                seen.insert(node.package_key.clone(), records.len());
+                records.push(dependency_record(node, status, depth));
+            }
+        }
+        if !node.already_shown {
+            collect_why_nodes(
+                &node.children,
+                depth + 1,
+                statuses,
+                seen,
+                records,
+                declared_only,
+            );
+        }
     }
 }
 
@@ -1266,10 +1349,14 @@ impl<'a> UpdatePlanTreeResult<'a> {
 }
 
 pub(crate) fn render_install_preflight(plan: &glu_client::install::InstallPlan) {
+    let requested = plan.resolved_root_keys();
     let promoted: Vec<_> = plan
         .promoted
         .iter()
-        .map(|package| PackageListItem::package(&package.name.0, &package.version))
+        .map(|package| {
+            PackageListItem::package(&package.name.0, &package.version)
+                .emphasized(requested.contains(&package.package_key))
+        })
         .collect();
     package_list::print_labeled_section("Added to your packages", &promoted);
 
@@ -1279,7 +1366,10 @@ pub(crate) fn render_install_preflight(plan: &glu_client::install::InstallPlan) 
         .filter(|package| {
             package.status == glu_client::install::PackageChangeStatus::AlreadyInstalled
         })
-        .map(|package| PackageListItem::package(&package.name.0, &package.version))
+        .map(|package| {
+            PackageListItem::package(&package.name.0, &package.version)
+                .emphasized(requested.contains(&package.package_key))
+        })
         .collect();
     package_list::print_labeled_section("Already installed", &satisfied);
 
@@ -1304,6 +1394,7 @@ pub(crate) fn render_install_execution_plan(
     label: &str,
     tree: bool,
 ) {
+    let requested = plan.resolved_root_keys();
     let total = plan.would_install.len() + plan.renamed.len();
     if total > 0 {
         if tree {
@@ -1331,11 +1422,12 @@ pub(crate) fn render_install_execution_plan(
                 .iter()
                 .map(|rename| {
                     PackageListItem::rename(&rename.old_name.0, &rename.new_name.0, &rename.version)
+                        .emphasized(requested.contains(&rename.package_key))
                 })
                 .collect();
             items.extend(plan.would_install.iter().map(|package| {
                 PackageListItem::package(&package.name.0, &package.version)
-                    .emphasized(package.direct == Some(true))
+                    .emphasized(requested.contains(&package.package_key))
             }));
             package_list::print_section(&format!("Will {label}"), &items);
         }
@@ -1461,6 +1553,7 @@ fn render_install_plan_output(plan: &InstallPlanOutput, globals: &GlobalOptions)
     } else {
         Default::default()
     };
+    let requested = dependency_root_keys(&plan.dependency_tree);
     if !install_tree.nodes.is_empty() {
         println!(
             "Would install {}:",
@@ -1468,11 +1561,11 @@ fn render_install_plan_output(plan: &InstallPlanOutput, globals: &GlobalOptions)
         );
         print_mutation_tree(&install_tree);
     } else {
-        print_package_section("Would install", &plan.would_install);
+        print_install_package_section("Would install", &plan.would_install, &requested);
     }
-    print_package_section("Already satisfied", &plan.satisfied);
-    print_package_section("Would promote to declared", &plan.would_promote);
-    print_rename_section("Would rename", &plan.would_rename);
+    print_install_package_section("Already satisfied", &plan.satisfied, &requested);
+    print_install_package_section("Would promote to declared", &plan.would_promote, &requested);
+    print_install_rename_section("Would rename", &plan.would_rename, &requested);
     print_package_section("Would remove", &plan.would_remove);
     print_would_download(plan.would_download_bytes);
 }
@@ -1632,6 +1725,50 @@ fn print_package_section(heading: &str, packages: &[MutationPackageRecord]) {
         .map(|package| {
             PackageListItem::package(&package.name, &package.version)
                 .emphasized(package.direct == Some(true))
+        })
+        .collect();
+    package_list::print_section(heading, &items);
+}
+
+fn dependency_root_keys(tree: &[DependencyTreeNode]) -> BTreeSet<String> {
+    tree.iter().map(|root| root.package_key.0.clone()).collect()
+}
+
+fn print_install_package_section(
+    heading: &str,
+    packages: &[MutationPackageRecord],
+    requested: &BTreeSet<String>,
+) {
+    package_list::print_section(heading, &install_package_items(packages, requested));
+}
+
+fn install_package_items(
+    packages: &[MutationPackageRecord],
+    requested: &BTreeSet<String>,
+) -> Vec<PackageListItem> {
+    packages
+        .iter()
+        .map(|package| {
+            PackageListItem::package(&package.name, &package.version).emphasized(
+                package
+                    .package_key
+                    .as_ref()
+                    .is_some_and(|package_key| requested.contains(package_key)),
+            )
+        })
+        .collect()
+}
+
+fn print_install_rename_section(
+    heading: &str,
+    renames: &[RenamePackageRecord],
+    requested: &BTreeSet<String>,
+) {
+    let items: Vec<_> = renames
+        .iter()
+        .map(|rename| {
+            PackageListItem::rename(&rename.old_name, &rename.new_name, &rename.version)
+                .emphasized(requested.contains(&rename.package_key))
         })
         .collect();
     package_list::print_section(heading, &items);
@@ -2358,13 +2495,29 @@ fn dependency_graph_json(
     direct: bool,
     statuses: &BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
 ) -> DependencyGraphJson {
+    dependency_graph_json_at_depth(nodes, direct, 0, statuses)
+}
+
+fn dependency_graph_json_at_depth(
+    nodes: &[DependencyTreeNode],
+    direct: bool,
+    initial_depth: usize,
+    statuses: &BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
+) -> DependencyGraphJson {
     let mut graph_nodes = BTreeMap::new();
     let mut edges: BTreeMap<String, Vec<DependencyGraphEdge>> = BTreeMap::new();
     let roots = nodes
         .iter()
         .map(|node| {
             let id = dependency_node_id(node);
-            collect_dependency_graph(node, direct, 0, statuses, &mut graph_nodes, &mut edges);
+            collect_dependency_graph(
+                node,
+                direct,
+                initial_depth,
+                statuses,
+                &mut graph_nodes,
+                &mut edges,
+            );
             id
         })
         .collect();
@@ -2456,16 +2609,29 @@ fn dependency_graph_node(
     }
 }
 
-/// Nested tree entry for `deps`/`why`: `direct` stops at one level of
+/// Nested tree entry for dependency output: `direct` stops at one level of
 /// children, `verbose` shows each edge's version floor.
 pub(crate) fn print_tree_roots(nodes: &[DependencyTreeNode], direct: bool, verbose: bool) {
+    print_dependency_tree(nodes, direct, verbose, RootStyle::SiblingBranches);
+}
+
+fn print_tree_forest(nodes: &[DependencyTreeNode], direct: bool, verbose: bool) {
+    print_dependency_tree(nodes, direct, verbose, RootStyle::Plain);
+}
+
+fn print_dependency_tree(
+    nodes: &[DependencyTreeNode],
+    direct: bool,
+    verbose: bool,
+    root_style: RootStyle,
+) {
     let options = TreeRenderOptions {
         decorated: true,
         direct,
         verbose,
         show_versions: true,
         version_label: None,
-        root_style: RootStyle::SiblingBranches,
+        root_style,
     };
     for line in render_dependency_tree(nodes, options) {
         println!("{line}");
@@ -2795,6 +2961,107 @@ mod tests {
         assert!(!records[1].installed);
         assert!(!records[1].direct);
         assert!(records[1].transitive);
+    }
+
+    #[test]
+    fn why_flat_reports_declared_root_causes_only() {
+        let root = node(
+            "nss",
+            "3.127",
+            vec![node(
+                "poppler",
+                "26.08.0",
+                vec![node("vips", "8.18.6", Vec::new())],
+            )],
+        );
+        let statuses = BTreeMap::from([
+            (
+                glu_core::PackageKey("package:poppler".to_string()),
+                glu_client::deps::PackageStatus {
+                    installed: true,
+                    declared: false,
+                    ..Default::default()
+                },
+            ),
+            (
+                glu_core::PackageKey("package:vips".to_string()),
+                glu_client::deps::PackageStatus {
+                    installed: true,
+                    declared: true,
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let records = why_root_cause_records(&root, &statuses);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name, "vips");
+        assert!(!records[0].direct);
+        assert!(records[0].transitive);
+    }
+
+    #[test]
+    fn why_tree_json_is_a_rootless_forest_with_target_relative_depths() {
+        let root = node(
+            "nss",
+            "3.127",
+            vec![node(
+                "poppler",
+                "26.08.0",
+                vec![node("vips", "8.18.6", Vec::new())],
+            )],
+        );
+
+        let graph = dependency_graph_json_at_depth(&root.children, false, 1, &BTreeMap::new());
+
+        assert_eq!(graph.roots, vec!["pkg:test/poppler@26.08.0"]);
+        assert!(!graph.nodes.contains_key("pkg:test/nss@3.127"));
+        assert!(graph.nodes["pkg:test/poppler@26.08.0"].direct);
+        assert!(graph.nodes["pkg:test/vips@8.18.6"].transitive);
+    }
+
+    #[test]
+    fn install_plan_emphasizes_only_resolved_roots() {
+        fn mutation(name: &str, direct: bool) -> MutationPackageRecord {
+            MutationPackageRecord {
+                package_key: Some(format!("package:{name}")),
+                name: name.to_string(),
+                version: "1.0".to_string(),
+                status: MutationStatus::WouldInstall,
+                installed: None,
+                linked: None,
+                declared: None,
+                deactivated: None,
+                direct: Some(direct),
+                transitive: Some(!direct),
+                cached: None,
+                download_bytes: None,
+                installed_bytes: None,
+            }
+        }
+
+        let tree = vec![
+            node(
+                "requested-a",
+                "1.0",
+                vec![node("immediate-dependency", "1.0", Vec::new())],
+            ),
+            node("requested-b", "1.0", Vec::new()),
+        ];
+        let requested = dependency_root_keys(&tree);
+        let items = install_package_items(
+            &[
+                mutation("requested-a", false),
+                mutation("immediate-dependency", true),
+                mutation("requested-b", false),
+            ],
+            &requested,
+        );
+
+        assert!(items[0].emphasized);
+        assert!(!items[1].emphasized);
+        assert!(items[2].emphasized);
     }
 
     #[test]

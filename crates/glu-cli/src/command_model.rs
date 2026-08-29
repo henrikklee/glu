@@ -754,7 +754,7 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         group: CommandGroup::Query,
         aliases: &[],
         summary: "Show why an installed package is needed",
-        default_behavior: "Shows installed packages that depend on NAME.",
+        default_behavior: "Shows the declared root causes that keep NAME installed.",
         arguments: PACKAGE_NAME_ARGUMENTS,
         mutates: false,
         default_scope: Some("installed"),

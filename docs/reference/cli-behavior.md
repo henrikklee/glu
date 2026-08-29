@@ -114,7 +114,7 @@ A command rejects shared options it does not support instead of silently ignorin
 
 Dependency-aware commands can render flat or tree-shaped output.
 
-Flat output is a deduplicated set view. Deduplication uses stable package identity, so two distinct packages are not merged merely because they have the same displayed spelling. Tree output preserves dependency shape and may mark repeated graph nodes as already shown. Forward dependency text and NUL output preserve the exact selector recorded on each edge, including aliases and old names.
+Flat output is normally a deduplicated set view. Deduplication uses stable package identity, so two distinct packages are not merged merely because they have the same displayed spelling. `glu why` is deliberately narrower: its flat and NUL views report the declared root cause or causes that keep the queried package installed, not every intermediate dependent. Its tree view is a rootless forest that omits the already-named target and shows paths from immediate dependents toward declared roots. Other tree output preserves dependency shape and may mark repeated graph nodes as already shown. Forward dependency text and NUL output preserve the exact selector recorded on each edge, including aliases and old names.
 
 JSON tree output preserves structure as data rather than exposing box-drawing text as the contract. Node-map keys are concrete package IDs, nodes include stable package keys and canonical names, and edges include their exact `requested_as` selector plus whether reverse traversal produced the edge. Flat dependency records retain package key, concrete package ID, and edge selector too. List-like JSON results are object-shaped so their scope, view, and future metadata can evolve without changing the result root type.
 
@@ -128,7 +128,7 @@ The internal postinstall worker is the only client path allowed to write process
 
 Mutating commands that support plan mode compute the same state transition as execution, then stop before mutation.
 
-Plan output shows the meaningful transition: install, update, reinstall, promote, rename, remove, keep, satisfy, download size, and confirmation requirement where relevant. Package records include local-state and impact annotations when known: `installed`, `linked`, `declared`, `deactivated`, `direct`, `transitive`, `cached`, `download_bytes`, and receipt-backed `installed_bytes`. `glu cleanup --plan` lists package names for cached downloads that match installed-receipt metadata, summarizes unassociated downloads, and reports total reclaimable bytes.
+Plan output shows the meaningful transition: install, update, reinstall, promote, rename, remove, keep, satisfy, download size, and confirmation requirement where relevant. In flat human install plans, bold names are exactly the resolved roots requested by the invocation; dependency depth metadata does not control emphasis. Package records include local-state and impact annotations when known: `installed`, `linked`, `declared`, `deactivated`, `direct`, `transitive`, `cached`, `download_bytes`, and receipt-backed `installed_bytes`. `glu cleanup --plan` lists package names for cached downloads that match installed-receipt metadata, summarizes unassociated downloads, and reports total reclaimable bytes.
 
 Plan mode is a read-only boundary between decision and execution. Recovery cleanup, lock-protected mutation, and package changes happen only on the execution side. Install and update plans preserve their dependency graph when `--tree` is selected.
 

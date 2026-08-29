@@ -262,11 +262,13 @@ friendly `package 'X' not found` errors with `Did you mean …?` suggestions.")]
 
     /// Reverse dependency tree of one installed package: what transitively depends on it.
     #[command(long_about = "\
-The reverse dependency tree of one installed package: who (transitively) \
-depends on it. Offline only (receipts). Prints `Nothing depends on it.` when \
-nobody does. Flat shows the dependents without the named package; `-t`/\
-`--tree` shows it as the root. `-j`/`--json` emits structured output and \
-`-0`/`--null` emits flat dependent names separated by NUL bytes.")]
+Explain why an installed package is needed. Offline only \
+(receipts). Flat output reports the declared root cause or causes rather than \
+every intermediate dependent. `-t`/`--tree` shows a rootless forest of the \
+paths from immediate dependents to those roots; the queried package is omitted \
+because it is already named by the command. Prints `Nothing depends on it.` \
+when nobody does. `-j`/`--json` emits structured output and `-0`/`--null` \
+emits root-cause names separated by NUL bytes.")]
     Why {
         /// Installed package name.
         name: String,

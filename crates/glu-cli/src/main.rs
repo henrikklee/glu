@@ -556,7 +556,7 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
         }
         Command::Why { name } => {
             let query = client.query_state(events.as_ref())?;
-            let view = query.why(&PackageSelector(name.clone()), !null);
+            let view = query.why(&PackageSelector(name.clone()), true);
             final_output = Some(CommandOutput::ReverseDeps(ReverseDepsOutput {
                 command: CommandId::Why,
                 source: ReverseDepsSource::Installed,

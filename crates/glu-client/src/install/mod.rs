@@ -179,6 +179,14 @@ impl InstallPlan {
         dependency_forest_from_manifest(&self.manifest)
     }
 
+    pub fn resolved_root_keys(&self) -> BTreeSet<glu_core::PackageKey> {
+        self.manifest
+            .roots
+            .iter()
+            .map(|root| root.package_key.clone())
+            .collect()
+    }
+
     pub fn resolved_version(&self, name: &PackageName) -> Option<&str> {
         self.manifest
             .packages
