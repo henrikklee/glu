@@ -143,7 +143,7 @@ It is the registry-wide counterpart to local `why`:
 - `why` uses installed receipts;
 - `uses` uses registry dependency data.
 
-The CLI requests `direct=true` for flat, JSON-flat, and NUL views. Tree views request the complete reverse closure, elide the already-named target, and retain target-relative branch and depth information.
+The CLI requests `direct=true` for default human, JSON, and NUL views. `--all` requests the complete reverse closure and renders it as a deduplicated set. Tree views request that same closure, elide the already-named target, and retain target-relative branch and depth information. Combining `--all` and `--tree` is equivalent to `--tree`.
 
 ## Errors
 

@@ -383,6 +383,7 @@ fn render_deps_output(deps: &DepsOutput, globals: &GlobalOptions) {
 
 fn render_reverse_deps_output(reverse: &ReverseDepsOutput, globals: &GlobalOptions) {
     let is_why = reverse.command == CommandId::Why;
+    let root_causes_only = is_why && !reverse.all && !globals.tree;
     if globals.is_json() {
         let result = if globals.tree {
             let (roots, initial_depth) = match &reverse.root {
@@ -406,7 +407,7 @@ fn render_reverse_deps_output(reverse: &ReverseDepsOutput, globals: &GlobalOptio
                 .root
                 .as_ref()
                 .map(|root| {
-                    if is_why {
+                    if root_causes_only {
                         why_root_cause_records(root, &reverse.statuses)
                     } else {
                         dependency_records(&root.children, reverse.direct, &reverse.statuses)
@@ -427,7 +428,7 @@ fn render_reverse_deps_output(reverse: &ReverseDepsOutput, globals: &GlobalOptio
 
     if globals.is_null() {
         if let Some(root) = &reverse.root {
-            if is_why {
+            if root_causes_only {
                 for record in why_root_cause_records(root, &reverse.statuses) {
                     print!("{}\0", record.name);
                 }
@@ -451,7 +452,7 @@ fn render_reverse_deps_output(reverse: &ReverseDepsOutput, globals: &GlobalOptio
     } else if globals.tree {
         print_tree_roots(&root.children, reverse.direct, globals.verbose);
     } else {
-        let items = if is_why {
+        let items = if root_causes_only {
             why_root_cause_records(root, &reverse.statuses)
                 .into_iter()
                 .map(|record| (record.name, record.version))
@@ -2391,10 +2392,10 @@ fn dependency_status_parts(record: &DependencyRecord) -> Vec<&'static str> {
     parts
 }
 
-/// `glu ls --tree`: dependency tree rooted at declared packages; with
-/// `--installed`/`--all`, dangling packages are added as roots so the tree
-/// covers everything installed. Explicit tree output keeps branch structure
-/// even when piped; ANSI styling is still terminal-gated by the style layer.
+/// `glu ls --tree`: complete installed forest. Declared packages are natural
+/// roots and dangling components are supplemental roots. `--all --tree` is
+/// equivalent. Explicit tree output keeps branch structure even when piped;
+/// ANSI styling is still terminal-gated by the style layer.
 pub(crate) fn print_list_tree(tree: &[DependencyTreeNode]) {
     let options = TreeRenderOptions {
         decorated: true,

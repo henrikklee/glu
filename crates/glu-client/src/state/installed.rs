@@ -341,13 +341,9 @@ impl InstalledState {
         self.prefix.0.join("Cellar")
     }
 
-    /// Full `glu ls --all` dependency tree: declared packages at the top,
-    /// each expanded by its declared deps (the `deps` recorded in its
-    /// receipt). Each package expands once — the first sighting shows the
-    /// full subtree, later sightings render as a leaf marked `(*)`
-    /// ("dependencies already shown above"), the cargo-tree convention.
-    /// This keeps dense graphs readable while staying complete: every
-    /// package appears exactly once with its deps.
+    /// Dependency forest reachable from declared packages. Each package
+    /// expands once; later sightings render as already-shown leaves. This
+    /// projection intentionally excludes dangling components.
     pub fn dependency_tree(&self) -> Vec<DependencyTreeNode> {
         dependency_query::installed_forward_forest(
             self.current_packages(),
@@ -357,9 +353,9 @@ impl InstalledState {
         )
     }
 
-    /// Like `dependency_tree`, but also roots every dangling package —
-    /// installed, not declared, and unreachable from anything declared — so
-    /// the tree covers *everything* installed (`glu ls --all --tree`).
+    /// Like `dependency_tree`, but also roots every dangling package so the
+    /// forest covers everything installed (`glu ls --tree`; `--all --tree` is
+    /// equivalent).
     pub fn dependency_tree_all(&self) -> Vec<DependencyTreeNode> {
         let mut roots: Vec<PackageKey> = self
             .declared()

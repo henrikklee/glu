@@ -499,7 +499,7 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
             all,
         } => {
             let query = client.query_state(events.as_ref())?;
-            let installed_scope = installed || all;
+            let installed_scope = globals.tree || installed || all;
             let statuses = if null {
                 BTreeMap::new()
             } else {
@@ -511,12 +511,7 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                 ListScope::Declared
             };
             let view = if globals.tree {
-                let tree = if installed_scope {
-                    query.list_tree_all()
-                } else {
-                    query.list_tree()
-                };
-                ListView::Tree(tree)
+                ListView::Tree(query.list_tree_all())
             } else if installed_scope {
                 ListView::Flat(query.list())
             } else {
@@ -538,7 +533,7 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
         }
         Command::Deps {
             name,
-            direct,
+            all,
             status,
             online,
         } => {
@@ -551,11 +546,12 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                 client.deps(&query, selector, online, !null),
             )
             .await??;
+            let direct = !tree && !all;
             final_output = Some(CommandOutput::Deps(output::deps_output(
                 view, target, direct, status,
             )));
         }
-        Command::Why { name } => {
+        Command::Why { all, name } => {
             let query = client.query_state(events.as_ref())?;
             let view = query.why(&PackageSelector(name.clone()), true);
             final_output = Some(CommandOutput::ReverseDeps(ReverseDepsOutput {
@@ -563,13 +559,14 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                 source: ReverseDepsSource::Installed,
                 target: name,
                 direct: false,
+                all: all && !tree,
                 root: view.root,
                 statuses: view.statuses,
             }));
         }
-        Command::Uses { name } => {
+        Command::Uses { all, name } => {
             let selector = PackageSelector(name.clone());
-            let direct = !tree;
+            let direct = !tree && !all;
             let statuses = if null {
                 BTreeMap::new()
             } else {
@@ -585,6 +582,7 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                 source: ReverseDepsSource::Registry,
                 target: name,
                 direct,
+                all: all && !tree,
                 root: Some(root),
                 statuses,
             }));

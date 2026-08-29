@@ -14,7 +14,7 @@ pub(crate) struct GlobalArgs {
     #[arg(short = '0', long, global = true, conflicts_with = "json")]
     pub(crate) null: bool,
 
-    /// Select the nested graph view where supported.
+    /// Preserve graph topology; read queries expand the complete graph.
     #[arg(short = 't', long, global = true)]
     pub(crate) tree: bool,
 
@@ -191,16 +191,16 @@ even when the package is already active."
         visible_alias = "ls",
         long_about = "\
 Default: declared packages — \"what did I install?\" — with a hint \
-to view all dependencies on terminals. `--installed`/`-a`/`--all` lists \
-every installed package; with `-t`, it also roots dangling packages so the \
-tree covers everything. `-t`/`--tree` renders the nested dependency tree; \
-`-j`/`--json` and `-0`/`--null` emit machine-readable output; combined \
+to view all dependencies on terminals. `--installed`/`-a`/`--all` flattens \
+and deduplicates the complete installed graph. `-t`/`--tree` renders that \
+complete graph as a forest; combining `--all` and `--tree` is equivalent to \
+`--tree`. `-j`/`--json` and `-0`/`--null` emit machine-readable output; combined \
 with `-t`, JSON preserves the nested tree and NUL emits tree node names. \
 Flat output is plain `name version` lines — safe for `xargs`."
     )]
     List {
         /// Explicitly list only declared packages (the default).
-        #[arg(long, conflicts_with_all = ["all", "installed"])]
+        #[arg(long, conflicts_with_all = ["all", "installed", "tree"])]
         declared: bool,
         /// List every installed package. Alias: --all / -a.
         #[arg(long)]
@@ -234,21 +234,23 @@ is current. Read-only. Default scope is every installed package; \
 
     /// Forward dependency tree of one package: what it pulls in.
     #[command(long_about = "\
-The forward dependency tree of one package. Installed packages answer from \
+The forward dependencies of one package. Installed packages answer from \
 receipts (offline); not-installed ones resolve from the registry, marked \
 `resolved from the registry — not installed`. `-o`/`--online` forces the \
 registry answer for an installed package (what a fresh install would pull) — \
-the two can differ. Human output lists names only by default. `-d`/`--direct` \
-limits to one level. `-t`/`--tree` elides the already-named query while \
-retaining dependency branches and reports `No dependencies.` for a leaf. `-v` \
+the two can differ. Default output lists direct dependencies. `-a`/`--all` \
+flattens and deduplicates the complete closure. `-t`/`--tree` renders that \
+closure as a tree, elides the already-named query, and reports \
+`No dependencies.` for a leaf. Combining `--all` and `--tree` is equivalent \
+to `--tree`. `-v` \
 annotates packages as `(VERSION installed)` plus each tree edge's declared requirement; resolver \
 candidate versions are never presented as dependency requirements. `--status` \
 annotates human output with installed/declared/link state. Unknown names get \
 friendly `package 'X' not found` errors with `Did you mean …?` suggestions.")]
     Deps {
-        /// Only the package's direct dependencies (one level).
-        #[arg(short = 'd', long)]
-        direct: bool,
+        /// Flatten and deduplicate the complete dependency closure.
+        #[arg(short = 'a', long)]
+        all: bool,
         /// Annotate human dependency output with installed/declared/link status.
         #[arg(long)]
         status: bool,
@@ -264,13 +266,18 @@ friendly `package 'X' not found` errors with `Did you mean …?` suggestions.")]
     /// Reverse dependency tree of one installed package: what transitively depends on it.
     #[command(long_about = "\
 Explain why an installed package is needed. Offline only \
-(receipts). Flat output reports the declared root cause or causes rather than \
-every intermediate dependent. `-t`/`--tree` elides the already-named queried \
+(receipts). Default output reports the declared root cause or causes rather than \
+every intermediate dependent. `-a`/`--all` instead flattens and deduplicates \
+all transitive dependents. `-t`/`--tree` elides the already-named queried \
 package while retaining its child branches, showing paths from immediate \
-dependents to declared roots. Prints `Nothing depends on it.` \
+dependents to declared roots; combining it with `--all` is equivalent to \
+`--tree`. Prints `Nothing depends on it.` \
 when nobody does. `-j`/`--json` emits structured output and `-0`/`--null` \
-emits root-cause names separated by NUL bytes.")]
+emits the selected names separated by NUL bytes.")]
     Why {
+        /// Flatten and deduplicate all transitive dependents.
+        #[arg(short = 'a', long)]
+        all: bool,
         /// Installed package name.
         name: String,
     },
@@ -279,14 +286,18 @@ emits root-cause names separated by NUL bytes.")]
     #[command(long_about = "\
 The registry-wide reverse dependency query — who could install this package. \
 Always online (`GET /v1/uses`); the counterpart of `glu why` that works for \
-not-installed packages and isn't limited to this system. Flat output reports \
-packages that directly depend on the query. `-t`/`--tree` requests the complete \
-transitive reverse graph and elides the already-named query while retaining its \
-child branches. `-v` adds each dependent's version floor on the package it \
+not-installed packages and isn't limited to this system. Default output reports \
+packages that directly depend on the query. `-a`/`--all` flattens and \
+deduplicates the complete reverse closure. `-t`/`--tree` renders that closure \
+as a tree and elides the already-named query; combining it with `--all` is \
+equivalent to `--tree`. `-v` adds each dependent's version floor on the package it \
 pulls. Prints `Nothing depends on it.` when the registry has none. `-j`/`--json` \
-emits structured output and `-0`/`--null` emits direct dependent names separated \
-by NUL bytes.")]
+emits structured output and `-0`/`--null` emits the selected dependent names \
+separated by NUL bytes.")]
     Uses {
+        /// Flatten and deduplicate all transitive dependents.
+        #[arg(short = 'a', long)]
+        all: bool,
         /// Package name.
         name: String,
     },

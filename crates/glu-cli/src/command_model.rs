@@ -254,7 +254,7 @@ pub(crate) const GLOBAL_OPTION_SPECS: &[OptionSpec] = &[
         short: Some('t'),
         kind: OptionKind::Bool,
         scope: OptionScope::GlobalPresentation,
-        description: "tree layout when the result has a useful tree representation",
+        description: "preserve graph topology; read queries expand the complete graph",
         conflicts_with: &[],
     },
     OptionSpec {
@@ -290,7 +290,7 @@ const LIST_OPTIONS: &[OptionSpec] = &[
         kind: OptionKind::Bool,
         scope: OptionScope::CommandSelection,
         description: "list declared packages (the default)",
-        conflicts_with: &["--installed", "--all"],
+        conflicts_with: &["--installed", "--all", "--tree"],
     },
     OptionSpec {
         long: "--installed",
@@ -404,11 +404,11 @@ const ACTIVATE_OPTIONS: &[OptionSpec] = &[OptionSpec {
 
 const DEPS_OPTIONS: &[OptionSpec] = &[
     OptionSpec {
-        long: "--direct",
-        short: Some('d'),
+        long: "--all",
+        short: Some('a'),
         kind: OptionKind::Bool,
         scope: OptionScope::CommandSelection,
-        description: "only direct dependencies",
+        description: "flatten and deduplicate the complete dependency closure",
         conflicts_with: &[],
     },
     OptionSpec {
@@ -437,6 +437,15 @@ const DEPS_OPTIONS: &[OptionSpec] = &[
         conflicts_with: &[],
     },
 ];
+
+const QUERY_ALL_OPTIONS: &[OptionSpec] = &[OptionSpec {
+    long: "--all",
+    short: Some('a'),
+    kind: OptionKind::Bool,
+    scope: OptionScope::CommandSelection,
+    description: "flatten and deduplicate the complete transitive closure",
+    conflicts_with: &[],
+}];
 
 const TRACE_SUMMARY_OPTIONS: &[OptionSpec] = &[
     OptionSpec {
@@ -689,7 +698,7 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         group: CommandGroup::Query,
         aliases: &["ls"],
         summary: "List installed packages",
-        default_behavior: "Lists declared packages by default. --installed or --all lists everything installed.",
+        default_behavior: "Lists declared roots by default. --installed or --all flattens the complete installed graph; --tree renders it as a forest.",
         arguments: EMPTY_ARGUMENTS,
         mutates: false,
         default_scope: Some("declared"),
@@ -723,7 +732,7 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         group: CommandGroup::Query,
         aliases: &[],
         summary: "Show what a package depends on",
-        default_behavior: "Shows dependency names only. Uses installed receipts when available unless --online is used; --verbose adds installed versions and package-level minimum requirements.",
+        default_behavior: "Shows direct dependencies by default. --all flattens the complete closure; --tree renders that closure. Uses installed receipts when available unless --online is used.",
         arguments: PACKAGE_NAME_ARGUMENTS,
         mutates: false,
         default_scope: None,
@@ -745,15 +754,20 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         group: CommandGroup::Query,
         aliases: &[],
         summary: "Show why an installed package is needed",
-        default_behavior: "Shows the declared root causes that keep NAME installed.",
+        default_behavior: "Shows declared root causes by default. --all flattens every transitive dependent; --tree renders the complete paths.",
         arguments: PACKAGE_NAME_ARGUMENTS,
         mutates: false,
         default_scope: Some("installed"),
         output_protocols: HUMAN_JSON_NULL,
         capabilities: CAP_TREE,
         result_schema: Some("ReverseDepsResult"),
-        options: EMPTY_OPTIONS,
-        examples: &["glu why glib", "glu why pcre2 -t", "glu why pcre2 -jt"],
+        options: QUERY_ALL_OPTIONS,
+        examples: &[
+            "glu why glib",
+            "glu why pcre2 -a",
+            "glu why pcre2 -t",
+            "glu why pcre2 -jt",
+        ],
         subcommands: EMPTY_COMMANDS,
     },
     CommandSpec {
@@ -762,15 +776,20 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         group: CommandGroup::Query,
         aliases: &[],
         summary: "Show which registry packages depend on a package",
-        default_behavior: "Flat output shows direct registry users; tree output shows complete reverse paths.",
+        default_behavior: "Shows direct registry users by default. --all flattens the complete reverse closure; --tree renders it.",
         arguments: PACKAGE_NAME_ARGUMENTS,
         mutates: false,
         default_scope: Some("registry"),
         output_protocols: HUMAN_JSON_NULL,
         capabilities: CAP_TREE_VERBOSE,
         result_schema: Some("ReverseDepsResult"),
-        options: EMPTY_OPTIONS,
-        examples: &["glu uses pcre2", "glu uses pcre2 -t", "glu uses pcre2 -jt"],
+        options: QUERY_ALL_OPTIONS,
+        examples: &[
+            "glu uses pcre2",
+            "glu uses pcre2 -a",
+            "glu uses pcre2 -t",
+            "glu uses pcre2 -jt",
+        ],
         subcommands: EMPTY_COMMANDS,
     },
     CommandSpec {
@@ -1665,6 +1684,7 @@ pub(crate) struct ReverseDepsOutput {
     pub(crate) source: ReverseDepsSource,
     pub(crate) target: String,
     pub(crate) direct: bool,
+    pub(crate) all: bool,
     pub(crate) root: Option<DependencyTreeNode>,
     pub(crate) statuses:
         std::collections::BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,

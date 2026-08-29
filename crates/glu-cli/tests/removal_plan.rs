@@ -7,11 +7,12 @@ fn glu() -> Command {
 }
 
 #[test]
-fn deps_human_hides_versions_until_verbose() {
+fn deps_default_all_and_tree_follow_progressive_disclosure() {
     let prefix = tempfile::tempdir().unwrap();
     write_declaration(prefix.path(), &[("root", "1.0")]);
     write_receipt(prefix.path(), "root", "1.0", &["dep"]);
-    write_receipt(prefix.path(), "dep", "1.0", &[]);
+    write_receipt(prefix.path(), "dep", "1.0", &["leaf"]);
+    write_receipt(prefix.path(), "leaf", "1.0", &[]);
 
     assert_eq!(human_command(prefix.path(), &["deps", "root"]), "dep\n");
     assert_eq!(
@@ -19,12 +20,97 @@ fn deps_human_hides_versions_until_verbose() {
         "dep (1.0 installed)\n"
     );
     assert_eq!(
+        human_command(prefix.path(), &["deps", "root", "--all"]),
+        "dep\nleaf\n"
+    );
+    assert_eq!(
         human_command(prefix.path(), &["deps", "root", "-t"]),
-        "└── dep\n"
+        "└── dep\n    └── leaf\n"
     );
     assert_eq!(
         human_command(prefix.path(), &["deps", "root", "-tv"]),
-        "└── dep (requires >= 1.0; 1.0 installed)\n"
+        concat!(
+            "└── dep (requires >= 1.0; 1.0 installed)\n",
+            "    └── leaf (requires >= 1.0; 1.0 installed)\n",
+        )
+    );
+    assert_eq!(
+        human_command(prefix.path(), &["deps", "root", "--all", "--tree"]),
+        human_command(prefix.path(), &["deps", "root", "--tree"])
+    );
+
+    let summary = json_command(prefix.path(), &["deps", "root", "--json"]);
+    assert_eq!(names(&summary["result"]["dependencies"]), vec!["dep"]);
+    let all = json_command(prefix.path(), &["deps", "root", "--all", "--json"]);
+    assert_eq!(names(&all["result"]["dependencies"]), vec!["dep", "leaf"]);
+    assert_eq!(
+        json_command(
+            prefix.path(),
+            &["deps", "root", "--all", "--tree", "--json"]
+        ),
+        json_command(prefix.path(), &["deps", "root", "--tree", "--json"])
+    );
+}
+
+#[test]
+fn list_tree_covers_the_complete_graph_and_all_is_redundant() {
+    let prefix = tempfile::tempdir().unwrap();
+    write_declaration(prefix.path(), &[("root", "1.0")]);
+    write_receipt(prefix.path(), "root", "1.0", &["dep"]);
+    write_receipt(prefix.path(), "dep", "1.0", &[]);
+    write_receipt(prefix.path(), "orphan", "1.0", &[]);
+
+    assert_eq!(human_command(prefix.path(), &["list"]), "root 1.0\n");
+    assert_eq!(
+        human_command(prefix.path(), &["list", "--all"]),
+        "dep 1.0\norphan 1.0\nroot 1.0\n"
+    );
+
+    let tree = human_command(prefix.path(), &["list", "--tree"]);
+    assert_eq!(tree, "orphan 1.0\nroot 1.0\n└── dep 1.0\n");
+    assert_eq!(
+        human_command(prefix.path(), &["list", "--all", "--tree"]),
+        tree
+    );
+    assert_eq!(
+        json_command(prefix.path(), &["list", "--all", "--tree", "--json"]),
+        json_command(prefix.path(), &["list", "--tree", "--json"])
+    );
+}
+
+#[test]
+fn why_default_all_and_tree_follow_progressive_disclosure() {
+    let prefix = tempfile::tempdir().unwrap();
+    write_declaration(prefix.path(), &[("root", "1.0")]);
+    write_receipt(prefix.path(), "root", "1.0", &["mid"]);
+    write_receipt(prefix.path(), "mid", "1.0", &["target"]);
+    write_receipt(prefix.path(), "target", "1.0", &[]);
+
+    assert_eq!(
+        human_command(prefix.path(), &["why", "target"]),
+        "root 1.0\n"
+    );
+    assert_eq!(
+        human_command(prefix.path(), &["why", "target", "--all"]),
+        "mid 1.0\nroot 1.0\n"
+    );
+    let tree = human_command(prefix.path(), &["why", "target", "--tree"]);
+    assert_eq!(tree, "└── mid 1.0\n    └── root 1.0\n");
+    assert_eq!(
+        human_command(prefix.path(), &["why", "target", "--all", "--tree"]),
+        tree
+    );
+
+    let summary = json_command(prefix.path(), &["why", "target", "--json"]);
+    assert_eq!(names(&summary["result"]["dependents"]), vec!["root"]);
+    let all = json_command(prefix.path(), &["why", "target", "--all", "--json"]);
+    assert_eq!(names(&all["result"]["dependents"]), vec!["mid", "root"]);
+    assert_eq!(
+        json_command(
+            prefix.path(),
+            &["why", "target", "--all", "--tree", "--json"]
+        ),
+        json_command(prefix.path(), &["why", "target", "--tree", "--json"])
     );
 }
 
