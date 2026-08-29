@@ -834,6 +834,7 @@ pub(crate) fn reinstall_plan_output(
             .collect(),
         requires_confirmation: plan.requires_confirmation,
         would_download_bytes: plan.would_download_bytes,
+        dependency_tree: plan.dependency_tree(),
     }
 }
 
@@ -1453,6 +1454,7 @@ pub(crate) fn render_update_preflight(plan: &glu_client::install::UpdatePlan) {
 
 pub(crate) fn render_update_execution_plan(plan: &glu_client::install::UpdatePlan, tree: bool) {
     let update_tree = plan.dependency_tree();
+    let requested = plan.resolved_root_keys();
     let changes: Vec<_> = plan
         .to_update
         .iter()
@@ -1470,7 +1472,7 @@ pub(crate) fn render_update_execution_plan(plan: &glu_client::install::UpdatePla
             .iter()
             .map(|update| {
                 PackageListItem::update(&update.name.0, &update.current, &update.latest)
-                    .emphasized(update.direct == Some(true))
+                    .emphasized(requested.contains(&update.package_key))
             })
             .collect();
         package_list::print_section("Will update", &items);
@@ -1582,9 +1584,10 @@ fn render_reinstall_plan_output(plan: &ReinstallPlanOutput, globals: &GlobalOpti
         println!("Nothing to do.");
         return;
     }
-    print_package_section("Would reinstall", &plan.would_reinstall);
-    print_package_section("Already satisfied", &plan.satisfied);
-    print_rename_section("Would rename", &plan.would_rename);
+    let requested = dependency_root_keys(&plan.dependency_tree);
+    print_install_package_section("Would reinstall", &plan.would_reinstall, &requested);
+    print_install_package_section("Already satisfied", &plan.satisfied, &requested);
+    print_install_rename_section("Would rename", &plan.would_rename, &requested);
     print_package_section("Would remove", &plan.would_remove);
     print_would_download(plan.would_download_bytes);
 }
@@ -1673,7 +1676,12 @@ fn render_update_plan_output(plan: &UpdatePlanOutput, globals: &GlobalOptions) {
                     .collect::<Vec<_>>(),
             );
         if !rendered_tree {
-            let updates: Vec<_> = plan.would_update.iter().map(update_list_item).collect();
+            let requested = dependency_root_keys(&plan.dependency_tree);
+            let updates: Vec<_> = plan
+                .would_update
+                .iter()
+                .map(|update| update_list_item(update, &requested))
+                .collect();
             package_list::print_section("Would update", &updates);
         }
         print_package_section("Would remove", &plan.would_remove);
@@ -1706,9 +1714,9 @@ fn print_mutation_plan(
     print_package_section("Would remove", removals);
 }
 
-fn update_list_item(update: &UpdatePackageRecord) -> PackageListItem {
+fn update_list_item(update: &UpdatePackageRecord, requested: &BTreeSet<String>) -> PackageListItem {
     PackageListItem::update(&update.name, &update.current, &update.latest)
-        .emphasized(update.direct == Some(true))
+        .emphasized(requested.contains(&update.package_key))
 }
 
 fn print_package_section(heading: &str, packages: &[MutationPackageRecord]) {
@@ -1762,14 +1770,6 @@ fn print_install_rename_section(
             PackageListItem::rename(&rename.old_name, &rename.new_name, &rename.version)
                 .emphasized(requested.contains(&rename.package_key))
         })
-        .collect();
-    package_list::print_section(heading, &items);
-}
-
-fn print_rename_section(heading: &str, renames: &[RenamePackageRecord]) {
-    let items: Vec<_> = renames
-        .iter()
-        .map(|rename| PackageListItem::rename(&rename.old_name, &rename.new_name, &rename.version))
         .collect();
     package_list::print_section(heading, &items);
 }
@@ -3050,7 +3050,7 @@ mod tests {
     }
 
     #[test]
-    fn install_plan_emphasizes_only_resolved_roots() {
+    fn mutation_plans_emphasize_only_resolved_roots() {
         fn mutation(name: &str, direct: bool) -> MutationPackageRecord {
             MutationPackageRecord {
                 package_key: Some(format!("package:{name}")),
@@ -3090,6 +3090,30 @@ mod tests {
         assert!(items[0].emphasized);
         assert!(!items[1].emphasized);
         assert!(items[2].emphasized);
+
+        fn update(name: &str, direct: bool) -> UpdatePackageRecord {
+            UpdatePackageRecord {
+                package_key: format!("package:{name}"),
+                name: name.to_string(),
+                current: "1.0".to_string(),
+                latest: "2.0".to_string(),
+                status: MutationStatus::WouldUpdate,
+                installed: None,
+                linked: None,
+                declared: None,
+                deactivated: None,
+                direct: Some(direct),
+                transitive: Some(!direct),
+                cached: None,
+                download_bytes: None,
+                installed_bytes: None,
+            }
+        }
+
+        let requested_update = update("requested-a", false);
+        let immediate_dependency = update("immediate-dependency", true);
+        assert!(update_list_item(&requested_update, &requested).emphasized);
+        assert!(!update_list_item(&immediate_dependency, &requested).emphasized);
     }
 
     #[test]
@@ -3305,6 +3329,7 @@ mod tests {
             would_remove: Vec::new(),
             requires_confirmation: false,
             would_download_bytes: None,
+            dependency_tree: Vec::new(),
         };
         assert_result_valid("ReinstallResult", &ReinstallResult::Plan(&reinstall_plan));
 

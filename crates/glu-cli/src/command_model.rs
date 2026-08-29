@@ -1793,6 +1793,8 @@ pub(crate) struct ReinstallPlanOutput {
     pub(crate) would_remove: Vec<MutationPackageRecord>,
     pub(crate) requires_confirmation: bool,
     pub(crate) would_download_bytes: Option<u64>,
+    #[serde(skip)]
+    pub(crate) dependency_tree: Vec<DependencyTreeNode>,
 }
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]

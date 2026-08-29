@@ -701,6 +701,19 @@ impl UpdatePlan {
             .map(dependency_forest_from_manifest)
             .unwrap_or_default()
     }
+
+    pub fn resolved_root_keys(&self) -> BTreeSet<glu_core::PackageKey> {
+        self.manifest
+            .as_ref()
+            .map(|manifest| {
+                manifest
+                    .roots
+                    .iter()
+                    .map(|root| root.package_key.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug)]
