@@ -543,6 +543,7 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
             online,
         } => {
             let query = client.query_state(events.as_ref())?;
+            let target = name.clone();
             let selector = PackageSelector(name);
             let queries_registry = online || query.resolve_selector(&selector).is_none();
             let view = while_resolving(
@@ -551,7 +552,7 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
             )
             .await??;
             final_output = Some(CommandOutput::Deps(output::deps_output(
-                view, direct, status,
+                view, target, direct, status,
             )));
         }
         Command::Why { name } => {

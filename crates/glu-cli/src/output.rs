@@ -296,6 +296,7 @@ pub(crate) fn status_output(client: &GluClient, query: &LocalQuery) -> Result<St
 
 pub(crate) fn deps_output(
     view: glu_client::deps::DepsView,
+    target: String,
     direct: bool,
     status: bool,
 ) -> DepsOutput {
@@ -304,6 +305,7 @@ pub(crate) fn deps_output(
         glu_client::deps::DepsSource::Resolved => DepsSource::Resolved,
     };
     DepsOutput {
+        target,
         source,
         installed: view.installed,
         direct,
@@ -316,24 +318,22 @@ pub(crate) fn deps_output(
 fn render_deps_output(deps: &DepsOutput, globals: &GlobalOptions) {
     if globals.is_json() {
         let result = if globals.tree {
-            let root = if deps.direct {
-                direct_only_root(&deps.root)
-            } else {
-                deps.root.clone()
-            };
             DepsResult::Tree(DepsTreeResult {
+                target: deps.target.clone(),
                 source: deps.source,
                 installed: deps.installed,
                 direct: deps.direct,
                 view: TreeView::Tree,
-                graph: dependency_graph_json(
-                    std::slice::from_ref(&root),
+                graph: dependency_graph_json_at_depth(
+                    &deps.root.children,
                     deps.direct,
+                    1,
                     &deps.statuses,
                 ),
             })
         } else {
             DepsResult::Flat(DepsFlatResult {
+                target: deps.target.clone(),
                 dependencies: dependency_records(&deps.root.children, deps.direct, &deps.statuses),
                 direct: deps.direct,
                 installed: deps.installed,
@@ -355,7 +355,11 @@ fn render_deps_output(deps: &DepsOutput, globals: &GlobalOptions) {
     }
 
     if globals.tree {
-        print_deps_tree(&deps.root, &deps.statuses, deps.direct, globals.verbose);
+        if deps.root.children.is_empty() {
+            println!("No dependencies.");
+        } else {
+            print_deps_tree(&deps.root, &deps.statuses, deps.direct, globals.verbose);
+        }
         if deps.status {
             print_dependency_status(
                 &dependency_records(&deps.root.children, deps.direct, &deps.statuses),
@@ -513,14 +517,6 @@ fn collect_why_nodes(
     }
 }
 
-fn direct_only_root(root: &DependencyTreeNode) -> DependencyTreeNode {
-    let mut root = root.clone();
-    for child in &mut root.children {
-        child.children.clear();
-    }
-    root
-}
-
 #[derive(serde::Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 enum DepsResult {
@@ -530,6 +526,7 @@ enum DepsResult {
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
 struct DepsFlatResult {
+    target: String,
     dependencies: Vec<DependencyRecord>,
     direct: bool,
     installed: bool,
@@ -2322,6 +2319,17 @@ fn print_deps_tree(
     direct: bool,
     verbose: bool,
 ) {
+    for line in deps_tree_lines(root, statuses, direct, verbose) {
+        println!("{line}");
+    }
+}
+
+fn deps_tree_lines(
+    root: &DependencyTreeNode,
+    statuses: &BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
+    direct: bool,
+    verbose: bool,
+) -> Vec<String> {
     fn local_versions(
         node: &DependencyTreeNode,
         statuses: &BTreeMap<glu_core::PackageKey, glu_client::deps::PackageStatus>,
@@ -2345,17 +2353,21 @@ fn print_deps_tree(
     }
 
     let root = local_versions(root, statuses, verbose);
+    let mut dependencies = root.children;
+    if direct {
+        for dependency in &mut dependencies {
+            dependency.children.clear();
+        }
+    }
     let options = TreeRenderOptions {
         decorated: true,
-        direct,
+        direct: false,
         verbose,
         show_versions: verbose,
         version_label: Some("installed"),
         root_style: RootStyle::SiblingBranches,
     };
-    for line in render_dependency_tree(std::slice::from_ref(&root), options) {
-        println!("{line}");
-    }
+    render_dependency_tree(&dependencies, options)
 }
 
 fn dependency_status_parts(record: &DependencyRecord) -> Vec<&'static str> {
@@ -2428,6 +2440,7 @@ struct ListTreeResult {
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
 struct DepsTreeResult {
+    target: String,
     source: DepsSource,
     installed: bool,
     direct: bool,
@@ -3012,6 +3025,30 @@ mod tests {
     }
 
     #[test]
+    fn deps_tree_elides_the_query_and_retains_dependency_branches() {
+        let leaf = node("timg", "1.6.3", Vec::new());
+        assert!(deps_tree_lines(&leaf, &BTreeMap::new(), false, false).is_empty());
+
+        let root = node(
+            "rust",
+            "1.98.0",
+            vec![node(
+                "libgit2",
+                "1.9.7",
+                vec![node("libssh2", "1.11.1", Vec::new())],
+            )],
+        );
+        assert_eq!(
+            deps_tree_lines(&root, &BTreeMap::new(), false, false),
+            vec!["└── libgit2", "    └── libssh2"]
+        );
+        assert_eq!(
+            deps_tree_lines(&root, &BTreeMap::new(), true, false),
+            vec!["└── libgit2"]
+        );
+    }
+
+    #[test]
     fn install_plan_emphasizes_only_resolved_roots() {
         fn mutation(name: &str, direct: bool) -> MutationPackageRecord {
             MutationPackageRecord {
@@ -3147,6 +3184,7 @@ mod tests {
         assert_result_valid(
             "DepsResult",
             &DepsResult::Flat(DepsFlatResult {
+                target: "root".to_string(),
                 dependencies: Vec::new(),
                 direct: false,
                 installed: true,
@@ -3157,6 +3195,7 @@ mod tests {
         assert_result_valid(
             "DepsResult",
             &DepsResult::Tree(DepsTreeResult {
+                target: "root".to_string(),
                 source: DepsSource::Resolved,
                 installed: false,
                 direct: false,

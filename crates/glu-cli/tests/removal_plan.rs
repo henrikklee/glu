@@ -20,14 +20,11 @@ fn deps_human_hides_versions_until_verbose() {
     );
     assert_eq!(
         human_command(prefix.path(), &["deps", "root", "-t"]),
-        "└── root\n    └── dep\n"
+        "└── dep\n"
     );
     assert_eq!(
         human_command(prefix.path(), &["deps", "root", "-tv"]),
-        concat!(
-            "└── root (1.0 installed)\n",
-            "    └── dep (requires >= 1.0; 1.0 installed)\n",
-        )
+        "└── dep (requires >= 1.0; 1.0 installed)\n"
     );
 }
 

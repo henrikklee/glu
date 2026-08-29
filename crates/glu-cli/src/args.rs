@@ -239,8 +239,9 @@ receipts (offline); not-installed ones resolve from the registry, marked \
 `resolved from the registry — not installed`. `-o`/`--online` forces the \
 registry answer for an installed package (what a fresh install would pull) — \
 the two can differ. Human output lists names only by default. `-d`/`--direct` \
-limits to one level, `-t`/`--tree` draws the nested tree, and `-v` annotates \
-packages as `(VERSION installed)` plus each tree edge's declared requirement; resolver \
+limits to one level. `-t`/`--tree` elides the already-named query while \
+retaining dependency branches and reports `No dependencies.` for a leaf. `-v` \
+annotates packages as `(VERSION installed)` plus each tree edge's declared requirement; resolver \
 candidate versions are never presented as dependency requirements. `--status` \
 annotates human output with installed/declared/link state. Unknown names get \
 friendly `package 'X' not found` errors with `Did you mean …?` suggestions.")]

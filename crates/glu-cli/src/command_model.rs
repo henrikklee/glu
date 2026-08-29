@@ -1643,6 +1643,7 @@ pub(crate) enum ListView {
 }
 
 pub(crate) struct DepsOutput {
+    pub(crate) target: String,
     pub(crate) source: DepsSource,
     pub(crate) installed: bool,
     pub(crate) direct: bool,
