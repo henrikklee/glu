@@ -76,6 +76,21 @@ fn list_tree_covers_the_complete_graph_and_all_is_redundant() {
         json_command(prefix.path(), &["list", "--all", "--tree", "--json"]),
         json_command(prefix.path(), &["list", "--tree", "--json"])
     );
+
+    assert_eq!(
+        human_command(prefix.path(), &["list", "--declared", "--tree"]),
+        "root 1.0\n└── dep 1.0\n"
+    );
+    let declared_tree = json_command(prefix.path(), &["list", "--declared", "--tree", "--json"]);
+    assert_eq!(declared_tree["result"]["scope"], "declared");
+    assert_eq!(
+        declared_tree["result"]["roots"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        declared_tree["result"]["nodes"].as_object().unwrap().len(),
+        2
+    );
 }
 
 #[test]

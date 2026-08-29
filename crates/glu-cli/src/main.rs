@@ -499,7 +499,7 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
             all,
         } => {
             let query = client.query_state(events.as_ref())?;
-            let installed_scope = globals.tree || installed || all;
+            let installed_scope = (globals.tree && !explicit_declared) || installed || all;
             let statuses = if null {
                 BTreeMap::new()
             } else {
@@ -511,7 +511,11 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                 ListScope::Declared
             };
             let view = if globals.tree {
-                ListView::Tree(query.list_tree_all())
+                ListView::Tree(if explicit_declared {
+                    query.list_tree()
+                } else {
+                    query.list_tree_all()
+                })
             } else if installed_scope {
                 ListView::Flat(query.list())
             } else {

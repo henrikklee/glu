@@ -290,7 +290,7 @@ const LIST_OPTIONS: &[OptionSpec] = &[
         kind: OptionKind::Bool,
         scope: OptionScope::CommandSelection,
         description: "list declared packages (the default)",
-        conflicts_with: &["--installed", "--all", "--tree"],
+        conflicts_with: &["--installed", "--all"],
     },
     OptionSpec {
         long: "--installed",
@@ -698,7 +698,7 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         group: CommandGroup::Query,
         aliases: &["ls"],
         summary: "List installed packages",
-        default_behavior: "Lists declared roots by default. --installed or --all flattens the complete installed graph; --tree renders it as a forest.",
+        default_behavior: "Lists declared roots by default. --installed or --all flattens the complete installed graph; --tree renders it as a forest; explicit --declared limits that forest to declared-root reachability.",
         arguments: EMPTY_ARGUMENTS,
         mutates: false,
         default_scope: Some("declared"),

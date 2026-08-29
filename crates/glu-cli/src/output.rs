@@ -2394,7 +2394,8 @@ fn dependency_status_parts(record: &DependencyRecord) -> Vec<&'static str> {
 
 /// `glu ls --tree`: complete installed forest. Declared packages are natural
 /// roots and dangling components are supplemental roots. `--all --tree` is
-/// equivalent. Explicit tree output keeps branch structure even when piped;
+/// equivalent; explicit `--declared --tree` excludes components unreachable
+/// from declared roots. Tree output keeps branch structure even when piped;
 /// ANSI styling is still terminal-gated by the style layer.
 pub(crate) fn print_list_tree(tree: &[DependencyTreeNode]) {
     let options = TreeRenderOptions {

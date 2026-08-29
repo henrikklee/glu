@@ -194,13 +194,14 @@ Default: declared packages — \"what did I install?\" — with a hint \
 to view all dependencies on terminals. `--installed`/`-a`/`--all` flattens \
 and deduplicates the complete installed graph. `-t`/`--tree` renders that \
 complete graph as a forest; combining `--all` and `--tree` is equivalent to \
-`--tree`. `-j`/`--json` and `-0`/`--null` emit machine-readable output; combined \
+`--tree`. Explicit `--declared --tree` instead limits the forest to components \
+reachable from declared roots. `-j`/`--json` and `-0`/`--null` emit machine-readable output; combined \
 with `-t`, JSON preserves the nested tree and NUL emits tree node names. \
 Flat output is plain `name version` lines — safe for `xargs`."
     )]
     List {
         /// Explicitly list only declared packages (the default).
-        #[arg(long, conflicts_with_all = ["all", "installed", "tree"])]
+        #[arg(long, conflicts_with_all = ["all", "installed"])]
         declared: bool,
         /// List every installed package. Alias: --all / -a.
         #[arg(long)]
