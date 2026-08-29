@@ -566,8 +566,9 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                 statuses: view.statuses,
             }));
         }
-        Command::Uses { name, direct } => {
+        Command::Uses { name } => {
             let selector = PackageSelector(name.clone());
+            let direct = !tree;
             let statuses = if null {
                 BTreeMap::new()
             } else {

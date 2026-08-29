@@ -143,6 +143,8 @@ It is the registry-wide counterpart to local `why`:
 - `why` uses installed receipts;
 - `uses` uses registry dependency data.
 
+The CLI requests `direct=true` for flat, JSON-flat, and NUL views. Tree views request the complete reverse closure, elide the already-named target, and retain target-relative branch and depth information.
+
 ## Errors
 
 Registry errors are structured so the client can produce useful messages.

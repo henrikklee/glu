@@ -276,17 +276,16 @@ emits root-cause names separated by NUL bytes.")]
 
     /// Reverse dependency tree from the registry: who could install this.
     #[command(long_about = "\
-The registry-wide reverse dependency tree — who could install this package. \
+The registry-wide reverse dependency query — who could install this package. \
 Always online (`GET /v1/uses`); the counterpart of `glu why` that works for \
-not-installed packages and isn't limited to this system. `-d`/`--direct` \
-limits to one-hop dependents, `-t`/`--tree` the nested view, `-v` each \
-dependent's version floor on the package it pulls. Prints `Nothing depends \
-on it.` when the registry has none. `-j`/`--json` emits structured output and \
-`-0`/`--null` emits flat dependent names separated by NUL bytes.")]
+not-installed packages and isn't limited to this system. Flat output reports \
+packages that directly depend on the query. `-t`/`--tree` requests the complete \
+transitive reverse graph and elides the already-named query while retaining its \
+child branches. `-v` adds each dependent's version floor on the package it \
+pulls. Prints `Nothing depends on it.` when the registry has none. `-j`/`--json` \
+emits structured output and `-0`/`--null` emits direct dependent names separated \
+by NUL bytes.")]
     Uses {
-        /// Only the packages that directly depend on it (one hop).
-        #[arg(short = 'd', long)]
-        direct: bool,
         /// Package name.
         name: String,
     },

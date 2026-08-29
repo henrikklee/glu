@@ -382,9 +382,7 @@ fn render_reverse_deps_output(reverse: &ReverseDepsOutput, globals: &GlobalOptio
     if globals.is_json() {
         let result = if globals.tree {
             let (roots, initial_depth) = match &reverse.root {
-                Some(root) if is_why => (root.children.clone(), 1),
-                Some(root) if reverse.direct => (vec![direct_only_root(root)], 0),
-                Some(root) => (vec![root.clone()], 0),
+                Some(root) => (root.children.clone(), 1),
                 None => (Vec::new(), 0),
             };
             ReverseDepsResult::Tree(ReverseDepsTreeResult {
@@ -447,11 +445,7 @@ fn render_reverse_deps_output(reverse: &ReverseDepsOutput, globals: &GlobalOptio
     if root.children.is_empty() {
         println!("Nothing depends on it.");
     } else if globals.tree {
-        if is_why {
-            print_tree_roots(&root.children, reverse.direct, globals.verbose);
-        } else {
-            print_tree_roots(std::slice::from_ref(root), reverse.direct, globals.verbose);
-        }
+        print_tree_roots(&root.children, reverse.direct, globals.verbose);
     } else {
         let items = if is_why {
             why_root_cause_records(root, &reverse.statuses)

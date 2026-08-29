@@ -438,15 +438,6 @@ const DEPS_OPTIONS: &[OptionSpec] = &[
     },
 ];
 
-const USES_OPTIONS: &[OptionSpec] = &[OptionSpec {
-    long: "--direct",
-    short: Some('d'),
-    kind: OptionKind::Bool,
-    scope: OptionScope::CommandSelection,
-    description: "only direct dependents",
-    conflicts_with: &[],
-}];
-
 const TRACE_SUMMARY_OPTIONS: &[OptionSpec] = &[
     OptionSpec {
         long: "--all",
@@ -771,15 +762,15 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         group: CommandGroup::Query,
         aliases: &[],
         summary: "Show which registry packages depend on a package",
-        default_behavior: "Shows registry packages that depend on NAME.",
+        default_behavior: "Flat output shows direct registry users; tree output shows complete reverse paths.",
         arguments: PACKAGE_NAME_ARGUMENTS,
         mutates: false,
         default_scope: Some("registry"),
         output_protocols: HUMAN_JSON_NULL,
         capabilities: CAP_TREE_VERBOSE,
         result_schema: Some("ReverseDepsResult"),
-        options: USES_OPTIONS,
-        examples: &["glu uses pcre2", "glu uses pcre2 -d", "glu uses pcre2 -jt"],
+        options: EMPTY_OPTIONS,
+        examples: &["glu uses pcre2", "glu uses pcre2 -t", "glu uses pcre2 -jt"],
         subcommands: EMPTY_COMMANDS,
     },
     CommandSpec {
