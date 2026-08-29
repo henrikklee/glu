@@ -264,9 +264,9 @@ friendly `package 'X' not found` errors with `Did you mean …?` suggestions.")]
     #[command(long_about = "\
 Explain why an installed package is needed. Offline only \
 (receipts). Flat output reports the declared root cause or causes rather than \
-every intermediate dependent. `-t`/`--tree` shows a rootless forest of the \
-paths from immediate dependents to those roots; the queried package is omitted \
-because it is already named by the command. Prints `Nothing depends on it.` \
+every intermediate dependent. `-t`/`--tree` elides the already-named queried \
+package while retaining its child branches, showing paths from immediate \
+dependents to declared roots. Prints `Nothing depends on it.` \
 when nobody does. `-j`/`--json` emits structured output and `-0`/`--null` \
 emits root-cause names separated by NUL bytes.")]
     Why {

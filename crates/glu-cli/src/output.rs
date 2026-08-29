@@ -448,7 +448,7 @@ fn render_reverse_deps_output(reverse: &ReverseDepsOutput, globals: &GlobalOptio
         println!("Nothing depends on it.");
     } else if globals.tree {
         if is_why {
-            print_tree_forest(&root.children, reverse.direct, globals.verbose);
+            print_tree_roots(&root.children, reverse.direct, globals.verbose);
         } else {
             print_tree_roots(std::slice::from_ref(root), reverse.direct, globals.verbose);
         }
@@ -2615,10 +2615,6 @@ pub(crate) fn print_tree_roots(nodes: &[DependencyTreeNode], direct: bool, verbo
     print_dependency_tree(nodes, direct, verbose, RootStyle::SiblingBranches);
 }
 
-fn print_tree_forest(nodes: &[DependencyTreeNode], direct: bool, verbose: bool) {
-    print_dependency_tree(nodes, direct, verbose, RootStyle::Plain);
-}
-
 fn print_dependency_tree(
     nodes: &[DependencyTreeNode],
     direct: bool,
@@ -3002,7 +2998,7 @@ mod tests {
     }
 
     #[test]
-    fn why_tree_json_is_a_rootless_forest_with_target_relative_depths() {
+    fn why_tree_json_elides_target_with_target_relative_depths() {
         let root = node(
             "nss",
             "3.127",
