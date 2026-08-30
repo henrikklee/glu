@@ -200,6 +200,7 @@ impl InstallPlan {
 #[derive(Debug, Clone, Default)]
 pub struct InstallSummary {
     pub requested: Vec<PackageSelector>,
+    pub resolved_root_keys: BTreeSet<glu_core::PackageKey>,
     pub installed: Vec<PackageChange>,
     pub satisfied: Vec<PackageChange>,
     pub promoted: Vec<PackageChange>,
@@ -443,6 +444,7 @@ pub async fn execute_install(
     let command_start = plan.command_start;
     let mut summary = InstallSummary {
         requested: plan.requested.clone(),
+        resolved_root_keys: plan.resolved_root_keys(),
         installed: plan
             .would_install
             .iter()

@@ -172,9 +172,10 @@ These sources answer different questions. Output makes the source clear when it 
 `info` reports the registry package's exposure policy. Human output says `global` or `isolated`
 and explains isolated policy when a reason is available. JSON carries the same source-neutral
 `exposure` object. Exposure policy is distinct from whether an installed package was deactivated
-by the user. Install, update, and reinstall plans and results carry the same policy; successful
-human mutations emit one concise explanation for newly installed isolated packages. Flat list JSON
-also uses `exposure` rather than a source-specific boolean.
+by the user. Install, update, and reinstall plans and results carry the same policy. After a
+successful human mutation, isolation notices are limited to resolved requested roots, or declared
+roots for updates; isolated transitive dependencies remain quiet. Flat list JSON also uses
+`exposure` rather than a source-specific boolean.
 
 ## Short flag composition
 

@@ -1804,6 +1804,9 @@ pub(crate) enum PlanMode {
 pub(crate) struct InstallOutput {
     pub(crate) mode: ExecutedMode,
     pub(crate) requested: Vec<String>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) resolved_root_keys: std::collections::BTreeSet<String>,
     pub(crate) installed: Vec<MutationPackageRecord>,
     pub(crate) satisfied: Vec<MutationPackageRecord>,
     pub(crate) promoted: Vec<MutationPackageRecord>,
@@ -1831,6 +1834,9 @@ pub(crate) struct InstallPlanOutput {
 pub(crate) struct ReinstallOutput {
     pub(crate) mode: ExecutedMode,
     pub(crate) requested: Vec<String>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) resolved_root_keys: std::collections::BTreeSet<String>,
     pub(crate) reinstalled: Vec<MutationPackageRecord>,
     pub(crate) satisfied: Vec<MutationPackageRecord>,
     pub(crate) renamed: Vec<RenamePackageRecord>,

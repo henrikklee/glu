@@ -702,6 +702,11 @@ pub(crate) fn install_output(summary: &glu_client::install::InstallSummary) -> I
             .iter()
             .map(|name| name.0.clone())
             .collect(),
+        resolved_root_keys: summary
+            .resolved_root_keys
+            .iter()
+            .map(|key| key.0.clone())
+            .collect(),
         installed: summary
             .installed
             .iter()
@@ -777,6 +782,11 @@ pub(crate) fn reinstall_output(summary: &glu_client::install::InstallSummary) ->
             .requested
             .iter()
             .map(|name| name.0.clone())
+            .collect(),
+        resolved_root_keys: summary
+            .resolved_root_keys
+            .iter()
+            .map(|key| key.0.clone())
             .collect(),
         reinstalled: summary
             .installed
@@ -1613,12 +1623,10 @@ fn render_install_output(install: &InstallOutput, globals: &GlobalOptions) {
         return;
     }
     render_execution_summary(&install.execution, globals);
-    render_isolated_notices(install.installed.iter().filter_map(|package| {
-        package
-            .exposure
-            .as_ref()
-            .map(|exposure| (&package.name, exposure))
-    }));
+    render_isolated_notices(mutation_root_exposures(
+        &install.installed,
+        &install.resolved_root_keys,
+    ));
 }
 
 fn render_install_plan_output(plan: &InstallPlanOutput, globals: &GlobalOptions) {
@@ -1672,12 +1680,10 @@ fn render_reinstall_output(reinstall: &ReinstallOutput, globals: &GlobalOptions)
         return;
     }
     render_execution_summary(&reinstall.execution, globals);
-    render_isolated_notices(reinstall.reinstalled.iter().filter_map(|package| {
-        package
-            .exposure
-            .as_ref()
-            .map(|exposure| (&package.name, exposure))
-    }));
+    render_isolated_notices(mutation_root_exposures(
+        &reinstall.reinstalled,
+        &reinstall.resolved_root_keys,
+    ));
 }
 
 fn render_reinstall_plan_output(plan: &ReinstallPlanOutput, globals: &GlobalOptions) {
@@ -1713,6 +1719,7 @@ fn render_update_output(update: &UpdateOutput, globals: &GlobalOptions) {
         update
             .updates
             .iter()
+            .filter(|package| package.declared == Some(true))
             .map(|package| (&package.name, &package.exposure)),
     );
     if !update.updates.is_empty() || update.broad {
@@ -1723,6 +1730,19 @@ fn render_update_output(update: &UpdateOutput, globals: &GlobalOptions) {
             println!("{hint}");
         }
     }
+}
+
+fn mutation_root_exposures<'a>(
+    packages: &'a [MutationPackageRecord],
+    root_keys: &'a BTreeSet<String>,
+) -> impl Iterator<Item = (&'a String, &'a glu_core::Exposure)> + 'a {
+    packages.iter().filter_map(|package| {
+        let package_key = package.package_key.as_ref()?;
+        let exposure = package.exposure.as_ref()?;
+        root_keys
+            .contains(package_key)
+            .then_some((&package.name, exposure))
+    })
 }
 
 fn render_isolated_notices<'a>(
@@ -1741,15 +1761,10 @@ fn isolated_notice(name: &str, exposure: &glu_core::Exposure) -> Option<String> 
     };
     Some(match reason {
         Some(reason) => format!(
-            "{} is {}: {reason}",
-            glu_client::style::bold(name),
-            glu_client::style::yellow("isolated")
+            "{} installed in isolation · {reason}",
+            glu_client::style::bold(name)
         ),
-        None => format!(
-            "{} is {}.",
-            glu_client::style::bold(name),
-            glu_client::style::yellow("isolated")
-        ),
+        None => format!("{} installed in isolation", glu_client::style::bold(name)),
     })
 }
 
@@ -3385,7 +3400,35 @@ mod tests {
     }
 
     #[test]
-    fn isolated_completion_notices_include_the_reason() {
+    fn isolated_completion_notices_are_limited_to_resolved_roots() {
+        fn installed(name: &str) -> MutationPackageRecord {
+            MutationPackageRecord {
+                package_key: Some(format!("package:{name}")),
+                name: name.to_string(),
+                version: "1.0".to_string(),
+                exposure: Some(glu_core::Exposure::Isolated {
+                    reason: Some("Provided by macOS".to_string()),
+                }),
+                status: MutationStatus::Installed,
+                installed: Some(true),
+                linked: Some(false),
+                declared: Some(false),
+                deactivated: Some(false),
+                direct: Some(false),
+                transitive: Some(true),
+                cached: None,
+                download_bytes: None,
+                installed_bytes: None,
+            }
+        }
+
+        let roots = BTreeSet::from(["package:root".to_string()]);
+        let packages = [installed("root"), installed("dependency")];
+        let noticed: Vec<_> = mutation_root_exposures(&packages, &roots)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(noticed, ["root"]);
+
         assert_eq!(isolated_notice("jq", &glu_core::Exposure::Global), None);
         assert_eq!(
             isolated_notice(
@@ -3395,7 +3438,7 @@ mod tests {
                 },
             )
             .as_deref(),
-            Some("rustup is isolated: Conflicts with rust")
+            Some("rustup installed in isolation · Conflicts with rust")
         );
     }
 
@@ -3642,6 +3685,7 @@ mod tests {
         let install = InstallOutput {
             mode: ExecutedMode::Executed,
             requested: Vec::new(),
+            resolved_root_keys: BTreeSet::new(),
             installed: Vec::new(),
             satisfied: Vec::new(),
             promoted: Vec::new(),
@@ -3671,6 +3715,7 @@ mod tests {
         let reinstall = ReinstallOutput {
             mode: ExecutedMode::Executed,
             requested: Vec::new(),
+            resolved_root_keys: BTreeSet::new(),
             reinstalled: Vec::new(),
             satisfied: Vec::new(),
             renamed: Vec::new(),
