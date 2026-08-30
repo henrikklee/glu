@@ -178,10 +178,10 @@ mod tests {
                 })
                 .collect(),
             dependency_requirements: Default::default(),
+            exposure: glu_core::Exposure::Global,
             artifact: artifact.clone(),
             install: PackageInstallMetadata {
                 opt_names: Vec::new(),
-                keg_only: false,
                 link_overwrite: vec![],
                 post_install_defined: false,
                 post_install_steps: vec![],

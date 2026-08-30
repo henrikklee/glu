@@ -157,7 +157,7 @@ mod tests {
             keg_version: KegVersion("1.0".to_string()),
             keg_path: PathBuf::from(format!("/prefix/Cellar/{name}/1.0")),
             opt_path: PathBuf::from(format!("/prefix/opt/{name}")),
-            keg_only: false,
+            exposure: glu_core::Exposure::Global,
             linked: true,
             deps: deps
                 .iter()

@@ -133,10 +133,10 @@ mod tests {
                     keg_version: KegVersion(version.to_string()),
                     deps: vec![],
                     dependency_requirements: Default::default(),
+                    exposure: glu_core::Exposure::Global,
                     artifact: artifact_id.clone(),
                     install: PackageInstallMetadata {
                         opt_names: Vec::new(),
-                        keg_only: false,
                         link_overwrite: vec![],
                         post_install_defined: false,
                         post_install_steps: vec![],

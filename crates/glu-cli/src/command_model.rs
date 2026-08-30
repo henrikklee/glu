@@ -2035,6 +2035,9 @@ pub(crate) struct MutationPackageRecord {
     pub(crate) package_key: Option<String>,
     pub(crate) name: String,
     pub(crate) version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(required)]
+    pub(crate) exposure: Option<glu_core::Exposure>,
     pub(crate) status: MutationStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(required)]
@@ -2080,6 +2083,7 @@ pub(crate) struct UpdatePackageRecord {
     pub(crate) name: String,
     pub(crate) current: String,
     pub(crate) latest: String,
+    pub(crate) exposure: glu_core::Exposure,
     pub(crate) status: MutationStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(required)]

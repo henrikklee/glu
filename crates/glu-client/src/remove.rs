@@ -459,7 +459,7 @@ mod tests {
             keg_version: KegVersion(keg_version.clone()),
             keg_path: PathBuf::from(format!("/prefix/Cellar/{name}/{keg_version}")),
             opt_path: PathBuf::from(format!("/prefix/opt/{name}")),
-            keg_only: false,
+            exposure: glu_core::Exposure::Global,
             linked: true,
             deps: deps
                 .into_iter()
@@ -525,7 +525,7 @@ mod tests {
                 opt_names: Vec::new(),
             },
             install: ReceiptInstall {
-                keg_only: false,
+                exposure: glu_core::Exposure::Global,
                 linked: false,
                 link_overwrite: Vec::new(),
                 deps: dependencies

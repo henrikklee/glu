@@ -21,7 +21,7 @@ pub enum LinkMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkReport {
     pub prefix_links: usize,
-    pub keg_only: bool,
+    pub isolated: bool,
 }
 
 impl LinkReport {
@@ -78,10 +78,10 @@ pub fn link_keg_with_mode(
 ) -> Result<LinkReport> {
     ensure_link_mode_allowed(prefix, package, mode)?;
     link_opt(prefix, &package.name, &package.opt_names, keg)?;
-    if package.keg_only {
+    if package.exposure.is_isolated() {
         return Ok(LinkReport {
             prefix_links: 0,
-            keg_only: true,
+            isolated: true,
         });
     }
 
@@ -91,7 +91,7 @@ pub fn link_keg_with_mode(
             mark_linked(prefix, &package.name, keg)?;
             Ok(LinkReport {
                 prefix_links: count,
-                keg_only: false,
+                isolated: false,
             })
         }
         Err(err) => {
@@ -123,7 +123,7 @@ fn ensure_link_mode_allowed(
     package: &PackageLinkMetadata,
     mode: LinkMode,
 ) -> Result<()> {
-    if mode != LinkMode::Normal || package.keg_only {
+    if mode != LinkMode::Normal || package.exposure.is_isolated() {
         return Ok(());
     }
     if let Some(active) = linked_keg_path(prefix, &package.name) {
@@ -168,7 +168,7 @@ mod tests {
                 .into_iter()
                 .map(|alias| PackageName(alias.to_string()))
                 .collect(),
-            keg_only: false,
+            exposure: glu_core::Exposure::Global,
             link_overwrite: vec![],
         }
     }
@@ -447,22 +447,22 @@ mod tests {
 
         assert_eq!(first.prefix_links, 1);
         assert_eq!(second.prefix_links, 1);
-        assert!(!first.keg_only);
+        assert!(!first.isolated);
     }
 
     #[test]
-    fn link_report_marks_keg_only_without_prefix_links() {
+    fn link_report_marks_isolated_policy_without_prefix_links() {
         let tmp = TempDir::new().unwrap();
         let prefix = Prefix(tmp.path().to_path_buf());
         let mut pkg = package("one", vec![]);
-        pkg.keg_only = true;
+        pkg.exposure = glu_core::Exposure::Isolated { reason: None };
         let keg_path = keg(&prefix, "one");
         touch(&keg_path.join("bin/one"));
 
         let report = link_keg_with_mode(&prefix, &pkg, &keg_path, LinkMode::Normal).unwrap();
 
         assert_eq!(report.prefix_links, 0);
-        assert!(report.keg_only);
+        assert!(report.isolated);
         assert!(prefix.0.join("opt/one").is_symlink());
         assert!(!prefix.0.join("bin/one").exists());
     }
@@ -575,7 +575,7 @@ mod tests {
                 opt_names: Vec::new(),
             },
             install: crate::state::ReceiptInstall {
-                keg_only: false,
+                exposure: glu_core::Exposure::Global,
                 linked,
                 link_overwrite: Vec::new(),
                 deps: Vec::new(),

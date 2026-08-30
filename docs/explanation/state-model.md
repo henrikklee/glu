@@ -75,7 +75,8 @@ Each complete installed keg has a package-local `glu.install-receipt.v1` receipt
 - exact direct dependency selectors and the package's separate, flattened `dependency_requirements` map;
 - keg and opt paths;
 - required filesystem `links.opt_names`;
-- link policy, linked state, and completion status.
+- source-neutral exposure policy and its normalized reason;
+- linked state and completion status.
 
 Selector aliases and filesystem opt-link names are independent facts. An alias can resolve a command without creating a link, and a required link name does not participate in dependency topology.
 
@@ -127,7 +128,9 @@ The installed version stands during promotion. Promotion changes why the package
 
 ## Activation state
 
-Activation is separate from installation.
+Activation is separate from installation and from package exposure. Exposure is registry policy persisted in the receipt; deactivation is user intent persisted in `glu.json`.
+
+An isolated package always keeps its stable opt link and skips automatic shared-prefix projection. Activating it does not override that package policy.
 
 A deactivated package:
 

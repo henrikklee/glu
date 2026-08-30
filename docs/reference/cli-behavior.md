@@ -133,7 +133,7 @@ The internal postinstall worker is the only client path allowed to write process
 
 Mutating commands that support plan mode compute the same state transition as execution, then stop before mutation.
 
-Plan output shows the meaningful transition: install, update, reinstall, promote, rename, remove, keep, satisfy, download size, and confirmation requirement where relevant. In flat human install, update, and reinstall plans, bold names are exactly the resolved roots selected by the invocation; dependency depth metadata does not control emphasis. Package records include local-state and impact annotations when known: `installed`, `linked`, `declared`, `deactivated`, `direct`, `transitive`, `cached`, `download_bytes`, and receipt-backed `installed_bytes`. `glu cleanup --plan` lists package names for cached downloads that match installed-receipt metadata, summarizes unassociated downloads, and reports total reclaimable bytes. `glu purge --plan` lists every installed package, reports known reclaimable installed bytes, and says whether `glu.json` would be removed or preserved.
+Plan output shows the meaningful transition: install, update, reinstall, promote, rename, remove, keep, satisfy, download size, and confirmation requirement where relevant. In flat human install, update, and reinstall plans, bold names are exactly the resolved roots selected by the invocation; dependency depth metadata does not control emphasis. Isolated packages are annotated without adding warning noise to global packages. Package records include exposure plus local-state and impact annotations when known: `installed`, `linked`, `declared`, `deactivated`, `direct`, `transitive`, `cached`, `download_bytes`, and receipt-backed `installed_bytes`. `glu cleanup --plan` lists package names for cached downloads that match installed-receipt metadata, summarizes unassociated downloads, and reports total reclaimable bytes. `glu purge --plan` lists every installed package, reports known reclaimable installed bytes, and says whether `glu.json` would be removed or preserved.
 
 Plan mode is a read-only boundary between decision and execution. Recovery cleanup, lock-protected mutation, and package changes happen only on the execution side. Install and update plans preserve their dependency graph when `--tree` is selected.
 
@@ -172,7 +172,9 @@ These sources answer different questions. Output makes the source clear when it 
 `info` reports the registry package's exposure policy. Human output says `global` or `isolated`
 and explains isolated policy when a reason is available. JSON carries the same source-neutral
 `exposure` object. Exposure policy is distinct from whether an installed package was deactivated
-by the user.
+by the user. Install, update, and reinstall plans and results carry the same policy; successful
+human mutations emit one concise explanation for newly installed isolated packages. Flat list JSON
+also uses `exposure` rather than a source-specific boolean.
 
 ## Short flag composition
 

@@ -473,7 +473,7 @@ fn installed_package_facts_match(
         && installed_oldnames == resolved_oldnames
         && installed_topology == resolved_topology
         && installed.dependency_requirements == package.dependency_requirements
-        && installed.keg_only == package.install.keg_only
+        && installed.exposure == package.exposure
 }
 
 fn root_match(
@@ -718,10 +718,10 @@ mod tests {
                     )
                 })
                 .collect(),
+            exposure: glu_core::Exposure::Global,
             artifact: ArtifactId(format!("art:sha256:{name}")),
             install: PackageInstallMetadata {
                 opt_names: Vec::new(),
-                keg_only: false,
                 link_overwrite: vec![],
                 post_install_defined: false,
                 post_install_steps: vec![],
@@ -856,7 +856,7 @@ mod tests {
             keg_version: KegVersion(version.to_string()),
             keg_path: std::path::PathBuf::from(format!("/prefix/Cellar/{name}/{version}")),
             opt_path: std::path::PathBuf::from(format!("/prefix/opt/{name}")),
-            keg_only: false,
+            exposure: glu_core::Exposure::Global,
             linked: true,
             deps,
             dependency_requirements,
@@ -935,7 +935,7 @@ mod tests {
                 opt_names: Vec::new(),
             },
             install: ReceiptInstall {
-                keg_only: false,
+                exposure: glu_core::Exposure::Global,
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: vec![],
@@ -1007,7 +1007,7 @@ mod tests {
                 opt_names: Vec::new(),
             },
             install: ReceiptInstall {
-                keg_only: false,
+                exposure: glu_core::Exposure::Global,
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: vec![],
@@ -1075,7 +1075,7 @@ mod tests {
                 opt_names: Vec::new(),
             },
             install: ReceiptInstall {
-                keg_only: false,
+                exposure: glu_core::Exposure::Global,
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: vec![],

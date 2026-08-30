@@ -205,7 +205,7 @@ mod tests {
                 opt_names: Vec::new(),
             },
             install: ReceiptInstall {
-                keg_only: false,
+                exposure: glu_core::Exposure::Global,
                 linked: !deactivated,
                 link_overwrite: Vec::new(),
                 deps: Vec::new(),
@@ -330,6 +330,36 @@ mod tests {
         assert!(declaration.deactivated_names().is_empty());
         let receipt = store.read_receipt_for_keg(&keg).unwrap();
         assert!(receipt.install.linked);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activating_an_isolated_package_preserves_policy_without_public_projection() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let prefix = Prefix(dir.path().join("prefix"));
+        write_receipt(&prefix, "foo", true);
+        let keg = prefix.0.join("Cellar/foo/1.0");
+        let store = InstalledStateStore::new(prefix.clone());
+        let mut receipt = store.read_receipt_for_keg(&keg).unwrap();
+        receipt.install.exposure = glu_core::Exposure::Isolated {
+            reason: Some("Conflicts with another package".to_string()),
+        };
+        store.write_receipt_for_keg(&keg, &receipt).unwrap();
+        symlink(&keg, &prefix.0.join("opt/foo"));
+
+        let results =
+            activate_packages(&prefix, vec![PackageSelector("foo".to_string())], false).unwrap();
+
+        assert_eq!(results[0].status, ActivationStatus::Activated);
+        assert!(!prefix.0.join("bin/foo").exists());
+        let receipt = store.read_receipt_for_keg(&keg).unwrap();
+        assert!(receipt.install.linked);
+        assert_eq!(
+            receipt.install.exposure,
+            glu_core::Exposure::Isolated {
+                reason: Some("Conflicts with another package".to_string()),
+            }
+        );
     }
 
     #[test]

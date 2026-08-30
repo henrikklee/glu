@@ -870,6 +870,7 @@ fn update_package_record(
         name: update.name.0.clone(),
         current: update.current.clone(),
         latest: update.latest.clone(),
+        exposure: update.exposure.clone(),
         status,
         installed: update.installed,
         linked: update.linked,
@@ -888,6 +889,7 @@ fn package_change_record(change: &glu_client::install::PackageChange) -> Mutatio
         package_key: Some(change.package_key.0.clone()),
         name: change.name.0.clone(),
         version: change.version.clone(),
+        exposure: Some(change.exposure.clone()),
         status: change.status.into(),
         installed: change.installed,
         linked: change.linked,
@@ -910,6 +912,7 @@ fn plain_mutation_package_record(
         package_key: None,
         name,
         version,
+        exposure: None,
         status,
         installed: None,
         linked: None,
@@ -972,6 +975,7 @@ fn purge_package_record(
         package_key: Some(package.package_key.0.clone()),
         name: package.name.0.clone(),
         version: package.keg_version.0.clone(),
+        exposure: Some(package.exposure.clone()),
         status,
         installed: Some(true),
         linked: Some(package.linked),
@@ -1509,8 +1513,9 @@ pub(crate) fn render_install_execution_plan(
                 })
                 .collect();
             items.extend(plan.would_install.iter().map(|package| {
-                PackageListItem::package(&package.name.0, &package.version)
-                    .emphasized(requested.contains(&package.package_key))
+                let item = PackageListItem::package(&package.name.0, &package.version)
+                    .emphasized(requested.contains(&package.package_key));
+                annotate_exposure(item, &package.exposure)
             }));
             package_list::print_section(&format!("Will {label}"), &items);
         }
@@ -1561,8 +1566,9 @@ pub(crate) fn render_update_execution_plan(plan: &glu_client::install::UpdatePla
             .to_update
             .iter()
             .map(|update| {
-                PackageListItem::update(&update.name.0, &update.current, &update.latest)
-                    .emphasized(requested.contains(&update.package_key))
+                let item = PackageListItem::update(&update.name.0, &update.current, &update.latest)
+                    .emphasized(requested.contains(&update.package_key));
+                annotate_exposure(item, &update.exposure)
             })
             .collect();
         package_list::print_section("Will update", &items);
@@ -1607,6 +1613,12 @@ fn render_install_output(install: &InstallOutput, globals: &GlobalOptions) {
         return;
     }
     render_execution_summary(&install.execution, globals);
+    render_isolated_notices(install.installed.iter().filter_map(|package| {
+        package
+            .exposure
+            .as_ref()
+            .map(|exposure| (&package.name, exposure))
+    }));
 }
 
 fn render_install_plan_output(plan: &InstallPlanOutput, globals: &GlobalOptions) {
@@ -1660,6 +1672,12 @@ fn render_reinstall_output(reinstall: &ReinstallOutput, globals: &GlobalOptions)
         return;
     }
     render_execution_summary(&reinstall.execution, globals);
+    render_isolated_notices(reinstall.reinstalled.iter().filter_map(|package| {
+        package
+            .exposure
+            .as_ref()
+            .map(|exposure| (&package.name, exposure))
+    }));
 }
 
 fn render_reinstall_plan_output(plan: &ReinstallPlanOutput, globals: &GlobalOptions) {
@@ -1691,6 +1709,12 @@ fn render_update_output(update: &UpdateOutput, globals: &GlobalOptions) {
         println!("Already up to date.");
     }
     render_execution_summary(&update.execution, globals);
+    render_isolated_notices(
+        update
+            .updates
+            .iter()
+            .map(|package| (&package.name, &package.exposure)),
+    );
     if !update.updates.is_empty() || update.broad {
         if let Some(hint) = glu_client::outdated::glu_update_hint(
             update.latest_glu_version.as_deref(),
@@ -1699,6 +1723,34 @@ fn render_update_output(update: &UpdateOutput, globals: &GlobalOptions) {
             println!("{hint}");
         }
     }
+}
+
+fn render_isolated_notices<'a>(
+    packages: impl IntoIterator<Item = (&'a String, &'a glu_core::Exposure)>,
+) {
+    for (name, exposure) in packages {
+        if let Some(notice) = isolated_notice(name, exposure) {
+            println!("{notice}");
+        }
+    }
+}
+
+fn isolated_notice(name: &str, exposure: &glu_core::Exposure) -> Option<String> {
+    let glu_core::Exposure::Isolated { reason } = exposure else {
+        return None;
+    };
+    Some(match reason {
+        Some(reason) => format!(
+            "{} is {}: {reason}",
+            glu_client::style::bold(name),
+            glu_client::style::yellow("isolated")
+        ),
+        None => format!(
+            "{} is {}.",
+            glu_client::style::bold(name),
+            glu_client::style::yellow("isolated")
+        ),
+    })
 }
 
 fn render_execution_summary(execution: &ExecutionSummaryRecord, globals: &GlobalOptions) {
@@ -1805,8 +1857,9 @@ fn print_mutation_plan(
 }
 
 fn update_list_item(update: &UpdatePackageRecord, requested: &BTreeSet<String>) -> PackageListItem {
-    PackageListItem::update(&update.name, &update.current, &update.latest)
-        .emphasized(requested.contains(&update.package_key))
+    let item = PackageListItem::update(&update.name, &update.current, &update.latest)
+        .emphasized(requested.contains(&update.package_key));
+    annotate_exposure(item, &update.exposure)
 }
 
 fn print_package_section(heading: &str, packages: &[MutationPackageRecord]) {
@@ -1839,14 +1892,26 @@ fn install_package_items(
     packages
         .iter()
         .map(|package| {
-            PackageListItem::package(&package.name, &package.version).emphasized(
+            let item = PackageListItem::package(&package.name, &package.version).emphasized(
                 package
                     .package_key
                     .as_ref()
                     .is_some_and(|package_key| requested.contains(package_key)),
-            )
+            );
+            match package.exposure.as_ref() {
+                Some(exposure) => annotate_exposure(item, exposure),
+                None => item,
+            }
         })
         .collect()
+}
+
+fn annotate_exposure(item: PackageListItem, exposure: &glu_core::Exposure) -> PackageListItem {
+    if exposure.is_isolated() {
+        item.annotated("isolated")
+    } else {
+        item
+    }
 }
 
 fn print_install_rename_section(
@@ -2831,7 +2896,7 @@ fn print_dependency_tree(
 struct ListRecord {
     name: String,
     version: String,
-    keg_only: bool,
+    exposure: glu_core::Exposure,
     declared: bool,
     active: bool,
 }
@@ -2856,7 +2921,7 @@ pub(crate) fn print_list_json(
             ListRecord {
                 name: package.name.0.clone(),
                 version: package.keg_version.0.clone(),
-                keg_only: package.keg_only,
+                exposure: package.exposure.clone(),
                 declared: status.is_some_and(|status| status.declared),
                 active: !status.is_some_and(|status| status.deactivated),
             }
@@ -3320,12 +3385,28 @@ mod tests {
     }
 
     #[test]
+    fn isolated_completion_notices_include_the_reason() {
+        assert_eq!(isolated_notice("jq", &glu_core::Exposure::Global), None);
+        assert_eq!(
+            isolated_notice(
+                "rustup",
+                &glu_core::Exposure::Isolated {
+                    reason: Some("Conflicts with rust".to_string()),
+                },
+            )
+            .as_deref(),
+            Some("rustup is isolated: Conflicts with rust")
+        );
+    }
+
+    #[test]
     fn mutation_plans_emphasize_only_resolved_roots() {
         fn mutation(name: &str, direct: bool) -> MutationPackageRecord {
             MutationPackageRecord {
                 package_key: Some(format!("package:{name}")),
                 name: name.to_string(),
                 version: "1.0".to_string(),
+                exposure: Some(glu_core::Exposure::Global),
                 status: MutationStatus::WouldInstall,
                 installed: None,
                 linked: None,
@@ -3348,11 +3429,15 @@ mod tests {
             node("requested-b", "1.0", Vec::new()),
         ];
         let requested = dependency_root_keys(&tree);
+        let mut isolated = mutation("requested-b", false);
+        isolated.exposure = Some(glu_core::Exposure::Isolated {
+            reason: Some("Conflicts with another package".to_string()),
+        });
         let items = install_package_items(
             &[
                 mutation("requested-a", false),
                 mutation("immediate-dependency", true),
-                mutation("requested-b", false),
+                isolated,
             ],
             &requested,
         );
@@ -3360,6 +3445,7 @@ mod tests {
         assert!(items[0].emphasized);
         assert!(!items[1].emphasized);
         assert!(items[2].emphasized);
+        assert_eq!(items[2].annotation.as_deref(), Some("isolated"));
 
         fn update(name: &str, direct: bool) -> UpdatePackageRecord {
             UpdatePackageRecord {
@@ -3367,6 +3453,7 @@ mod tests {
                 name: name.to_string(),
                 current: "1.0".to_string(),
                 latest: "2.0".to_string(),
+                exposure: glu_core::Exposure::Global,
                 status: MutationStatus::WouldUpdate,
                 installed: None,
                 linked: None,

@@ -71,7 +71,7 @@ fn write_receipt(prefix: &Path, name: &str, version: &str, installed_bytes: u64)
   "sizes":{{"installed_bytes":{installed_bytes}}},
   "paths":{{"keg":"{}","opt":"{}"}},
   "links":{{"opt_names":[]}},
-  "install":{{"keg_only":false,"linked":false,"link_overwrite":[],"deps":[],"dependency_requirements":{{}}}}
+  "install":{{"exposure":{{"mode":"global"}},"linked":false,"link_overwrite":[],"deps":[],"dependency_requirements":{{}}}}
 }}"#,
         keg.display(),
         opt.display()

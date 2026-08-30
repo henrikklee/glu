@@ -175,7 +175,7 @@ fn write_receipt_at(
             opt_names: PackageLinkMetadata::from(package).opt_names,
         },
         install: ReceiptInstall {
-            keg_only: package.install.keg_only,
+            exposure: package.exposure.clone(),
             linked,
             link_overwrite: package.install.link_overwrite.clone(),
             deps: package
@@ -262,10 +262,10 @@ mod tests {
             keg_version: KegVersion(version.to_string()),
             deps: Vec::<PackageDependency>::new(),
             dependency_requirements: Default::default(),
+            exposure: glu_core::Exposure::Global,
             artifact: ArtifactId(format!("art:test:{name}:{version}")),
             install: PackageInstallMetadata {
                 opt_names: Vec::new(),
-                keg_only: false,
                 link_overwrite: vec![],
                 post_install_defined: false,
                 post_install_steps: vec![],

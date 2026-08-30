@@ -57,7 +57,7 @@ pub(crate) fn simulate_post_install_state(
             keg_version: package.keg_version.clone(),
             keg_path: std::path::PathBuf::new(),
             opt_path: std::path::PathBuf::new(),
-            keg_only: package.install.keg_only,
+            exposure: package.exposure.clone(),
             linked: false,
             deps: package.deps.clone(),
             dependency_requirements: package.dependency_requirements.clone(),
@@ -160,7 +160,7 @@ mod tests {
             keg_version: KegVersion("1.0".to_string()),
             keg_path: PathBuf::new(),
             opt_path: PathBuf::new(),
-            keg_only: false,
+            exposure: glu_core::Exposure::Global,
             linked: true,
             deps: deps
                 .into_iter()
@@ -197,10 +197,10 @@ mod tests {
                     })
                     .collect(),
                 dependency_requirements: Default::default(),
+                exposure: glu_core::Exposure::Global,
                 artifact: ArtifactId(format!("artifact:{name}")),
                 install: PackageInstallMetadata {
                     opt_names: Vec::new(),
-                    keg_only: false,
                     link_overwrite: Vec::new(),
                     post_install_defined: false,
                     post_install_steps: Vec::new(),

@@ -358,7 +358,7 @@ fn write_receipt(prefix: &Path, name: &str, version: &str, deps: &[&str]) {
   }},
   "links":{{"opt_names":[]}},
   "install":{{
-    "keg_only":false,
+    "exposure":{{"mode":"global"}},
     "linked":true,
     "link_overwrite":[],
     "deps":[{deps_json}],

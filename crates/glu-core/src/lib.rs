@@ -116,6 +116,7 @@ pub struct ResolvedPackage {
     /// selected artifact. These constraints belong to the package, not to
     /// its direct dependency edges.
     pub dependency_requirements: BTreeMap<PackageKey, MinimumVersion>,
+    pub exposure: Exposure,
     pub artifact: ArtifactId,
     pub install: PackageInstallMetadata,
 }
@@ -126,7 +127,7 @@ pub struct PackageLinkMetadata {
     /// Additional filesystem opt-link names. These are not selector aliases
     /// and never participate in package identity or graph traversal.
     pub opt_names: Vec<PackageName>,
-    pub keg_only: bool,
+    pub exposure: Exposure,
     pub link_overwrite: Vec<String>,
 }
 
@@ -135,7 +136,7 @@ impl From<&ResolvedPackage> for PackageLinkMetadata {
         Self {
             name: package.name.clone(),
             opt_names: package.install.opt_names.clone(),
-            keg_only: package.install.keg_only,
+            exposure: package.exposure.clone(),
             link_overwrite: package.install.link_overwrite.clone(),
         }
     }
@@ -165,8 +166,6 @@ fn default_true() -> bool {
 pub struct PackageInstallMetadata {
     /// Additional filesystem opt-link names. These are not package selectors.
     pub opt_names: Vec<PackageName>,
-    #[serde(default)]
-    pub keg_only: bool,
     #[serde(default)]
     pub link_overwrite: Vec<String>,
     #[serde(default)]
@@ -290,6 +289,12 @@ pub enum Exposure {
     },
 }
 
+impl Exposure {
+    pub fn is_isolated(&self) -> bool {
+        matches!(self, Self::Isolated { .. })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct InfoDependencies {
     pub direct: u32,
@@ -335,8 +340,7 @@ pub struct InstalledPackage {
     pub keg_version: KegVersion,
     pub keg_path: PathBuf,
     pub opt_path: PathBuf,
-    #[serde(default)]
-    pub keg_only: bool,
+    pub exposure: Exposure,
     #[serde(default)]
     pub linked: bool,
     pub deps: Vec<PackageDependency>,
@@ -355,7 +359,6 @@ mod tests {
     fn package_install_metadata_defaults_postinstall_network_to_homebrew_default() {
         let json = r#"{
             "opt_names": [],
-            "keg_only": false,
             "link_overwrite": [],
             "post_install_defined": false,
             "post_install_steps": []
@@ -380,10 +383,9 @@ mod tests {
     }
 
     #[test]
-    fn package_install_metadata_defaults_omitted_false_and_empty_fields() {
+    fn package_install_metadata_defaults_omitted_empty_fields() {
         let metadata: PackageInstallMetadata = serde_json::from_str(r#"{"opt_names":[]}"#).unwrap();
         assert!(metadata.opt_names.is_empty());
-        assert!(!metadata.keg_only);
         assert!(metadata.link_overwrite.is_empty());
         assert!(!metadata.post_install_defined);
         assert!(metadata.post_install_steps.is_empty());
@@ -419,6 +421,7 @@ mod tests {
             "dependency_requirements":{
                 "package:dep":{"version":"2.0"}
             },
+            "exposure":{"mode":"global"},
             "artifact":"art:sha256:abc",
             "install":{"opt_names":[]}
         }"#;
@@ -430,6 +433,24 @@ mod tests {
             package.dependency_requirements[&PackageKey("package:dep".to_string())].revision,
             None
         );
-        assert!(!package.install.keg_only);
+        assert_eq!(package.exposure, Exposure::Global);
+    }
+
+    #[test]
+    fn resolved_package_requires_exposure() {
+        let json = r#"{
+            "package_key":"package:pkg",
+            "name":"pkg",
+            "aliases":[],
+            "oldnames":[],
+            "version":"1.0",
+            "revision":0,
+            "keg_version":"1.0",
+            "dependency_requirements":{},
+            "artifact":"art:sha256:abc",
+            "install":{"opt_names":[]}
+        }"#;
+        let error = serde_json::from_str::<ResolvedPackage>(json).unwrap_err();
+        assert!(error.to_string().contains("missing field `exposure`"));
     }
 }

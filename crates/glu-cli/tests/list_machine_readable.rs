@@ -60,9 +60,14 @@ fn json_names(prefix: &Path, args: &[&str]) -> Vec<String> {
     let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(value["ok"], true);
     assert_eq!(value["result"]["view"], "flat");
-    let mut names: Vec<String> = value["result"]["packages"]
-        .as_array()
-        .unwrap()
+    let packages = value["result"]["packages"].as_array().unwrap();
+    assert!(packages
+        .iter()
+        .all(|package| package["exposure"]["mode"] == "global"));
+    assert!(packages
+        .iter()
+        .all(|package| package.get("keg_only").is_none()));
+    let mut names: Vec<String> = packages
         .iter()
         .map(|package| package["name"].as_str().unwrap().to_string())
         .collect();
@@ -150,7 +155,7 @@ fn write_receipt(prefix: &Path, name: &str, version: &str, deps: &[&str]) {
   }},
   "links":{{"opt_names":[]}},
   "install":{{
-    "keg_only":false,
+    "exposure":{{"mode":"global"}},
     "linked":true,
     "link_overwrite":[],
     "deps":[{deps_json}],

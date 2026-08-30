@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use glu_core::{
-    ArtifactId, InstalledPackage, KegVersion, MinimumVersion, PackageId, PackageKey,
+    ArtifactId, Exposure, InstalledPackage, KegVersion, MinimumVersion, PackageId, PackageKey,
     PackageLinkMetadata, PackageName, PackageSelector,
 };
 use serde::{Deserialize, Serialize};
@@ -76,7 +76,7 @@ pub struct ReceiptSizes {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReceiptInstall {
-    pub keg_only: bool,
+    pub exposure: Exposure,
     pub linked: bool,
     /// Link overwrite patterns from the resolved package metadata. These are
     /// required to reconstruct activation locally without resolving online.
@@ -102,7 +102,7 @@ impl GluInstallReceipt {
             keg_version: self.package.keg_version.clone(),
             keg_path: self.paths.keg.clone(),
             opt_path: self.paths.opt.clone(),
-            keg_only: self.install.keg_only,
+            exposure: self.install.exposure.clone(),
             linked: self.install.linked,
             // Provider identities are resolved across the complete receipt
             // set by InstalledStateStore. One receipt alone only knows the
@@ -122,7 +122,7 @@ impl GluInstallReceipt {
         PackageLinkMetadata {
             name: self.package.name.clone(),
             opt_names: self.links.opt_names.clone(),
-            keg_only: self.install.keg_only,
+            exposure: self.install.exposure.clone(),
             link_overwrite: self.install.link_overwrite.clone(),
         }
     }
@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn receipt_keeps_requested_dependencies_and_flattened_minimum_versions_separate() {
         let install = ReceiptInstall {
-            keg_only: false,
+            exposure: Exposure::Global,
             linked: true,
             link_overwrite: Vec::new(),
             deps: vec![PackageSelector("llvm@22".to_string())],
@@ -230,6 +230,15 @@ mod tests {
     }
 
     #[test]
+    fn receipt_install_rejects_the_old_boolean_only_shape() {
+        let error = serde_json::from_str::<ReceiptInstall>(
+            r#"{"keg_only":true,"linked":true,"link_overwrite":[],"deps":[],"dependency_requirements":{}}"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("missing field `exposure`"));
+    }
+
+    #[test]
     fn receipt_reader_rejects_unsupported_schema_with_reinstall_guidance() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("receipt.json");
@@ -256,7 +265,7 @@ mod tests {
                 },
                 "paths":{"keg":"/tmp/Cellar/foo/1.0","opt":"/tmp/opt/foo"},
                 "links":{"opt_names":[]},
-                "install":{"keg_only":false,"linked":true}
+                "install":{"exposure":{"mode":"global"},"linked":true}
             }"#,
         )
         .unwrap();
@@ -293,7 +302,7 @@ mod tests {
             },
             "links": { "opt_names": [] },
             "install": {
-                "keg_only": false,
+                "exposure": {"mode": "global"},
                 "linked": true,
                 "link_overwrite": [],
                 "deps": [],

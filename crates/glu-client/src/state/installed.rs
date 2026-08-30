@@ -445,14 +445,14 @@ mod tests {
         name: &str,
         version: &str,
         declared: bool,
-        keg_only: bool,
+        isolated: bool,
     ) {
         write_receipt_status(
             prefix,
             name,
             version,
             declared,
-            keg_only,
+            isolated,
             ReceiptStatus::Complete,
         )
     }
@@ -462,7 +462,7 @@ mod tests {
         name: &str,
         version: &str,
         declared: bool,
-        keg_only: bool,
+        isolated: bool,
         status: ReceiptStatus,
     ) {
         let keg = prefix.join("Cellar").join(name).join(version);
@@ -495,7 +495,11 @@ mod tests {
                 opt_names: Vec::new(),
             },
             install: ReceiptInstall {
-                keg_only,
+                exposure: if isolated {
+                    glu_core::Exposure::Isolated { reason: None }
+                } else {
+                    glu_core::Exposure::Global
+                },
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: vec![],
@@ -566,7 +570,7 @@ mod tests {
             keg_version: KegVersion(version.to_string()),
             keg_path: std::path::PathBuf::from(format!("/prefix/Cellar/{name}/{version}")),
             opt_path: std::path::PathBuf::from(format!("/prefix/opt/{name}")),
-            keg_only: false,
+            exposure: glu_core::Exposure::Global,
             linked: true,
             deps: Vec::new(),
             dependency_requirements: Default::default(),
@@ -587,7 +591,7 @@ mod tests {
             keg_version: KegVersion(version.to_string()),
             keg_path: std::path::PathBuf::from(format!("/prefix/Cellar/{name}/{version}")),
             opt_path: std::path::PathBuf::from(format!("/prefix/opt/{name}")),
-            keg_only: false,
+            exposure: glu_core::Exposure::Global,
             linked: true,
             deps: deps
                 .iter()
@@ -1154,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn list_exposes_keg_only() {
+    fn list_exposes_isolated_policy() {
         let dir = tempfile::tempdir().unwrap();
         let prefix = dir.path().to_path_buf();
         write_receipt(&prefix, "icu4c@78", "78.3", false, true);
@@ -1165,8 +1169,8 @@ mod tests {
             .unwrap();
         let list = state.list();
         assert_eq!(list[0].name.0, "icu4c@78");
-        assert!(list[0].keg_only);
-        assert!(!list[1].keg_only);
+        assert!(list[0].exposure.is_isolated());
+        assert!(!list[1].exposure.is_isolated());
     }
 
     #[test]

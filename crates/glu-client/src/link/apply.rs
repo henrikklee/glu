@@ -261,7 +261,7 @@ mod tests {
         PackageLinkMetadata {
             name: PackageName(name.to_string()),
             opt_names: vec![],
-            keg_only: false,
+            exposure: glu_core::Exposure::Global,
             link_overwrite: vec![],
         }
     }

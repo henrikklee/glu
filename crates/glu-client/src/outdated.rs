@@ -118,7 +118,7 @@ mod tests {
             keg_version: KegVersion(format!("{version}_{revision}")),
             keg_path: Default::default(),
             opt_path: Default::default(),
-            keg_only: false,
+            exposure: glu_core::Exposure::Global,
             linked: true,
             deps: vec![],
             dependency_requirements: Default::default(),

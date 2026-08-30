@@ -28,10 +28,10 @@ fn package_with_steps(steps: Vec<Value>) -> ResolvedPackage {
         keg_version: KegVersion("1.2.3".to_string()),
         deps: Vec::<PackageDependency>::new(),
         dependency_requirements: Default::default(),
+        exposure: glu_core::Exposure::Global,
         artifact: ArtifactId("art:test:fixture".to_string()),
         install: PackageInstallMetadata {
             opt_names: Vec::new(),
-            keg_only: false,
             link_overwrite: vec![],
             post_install_defined: !steps.is_empty(),
             post_install_steps: steps,

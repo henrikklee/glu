@@ -30,7 +30,7 @@ for pkg in confuse:3.2:0 node:22.1.0:0; do
  "package":{"id":"pkg:test/$name@${ver}_${rev}","name":"$name","version":"$ver","revision":$rev,"keg_version":"${ver}_${rev}"},
  "artifact":{"id":"art:test","sha256":"0","bottle_tag":"arm64_sequoia","cellar":":any"},
  "paths":{"keg":"$PREFIX/Cellar/$name/${ver}_${rev}","opt":"$PREFIX/opt/$name"},
- "install":{"keg_only":false,"linked":true,"deps":[]}}
+ "install":{"exposure":{"mode":"global"},"linked":true,"deps":[]}}
 EOF
   ln -sf "$PREFIX/Cellar/$name/${ver}_${rev}" "$PREFIX/opt/$name"
 done

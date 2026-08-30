@@ -104,6 +104,8 @@ Package records advertise selector aliases and old names. The registry gives exa
 
 Old-name transitions are explicit install work. They are not reconstructed independently by individual commands.
 
+Full resolve supplies each package's target-effective `exposure` policy. Global packages are projected through the shared prefix; isolated packages retain their normalized reason and skip that projection. The same authoritative policy flows into planning, linking, and receipts.
+
 Full resolve also supplies `install.opt_names`. These are required filesystem opt-link names. They are separate from selector aliases even when the current registry happens to publish the same spelling in both sets.
 
 ## Info

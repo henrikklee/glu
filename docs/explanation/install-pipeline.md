@@ -93,9 +93,9 @@ The default prefix is:
 /opt/glustore
 ```
 
-Active packages get stable opt links and public prefix links under roots such as `bin`, `sbin`, `lib`, `include`, `share`, `etc`, `var`, and `Frameworks`.
+Active global packages get stable opt links and public prefix links under roots such as `bin`, `sbin`, `lib`, `include`, `share`, `etc`, `var`, and `Frameworks`.
 
-Deactivated packages keep stable opt links but skip public prefix projection.
+Isolated packages always keep stable opt links but skip public prefix projection according to their registry policy. Deactivated packages also skip public projection, but deactivation remains a separate user-controlled state.
 
 Linking owns destination classification. It distinguishes missing paths, same-target links, links into this keg, links into another live keg, stale keg links, non-keg links, real files, and real directories. This keeps retries safe and prevents unrelated prefix state from being removed.
 
@@ -119,7 +119,7 @@ This localizes complexity: package formulas express setup needs, postinstall pla
 
 ## 10. Write installed state
 
-A package counts as installed only after required commit and package-local postinstall work succeed. Complete receipts are written at that boundary. They persist exact dependency selectors and the package's typed requirement map; a later state load resolves those selectors against the complete installed package set to rebuild provider bindings.
+A package counts as installed only after required commit and package-local postinstall work succeed. Complete receipts are written at that boundary. They persist exact dependency selectors, the package's typed requirement map, and its complete exposure policy including the normalized reason. A later state load resolves selectors against the complete installed package set to rebuild provider bindings.
 
 Incomplete receipts and staging roots are interrupted-install state. Mutating commands clean them before planning.
 

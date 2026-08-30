@@ -628,10 +628,10 @@ mod tests {
             keg_version: KegVersion("1.0".to_string()),
             deps: Vec::<PackageDependency>::new(),
             dependency_requirements: Default::default(),
+            exposure: glu_core::Exposure::Global,
             artifact: ArtifactId("art:test:fixture".to_string()),
             install: PackageInstallMetadata {
                 opt_names: Vec::new(),
-                keg_only: false,
                 link_overwrite: vec![],
                 post_install_defined: true,
                 post_install_steps: vec![],

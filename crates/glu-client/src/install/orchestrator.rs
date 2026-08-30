@@ -457,7 +457,7 @@ impl SchedulerInstallOperations {
         let artifact = self.manifest.require_artifact(&package.artifact)?.clone();
         let prefix = self.prefix.clone();
         let force = self.options.force;
-        let active = !package.install.keg_only && self.should_activate_package(&package);
+        let active = !package.exposure.is_isolated() && self.should_activate_package(&package);
         let receipt_linked = active;
         let links = tokio::task::spawn_blocking(move || {
             write_prepared_receipt(&keg, &package, &package.artifact, &artifact, false)?;
@@ -706,12 +706,9 @@ fn rename_existing_keg(input: RenameExistingKegInput<'_>) -> Result<()> {
     }
     receipt.paths.keg = new_keg.clone();
     receipt.paths.opt = prefix.0.join("opt").join(&package.name.0);
-    let link_package = glu_core::PackageLinkMetadata {
-        name: package.name.clone(),
-        opt_names: package.install.opt_names.clone(),
-        keg_only: receipt.install.keg_only,
-        link_overwrite: package.install.link_overwrite.clone(),
-    };
+    receipt.install.exposure = package.exposure.clone();
+    receipt.install.link_overwrite = package.install.link_overwrite.clone();
+    let link_package = glu_core::PackageLinkMetadata::from(package);
     receipt.links.opt_names = link_package.opt_names.clone();
     store.write_receipt_for_keg(&new_keg, &receipt)?;
 
@@ -869,10 +866,10 @@ mod tests {
                 keg_version: KegVersion("1.1".to_string()),
                 deps: Vec::new(),
                 dependency_requirements: Default::default(),
+                exposure: glu_core::Exposure::Global,
                 artifact: ArtifactId("art:test".to_string()),
                 install: PackageInstallMetadata {
                     opt_names: Vec::new(),
-                    keg_only: false,
                     link_overwrite: Vec::new(),
                     post_install_defined: false,
                     post_install_steps: Vec::new(),
@@ -918,7 +915,7 @@ mod tests {
                 opt_names: Vec::new(),
             },
             install: ReceiptInstall {
-                keg_only: false,
+                exposure: glu_core::Exposure::Global,
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: Vec::new(),
@@ -928,7 +925,10 @@ mod tests {
         InstalledStateStore::new(prefix.clone())
             .write_receipt_for_keg(&old_keg, &receipt)
             .unwrap();
-        let (package_id, package) = package("bar", vec!["foo"]);
+        let (package_id, mut package) = package("bar", vec!["foo"]);
+        package.exposure = glu_core::Exposure::Isolated {
+            reason: Some("Conflicts with another package".to_string()),
+        };
 
         let old_name = PackageName("foo".to_string());
         rename_existing_keg(RenameExistingKegInput {
@@ -957,6 +957,8 @@ mod tests {
             .contains(&glu_core::PackageSelector("foo".to_string())));
         assert_eq!(receipt.paths.keg, new_keg);
         assert_eq!(receipt.paths.opt, prefix.0.join("opt/bar"));
+        assert_eq!(receipt.install.exposure, package.exposure);
+        assert!(!prefix.0.join("bin/tool").exists());
         assert_eq!(
             prefix.0.join("opt/bar").canonicalize().unwrap(),
             prefix.0.join("Cellar/bar/1.0").canonicalize().unwrap()
@@ -1001,7 +1003,7 @@ mod tests {
                 opt_names: Vec::new(),
             },
             install: ReceiptInstall {
-                keg_only: false,
+                exposure: glu_core::Exposure::Global,
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: Vec::new(),

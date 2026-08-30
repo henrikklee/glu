@@ -122,7 +122,7 @@ mod tests {
                 opt_names: Vec::new(),
             },
             install: ReceiptInstall {
-                keg_only: false,
+                exposure: glu_core::Exposure::Global,
                 linked: true,
                 link_overwrite: Vec::new(),
                 deps: Vec::new(),

@@ -309,7 +309,7 @@ mod tests {
                 .into_iter()
                 .map(|alias| PackageName(alias.to_string()))
                 .collect(),
-            keg_only: false,
+            exposure: glu_core::Exposure::Global,
             link_overwrite: vec![],
         }
     }
@@ -325,10 +325,10 @@ mod tests {
             keg_version: KegVersion("1.0".to_string()),
             deps: Vec::<PackageDependency>::new(),
             dependency_requirements: Default::default(),
+            exposure: glu_core::Exposure::Global,
             artifact: ArtifactId(format!("art:test:{name}")),
             install: PackageInstallMetadata {
                 opt_names: Vec::new(),
-                keg_only: false,
                 link_overwrite: vec![],
                 post_install_defined: false,
                 post_install_steps: vec![],
@@ -751,11 +751,11 @@ mod tests {
     }
 
     #[test]
-    fn unlink_keg_only_package_is_a_noop_besides_marker() {
+    fn unlink_isolated_package_is_a_noop_besides_marker() {
         let tmp = TempDir::new().unwrap();
         let prefix = Prefix(tmp.path().to_path_buf());
         let mut pkg = package("one", vec![]);
-        pkg.keg_only = true;
+        pkg.exposure = glu_core::Exposure::Isolated { reason: None };
         let one_keg = keg(&prefix, "one");
         touch(&one_keg.join("bin/one"));
 
@@ -807,7 +807,7 @@ mod path_confinement_tests {
         PackageLinkMetadata {
             name: PackageName(name.to_string()),
             opt_names: vec![],
-            keg_only: false,
+            exposure: glu_core::Exposure::Global,
             link_overwrite: vec![],
         }
     }

@@ -54,7 +54,7 @@ fn write_receipt(prefix: &Path, name: &str, version: &str, sha256: &str) {
   }},
   "paths":{{"keg":"{}","opt":"{}"}},
   "links":{{"opt_names":[]}},
-  "install":{{"keg_only":false,"linked":true,"link_overwrite":[],"deps":[],"dependency_requirements":{{}}}}
+  "install":{{"exposure":{{"mode":"global"}},"linked":true,"link_overwrite":[],"deps":[],"dependency_requirements":{{}}}}
 }}"#,
         keg.display(),
         opt.display()

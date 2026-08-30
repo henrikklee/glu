@@ -262,10 +262,10 @@ mod tests {
             keg_version: KegVersion("1.0".to_string()),
             deps: Vec::new(),
             dependency_requirements: Default::default(),
+            exposure: glu_core::Exposure::Global,
             artifact: ArtifactId(format!("art:test:{name}")),
             install: PackageInstallMetadata {
                 opt_names: Vec::new(),
-                keg_only: false,
                 link_overwrite: vec![],
                 post_install_defined: false,
                 post_install_steps: vec![],
@@ -447,11 +447,11 @@ mod tests {
     }
 
     #[test]
-    fn keg_only_packages_still_get_etc_var_copied() {
+    fn isolated_packages_still_get_etc_var_copied() {
         let tmp = TempDir::new().unwrap();
         let prefix = Prefix(tmp.path().to_path_buf());
         let mut pkg = package("one");
-        pkg.install.keg_only = true;
+        pkg.exposure = glu_core::Exposure::Isolated { reason: None };
         let one_keg = keg(&prefix, "one", "1.0");
         write(&one_keg.join(".bottle/etc/foo.conf"), b"default");
 
