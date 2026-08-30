@@ -2894,14 +2894,10 @@ fn render_setup_output(result: &SetupResult) {
 }
 
 pub(crate) fn print_info(info: &InfoResponse, installed: Option<&InstalledPackage>) {
-    match &info.desc {
-        Some(desc) => println!(
-            "{} {}   {desc}",
-            info.name.0,
-            glu_client::style::dim(&info.version)
-        ),
-        None => println!("{} {}", info.name.0, glu_client::style::dim(&info.version)),
-    }
+    println!(
+        "{}",
+        info_heading(&info.name.0, &info.version, info.desc.as_deref())
+    );
     match (&info.homepage, &info.license) {
         (Some(homepage), Some(license)) => println!("{homepage} · {license}"),
         (Some(homepage), None) => println!("{homepage}"),
@@ -2911,39 +2907,80 @@ pub(crate) fn print_info(info: &InfoResponse, installed: Option<&InstalledPackag
     println!();
 
     println!(
-        "  {:<16} {}",
-        "Installed",
-        match installed {
-            Some(package) => format!("yes ({})", package.version),
-            None => "no".to_string(),
-        }
+        "{}",
+        info_row(
+            "Installed",
+            &installed_summary(installed.map(|package| package.version.as_str()))
+        )
     );
     println!(
-        "  {:<16} {}  ·  {} with dependencies",
+        "{:<16} {}  ·  {} with dependencies",
         "Download size",
         fmt_size(info.download_bytes),
         fmt_size(info.download_bytes_with_dependencies)
     );
     println!(
-        "  {:<16} {}  ·  {} with dependencies",
+        "{:<16} {}  ·  {} with dependencies",
         "Installed size",
         fmt_size(info.installed_bytes),
         fmt_size(info.installed_bytes_with_dependencies)
     );
     println!(
-        "  {:<16} {} total ({} direct)",
-        "Dependencies", info.dependencies.total, info.dependencies.direct
+        "{}",
+        info_row("Dependencies", &dependency_summary(&info.dependencies))
     );
     match &info.exposure {
-        glu_core::Exposure::Global => println!("  {:<16} global", "Exposure"),
+        glu_core::Exposure::Global => println!("{}", info_row("Exposure", "global")),
         glu_core::Exposure::Isolated { reason } => {
-            println!("  {:<16} isolated", "Exposure");
             println!(
-                "  {:<16} {}",
+                "{}",
+                info_row("Exposure", &glu_client::style::yellow("isolated"))
+            );
+            println!(
+                "{:<16} {}",
                 "Reason",
                 reason.as_deref().unwrap_or("Not specified")
             );
         }
+    }
+}
+
+fn info_row(label: &str, value: &str) -> String {
+    format!("{label:<16} {value}")
+}
+
+const INFO_VALUE_COLUMN: usize = 17;
+
+fn info_heading(name: &str, version: &str, description: Option<&str>) -> String {
+    let identity = format!(
+        "{} {}",
+        glu_client::style::bold(name),
+        glu_client::style::dim(version)
+    );
+    let Some(description) = description else {
+        return identity;
+    };
+
+    let identity_width = name.chars().count() + 1 + version.chars().count();
+    let gap = INFO_VALUE_COLUMN.saturating_sub(identity_width).max(2);
+    format!("{identity}{}{description}", " ".repeat(gap))
+}
+
+fn installed_summary(version: Option<&str>) -> String {
+    match version {
+        Some(version) => format!("{} ({version})", glu_client::style::green("yes")),
+        None => glu_client::style::yellow("no"),
+    }
+}
+
+fn dependency_summary(dependencies: &glu_core::InfoDependencies) -> String {
+    if dependencies.total == 0 {
+        "-".to_string()
+    } else {
+        format!(
+            "{} total ({} direct)",
+            dependencies.total, dependencies.direct
+        )
     }
 }
 
@@ -2980,6 +3017,45 @@ mod tests {
             already_shown: false,
             incoming: None,
         }
+    }
+
+    #[test]
+    fn info_rows_are_unindented_and_zero_dependencies_are_compact() {
+        assert_eq!(info_row("Installed", "no"), "Installed        no");
+        assert_eq!(
+            dependency_summary(&glu_core::InfoDependencies {
+                direct: 0,
+                total: 0,
+            }),
+            "-"
+        );
+        assert_eq!(
+            dependency_summary(&glu_core::InfoDependencies {
+                direct: 2,
+                total: 5,
+            }),
+            "5 total (2 direct)"
+        );
+    }
+
+    #[test]
+    fn short_info_headings_align_descriptions_with_values() {
+        let short = info_heading("rustup", "1.29.0", Some("Rust toolchain installer"));
+        assert_eq!(
+            short.find("Rust toolchain installer"),
+            Some(INFO_VALUE_COLUMN)
+        );
+
+        let long = info_heading("a-very-long-package-name", "1.0", Some("Description"));
+        assert!(long.contains("1.0  Description"));
+        assert_eq!(info_heading("jq", "1.8.2", None), "jq 1.8.2");
+    }
+
+    #[test]
+    fn installed_summary_styles_only_the_status_word() {
+        // Test output is not a terminal, so style helpers return plain text.
+        assert_eq!(installed_summary(None), "no");
+        assert_eq!(installed_summary(Some("1.2.3")), "yes (1.2.3)");
     }
 
     #[test]
