@@ -393,6 +393,25 @@ const YES_OPTIONS: &[OptionSpec] = &[OptionSpec {
     conflicts_with: &[],
 }];
 
+const PURGE_OPTIONS: &[OptionSpec] = &[
+    OptionSpec {
+        long: "--keep-declaration",
+        short: None,
+        kind: OptionKind::Bool,
+        scope: OptionScope::CommandBehavior,
+        description: "preserve glu.json so declared packages can be restored with `glu install`",
+        conflicts_with: &[],
+    },
+    OptionSpec {
+        long: "--yes",
+        short: Some('y'),
+        kind: OptionKind::Bool,
+        scope: OptionScope::GlobalSafety,
+        description: "answer confirmation prompts for the already-computed plan",
+        conflicts_with: &[],
+    },
+];
+
 const ACTIVATE_OPTIONS: &[OptionSpec] = &[OptionSpec {
     long: "--force",
     short: Some('f'),
@@ -649,6 +668,27 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         result_schema: Some("CleanupResult"),
         options: YES_OPTIONS,
         examples: &["glu cleanup --plan", "glu cleanup", "glu cleanup -yj"],
+        subcommands: EMPTY_COMMANDS,
+    },
+    CommandSpec {
+        id: CommandId::Purge,
+        name: "purge",
+        group: CommandGroup::Maintenance,
+        aliases: &[],
+        summary: "Remove every installed package",
+        default_behavior: "Removes every installed package and glu.json while preserving the glu executable and download cache; --keep-declaration preserves glu.json.",
+        arguments: EMPTY_ARGUMENTS,
+        mutates: true,
+        default_scope: Some("installed packages"),
+        output_protocols: HUMAN_JSON,
+        capabilities: CAP_PLAN_YES,
+        result_schema: Some("PurgeResult"),
+        options: PURGE_OPTIONS,
+        examples: &[
+            "glu purge --plan",
+            "glu purge --keep-declaration",
+            "glu purge --keep-declaration -yj",
+        ],
         subcommands: EMPTY_COMMANDS,
     },
     CommandSpec {
@@ -995,6 +1035,8 @@ pub(crate) enum CommandId {
     Autoremove,
     #[serde(rename = "cleanup")]
     Cleanup,
+    #[serde(rename = "purge")]
+    Purge,
     #[serde(rename = "activate")]
     Activate,
     #[serde(rename = "deactivate")]
@@ -1042,6 +1084,7 @@ impl CommandId {
         Self::Remove,
         Self::Autoremove,
         Self::Cleanup,
+        Self::Purge,
         Self::Activate,
         Self::Deactivate,
         Self::List,
@@ -1070,6 +1113,7 @@ impl CommandId {
             Self::Remove => "remove",
             Self::Autoremove => "autoremove",
             Self::Cleanup => "cleanup",
+            Self::Purge => "purge",
             Self::Activate => "activate",
             Self::Deactivate => "deactivate",
             Self::List => "list",
@@ -1188,6 +1232,7 @@ pub(crate) enum CliErrorDetails {
     Parse(ParseErrorDetails),
     PlannedRemovals(PlannedRemovalsDetails),
     CleanupConfirmation(CleanupConfirmationDetails),
+    PurgeConfirmation(PurgeConfirmationDetails),
     RemovalConfirmation(RemovalConfirmationDetails),
     UpdateConfirmation(UpdateConfirmationDetails),
     InstallConfirmation(InstallConfirmationDetails),
@@ -1250,6 +1295,14 @@ pub(crate) struct CleanupConfirmationDetails {
     pub(crate) unassociated_downloads: usize,
     pub(crate) unassociated_bytes: u64,
     pub(crate) reclaimable_bytes: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct PurgeConfirmationDetails {
+    pub(crate) planned_removals: Vec<ErrorPackageRecord>,
+    pub(crate) declaration: PurgeDeclarationAction,
+    pub(crate) declared_packages: usize,
+    pub(crate) reclaimable_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
@@ -1626,6 +1679,8 @@ pub(crate) enum CommandOutput {
     AutoremovePlan(AutoremovePlanOutput),
     Cleanup(CleanupOutput),
     CleanupPlan(CleanupPlanOutput),
+    Purge(PurgeOutput),
+    PurgePlan(PurgePlanOutput),
     Status(StatusOutput),
     Outdated(OutdatedOutput),
     TraceView(crate::trace_cmd::TraceViewOutput),
@@ -1943,6 +1998,34 @@ pub(crate) struct CleanupPlanOutput {
     pub(crate) unassociated_bytes: u64,
     pub(crate) requires_confirmation: bool,
     pub(crate) would_reclaim_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PurgeDeclarationAction {
+    Absent,
+    Preserved,
+    Removed,
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct PurgeOutput {
+    pub(crate) mode: ExecutedMode,
+    pub(crate) removed: Vec<MutationPackageRecord>,
+    pub(crate) declaration: PurgeDeclarationAction,
+    pub(crate) declared_packages: usize,
+    pub(crate) reclaimed_bytes: Option<u64>,
+    pub(crate) leftover_config_files: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct PurgePlanOutput {
+    pub(crate) mode: PlanMode,
+    pub(crate) would_remove: Vec<MutationPackageRecord>,
+    pub(crate) declaration: PurgeDeclarationAction,
+    pub(crate) declared_packages: usize,
+    pub(crate) requires_confirmation: bool,
+    pub(crate) would_reclaim_bytes: Option<u64>,
 }
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]

@@ -54,6 +54,16 @@ impl InstalledStateStore {
         declaration.write(&self.prefix)
     }
 
+    /// Removes `<prefix>/glu.json` when present.
+    pub fn remove_declaration(&self) -> Result<bool> {
+        let path = Declaration::path(&self.prefix);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
+        }
+    }
+
     fn receipt_path(keg_path: &Path) -> PathBuf {
         receipts::receipt_path_for_keg(keg_path)
     }

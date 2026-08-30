@@ -154,6 +154,20 @@ Lists matching package names and asks before deleting anything; `--plan` preview
 without mutation and `--yes` approves the computed plan.")]
     Cleanup {},
 
+    /// Remove every installed package.
+    #[command(long_about = "\
+Removes every package installed by glu, including declared packages, \
+dependencies, and dangling packages. The glu executable and download cache \
+are always preserved. By default glu.json is also removed; \
+`--keep-declaration` preserves it verbatim so bare `glu install` can restore \
+the declared environment. Always lists the plan and asks before changing \
+anything; `--plan` previews and `--yes` approves the computed plan.")]
+    Purge {
+        /// Preserve glu.json so bare `glu install` can restore the packages.
+        #[arg(long)]
+        keep_declaration: bool,
+    },
+
     /// Keep packages installed but remove their public prefix links.
     #[command(
         visible_alias = "unlink",
@@ -388,6 +402,7 @@ impl Command {
             Self::Remove { .. } => CommandId::Remove,
             Self::Autoremove { .. } => CommandId::Autoremove,
             Self::Cleanup { .. } => CommandId::Cleanup,
+            Self::Purge { .. } => CommandId::Purge,
             Self::Deactivate { .. } => CommandId::Deactivate,
             Self::Activate { .. } => CommandId::Activate,
             Self::List { .. } => CommandId::List,

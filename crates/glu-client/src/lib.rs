@@ -14,6 +14,7 @@ pub mod link;
 pub mod outdated;
 mod path_component;
 pub mod postinstall;
+pub mod purge;
 pub mod registry;
 pub mod remove;
 pub mod shell;
@@ -339,6 +340,17 @@ impl GluClient {
         dangling: &[glu_core::InstalledPackage],
     ) -> Result<Vec<remove::RemovedPackage>> {
         remove::execute_autoremove(&self.config.prefix, dangling)
+    }
+
+    /// Plans removal of every installed package. The declaration is removed
+    /// by default and retained verbatim when `keep_declaration` is true.
+    pub fn plan_purge(&self, keep_declaration: bool) -> Result<purge::PurgePlan> {
+        purge::plan_purge(&self.config.prefix, keep_declaration)
+    }
+
+    /// Executes a previously computed prefix-wide purge plan.
+    pub fn execute_purge(&self, plan: &purge::PurgePlan) -> Result<Vec<remove::RemovedPackage>> {
+        purge::execute_purge(&self.config.prefix, plan)
     }
 
     /// Registry info for `name`, plus the locally installed keg (if any).

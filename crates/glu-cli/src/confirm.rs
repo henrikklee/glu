@@ -73,6 +73,24 @@ pub(super) fn confirm_cleanup(plan: &CacheCleanupPlan) -> Result<bool> {
     ask_yes_no()
 }
 
+pub(super) fn confirm_purge(plan: &glu_client::purge::PurgePlan) -> Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        let command = if plan.keep_declaration {
+            "glu purge --keep-declaration -y"
+        } else {
+            "glu purge -y"
+        };
+        if plan.packages.is_empty() {
+            bail!("would remove glu.json; re-run with `{command}` to confirm");
+        }
+        bail!(
+            "would purge {}; re-run with `{command}` to confirm",
+            glu_client::format::plural(plan.packages.len(), "package")
+        );
+    }
+    ask_yes_no()
+}
+
 /// The shared interactive confirmation. Enter accepts the default; Y accepts
 /// and N or Escape abort immediately without waiting for Enter.
 fn ask_yes_no() -> Result<bool> {

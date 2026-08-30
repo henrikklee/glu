@@ -5,9 +5,10 @@ use crate::command_model::{
     GlobalOptions, InfoManyOutput, InfoOutput, InstallOutput, InstallPlanOutput,
     InstallPoolStatsRecord, InstallStatsRecord, JsonSuccessEnvelope, KeptPackageRecord, ListOutput,
     ListScope, ListView, MutationPackageRecord, MutationStatus, OutdatedOutput, OutdatedRecord,
-    OutputFormat, PlanMode, ReinstallOutput, ReinstallPlanOutput, RemovalOutput, RemovalPlanOutput,
-    RenamePackageRecord, ReverseDepsOutput, ReverseDepsSource, StatusOutput, StatusShell,
-    TimingBreakdownRecord, UpdateOutput, UpdatePackageRecord, UpdatePlanOutput,
+    OutputFormat, PlanMode, PurgeDeclarationAction, PurgeOutput, PurgePlanOutput, ReinstallOutput,
+    ReinstallPlanOutput, RemovalOutput, RemovalPlanOutput, RenamePackageRecord, ReverseDepsOutput,
+    ReverseDepsSource, StatusOutput, StatusShell, TimingBreakdownRecord, UpdateOutput,
+    UpdatePackageRecord, UpdatePlanOutput,
 };
 use crate::package_list::{self, PackageListItem};
 use crate::tables;
@@ -60,6 +61,8 @@ fn render_human(output: &CommandOutput, globals: &GlobalOptions) {
         CommandOutput::AutoremovePlan(plan) => render_autoremove_plan_output(plan, globals),
         CommandOutput::Cleanup(cleanup) => render_cleanup_output(cleanup, globals),
         CommandOutput::CleanupPlan(plan) => render_cleanup_plan_output(plan, globals),
+        CommandOutput::Purge(purge) => render_purge_output(purge, globals),
+        CommandOutput::PurgePlan(plan) => render_purge_plan_output(plan, globals),
         CommandOutput::Status(status) => render_status_output(status, globals),
         CommandOutput::Outdated(outdated) => render_outdated_output(outdated, globals),
         CommandOutput::TraceView(view) => render_trace_view_output(view),
@@ -97,6 +100,8 @@ fn render_json(output: &CommandOutput, globals: &GlobalOptions) {
         CommandOutput::AutoremovePlan(plan) => render_autoremove_plan_output(plan, globals),
         CommandOutput::Cleanup(cleanup) => render_cleanup_output(cleanup, globals),
         CommandOutput::CleanupPlan(plan) => render_cleanup_plan_output(plan, globals),
+        CommandOutput::Purge(purge) => render_purge_output(purge, globals),
+        CommandOutput::PurgePlan(plan) => render_purge_plan_output(plan, globals),
         CommandOutput::Status(status) => render_status_output(status, globals),
         CommandOutput::Outdated(outdated) => render_outdated_output(outdated, globals),
         CommandOutput::TraceList(list) => print_json_success(CommandId::TraceList, list),
@@ -132,6 +137,8 @@ fn render_null(output: &CommandOutput, globals: &GlobalOptions) {
         | CommandOutput::AutoremovePlan(_)
         | CommandOutput::Cleanup(_)
         | CommandOutput::CleanupPlan(_)
+        | CommandOutput::Purge(_)
+        | CommandOutput::PurgePlan(_)
         | CommandOutput::Status(_)
         | CommandOutput::Outdated(_)
         | CommandOutput::TraceView(_)
@@ -206,6 +213,7 @@ pub(crate) fn result_schema(name: &str) -> Option<serde_json::Value> {
         "DeactivationResult" => Some(generated_schema::<DeactivationOutput>()),
         "AutoremoveResult" => Some(generated_schema::<AutoremoveResult<'static>>()),
         "CleanupResult" => Some(generated_schema::<CleanupResult<'static>>()),
+        "PurgeResult" => Some(generated_schema::<PurgeResult<'static>>()),
         "RemovalResult" => Some(generated_schema::<RemovalResult<'static>>()),
         _ => None,
     }
@@ -955,6 +963,34 @@ fn installed_package_removal_plan_record(package: &InstalledPackage) -> Mutation
     )
 }
 
+fn purge_package_record(
+    package: &InstalledPackage,
+    declaration: Option<&glu_client::state::Declaration>,
+    status: MutationStatus,
+) -> MutationPackageRecord {
+    MutationPackageRecord {
+        package_key: Some(package.package_key.0.clone()),
+        name: package.name.0.clone(),
+        version: package.keg_version.0.clone(),
+        status,
+        installed: Some(true),
+        linked: Some(package.linked),
+        declared: Some(declaration.is_some_and(|value| value.contains(&package.name))),
+        deactivated: Some(declaration.is_some_and(|value| {
+            value
+                .deactivated
+                .get(&package.name)
+                .copied()
+                .unwrap_or(false)
+        })),
+        direct: None,
+        transitive: None,
+        cached: None,
+        download_bytes: package.download_bytes,
+        installed_bytes: package.installed_bytes,
+    }
+}
+
 fn execution_summary_record(
     summary: &glu_client::install::WorksetExecutionSummary,
 ) -> ExecutionSummaryRecord {
@@ -1177,6 +1213,60 @@ pub(crate) fn cleanup_plan_output(plan: &CacheCleanupPlan) -> CleanupPlanOutput 
         unassociated_downloads: summary.unassociated_downloads,
         unassociated_bytes: summary.unassociated_bytes,
         requires_confirmation: !plan.bottles().is_empty(),
+        would_reclaim_bytes: plan.reclaimable_bytes(),
+    }
+}
+
+fn purge_declaration_action(plan: &glu_client::purge::PurgePlan) -> PurgeDeclarationAction {
+    if !plan.declaration_present() {
+        PurgeDeclarationAction::Absent
+    } else if plan.keep_declaration {
+        PurgeDeclarationAction::Preserved
+    } else {
+        PurgeDeclarationAction::Removed
+    }
+}
+
+pub(crate) fn purge_output(
+    plan: &glu_client::purge::PurgePlan,
+    leftover_config_files: &[std::path::PathBuf],
+) -> PurgeOutput {
+    PurgeOutput {
+        mode: ExecutedMode::Executed,
+        removed: plan
+            .packages
+            .iter()
+            .map(|package| {
+                purge_package_record(package, plan.declaration.as_ref(), MutationStatus::Removed)
+            })
+            .collect(),
+        declaration: purge_declaration_action(plan),
+        declared_packages: plan.declared_packages(),
+        reclaimed_bytes: plan.reclaimable_bytes(),
+        leftover_config_files: leftover_config_files
+            .iter()
+            .map(|path| display_path(path))
+            .collect(),
+    }
+}
+
+pub(crate) fn purge_plan_output(plan: &glu_client::purge::PurgePlan) -> PurgePlanOutput {
+    PurgePlanOutput {
+        mode: PlanMode::Plan,
+        would_remove: plan
+            .packages
+            .iter()
+            .map(|package| {
+                purge_package_record(
+                    package,
+                    plan.declaration.as_ref(),
+                    MutationStatus::WouldRemove,
+                )
+            })
+            .collect(),
+        declaration: purge_declaration_action(plan),
+        declared_packages: plan.declared_packages(),
+        requires_confirmation: plan.requires_confirmation(),
         would_reclaim_bytes: plan.reclaimable_bytes(),
     }
 }
@@ -1977,21 +2067,24 @@ fn render_removal_output(removal: &RemovalOutput, globals: &GlobalOptions) {
         print_json_success(CommandId::Remove, &RemovalResult::Executed(removal));
         return;
     }
-    if !removal.leftover_config_files.is_empty() {
-        println!();
-        println!(
-            "{}",
-            glu_client::style::bold_yellow(
-                "The following configuration files have not been removed!",
-            )
-        );
-        println!(
-            "{}",
-            glu_client::style::yellow("If desired, remove them manually with `rm -rf`:")
-        );
-        for path in &removal.leftover_config_files {
-            println!("  {path}");
-        }
+    render_leftover_config_files(&removal.leftover_config_files);
+}
+
+fn render_leftover_config_files(paths: &[String]) {
+    if paths.is_empty() {
+        return;
+    }
+    println!();
+    println!(
+        "{}",
+        glu_client::style::bold_yellow("The following configuration files have not been removed!",)
+    );
+    println!(
+        "{}",
+        glu_client::style::yellow("If desired, remove them manually with `rm -rf`:")
+    );
+    for path in paths {
+        println!("  {path}");
     }
 }
 
@@ -2124,6 +2217,95 @@ fn print_cleanup_plan(plan: &CleanupPlanOutput, heading: &str, reclaim_label: &s
         "{reclaim_label}: {}",
         glu_client::format::human_bytes(plan.would_reclaim_bytes)
     );
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+enum PurgeResult<'a> {
+    Executed(&'a PurgeOutput),
+    Plan(&'a PurgePlanOutput),
+}
+
+pub(crate) fn render_purge_execution_plan(plan: &glu_client::purge::PurgePlan) {
+    print_purge_plan(&purge_plan_output(plan), "Will remove", "Will reclaim");
+}
+
+fn render_purge_output(purge: &PurgeOutput, globals: &GlobalOptions) {
+    if globals.is_json() {
+        print_json_success(CommandId::Purge, &PurgeResult::Executed(purge));
+        return;
+    }
+
+    if purge.removed.is_empty() && purge.declaration != PurgeDeclarationAction::Removed {
+        println!("No installed packages to purge.");
+        if purge.declaration == PurgeDeclarationAction::Preserved {
+            println!("Preserved glu.json.");
+        }
+        return;
+    }
+    if !purge.removed.is_empty() {
+        println!(
+            "Purged {}.",
+            glu_client::format::plural(purge.removed.len(), "package")
+        );
+        if let Some(bytes) = purge.reclaimed_bytes.filter(|bytes| *bytes > 0) {
+            println!("Reclaimed: {}", glu_client::format::human_bytes(bytes));
+        }
+    }
+    match purge.declaration {
+        PurgeDeclarationAction::Removed => println!("Removed glu.json."),
+        PurgeDeclarationAction::Preserved if !purge.removed.is_empty() => println!(
+            "Preserved glu.json. Run `glu install` to restore {}.",
+            glu_client::format::plural(purge.declared_packages, "declared package")
+        ),
+        PurgeDeclarationAction::Absent | PurgeDeclarationAction::Preserved => {}
+    }
+    render_leftover_config_files(&purge.leftover_config_files);
+}
+
+fn render_purge_plan_output(plan: &PurgePlanOutput, globals: &GlobalOptions) {
+    if globals.is_json() {
+        print_json_success(CommandId::Purge, &PurgeResult::Plan(plan));
+        return;
+    }
+    print_purge_plan(plan, "Would remove", "Would reclaim");
+}
+
+fn print_purge_plan(plan: &PurgePlanOutput, heading: &str, reclaim_label: &str) {
+    if plan.would_remove.is_empty() && plan.declaration != PurgeDeclarationAction::Removed {
+        println!("Nothing to purge.");
+        return;
+    }
+    let packages: Vec<_> = plan
+        .would_remove
+        .iter()
+        .map(|package| PackageListItem::package(&package.name, &package.version))
+        .collect();
+    package_list::print_counted_section(heading, "package", &packages);
+    match plan.declaration {
+        PurgeDeclarationAction::Removed => println!(
+            "{heading} glu.json ({}).",
+            glu_client::format::plural(plan.declared_packages, "declared package")
+        ),
+        PurgeDeclarationAction::Preserved if !plan.would_remove.is_empty() => {
+            let verb = if heading.starts_with("Would") {
+                "Would preserve"
+            } else {
+                "Will preserve"
+            };
+            println!(
+                "{verb} glu.json ({}).",
+                glu_client::format::plural(plan.declared_packages, "declared package")
+            );
+        }
+        PurgeDeclarationAction::Absent | PurgeDeclarationAction::Preserved => {}
+    }
+    if let Some(bytes) = plan.would_reclaim_bytes.filter(|bytes| *bytes > 0) {
+        println!(
+            "{reclaim_label}: {}",
+            glu_client::format::human_bytes(bytes)
+        );
+    }
 }
 
 fn render_status_output(status: &StatusOutput, globals: &GlobalOptions) {
@@ -3429,6 +3611,25 @@ mod tests {
             would_reclaim_bytes: 52,
         };
         assert_result_valid("CleanupResult", &CleanupResult::Plan(&cleanup_plan));
+
+        let purge = PurgeOutput {
+            mode: ExecutedMode::Executed,
+            removed: Vec::new(),
+            declaration: PurgeDeclarationAction::Preserved,
+            declared_packages: 1,
+            reclaimed_bytes: Some(42),
+            leftover_config_files: Vec::new(),
+        };
+        assert_result_valid("PurgeResult", &PurgeResult::Executed(&purge));
+        let purge_plan = PurgePlanOutput {
+            mode: PlanMode::Plan,
+            would_remove: Vec::new(),
+            declaration: PurgeDeclarationAction::Removed,
+            declared_packages: 1,
+            requires_confirmation: true,
+            would_reclaim_bytes: Some(42),
+        };
+        assert_result_valid("PurgeResult", &PurgeResult::Plan(&purge_plan));
 
         let status = StatusOutput {
             version: "0.1.0",

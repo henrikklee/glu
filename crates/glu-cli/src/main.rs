@@ -19,8 +19,9 @@ use command_model::{
     ErrorUpdateRecord, ExitClass, GlobalOptions, InfoManyOutput, InfoOutput, InfoPackageError,
     InfoPackageResult, InstallConfirmationDetails, InvocationInfo, ListOutput, ListScope, ListView,
     OperationErrorDetails, PackagesErrorDetails, PartialInstallDetails, PlannedRemovalsDetails,
-    RegistryErrorDetails, RemovalConfirmationDetails, RequirementErrorDetails, ReverseDepsOutput,
-    ReverseDepsSource, UnsupportedOptionDetails, UpdateConfirmationDetails, COMMAND_SPECS,
+    PurgeConfirmationDetails, RegistryErrorDetails, RemovalConfirmationDetails,
+    RequirementErrorDetails, ReverseDepsOutput, ReverseDepsSource, UnsupportedOptionDetails,
+    UpdateConfirmationDetails, COMMAND_SPECS,
 };
 use glu_client::{config::ClientConfig, install::InstallOptions, GluClient};
 #[cfg(test)]
@@ -432,6 +433,63 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
             }
             let cleaned = client.execute_cache_cleanup(&cleanup_plan)?;
             final_output = Some(CommandOutput::Cleanup(output::cleanup_output(&cleaned)));
+        }
+        Command::Purge { keep_declaration } => {
+            let purge_plan = client.plan_purge(keep_declaration)?;
+            if plan {
+                final_output = Some(CommandOutput::PurgePlan(output::purge_plan_output(
+                    &purge_plan,
+                )));
+                return Ok((final_output, globals));
+            }
+            if !purge_plan.requires_confirmation() {
+                final_output = Some(CommandOutput::Purge(output::purge_output(&purge_plan, &[])));
+                return Ok((final_output, globals));
+            }
+            if !json {
+                output::render_purge_execution_plan(&purge_plan);
+            }
+            if !yes {
+                if json {
+                    let summary = output::purge_plan_output(&purge_plan);
+                    let planned_removals = purge_plan
+                        .packages
+                        .iter()
+                        .map(|package| ErrorPackageRecord {
+                            name: package.name.0.clone(),
+                            version: package.keg_version.0.clone(),
+                        })
+                        .collect();
+                    return Err(CliFailure::Structured(Box::new(
+                        CliError::confirmation_required(
+                            "purge would remove installed packages or glu.json; rerun with --yes to approve this computed plan",
+                            vec![if keep_declaration {
+                                "glu purge --keep-declaration --yes --json".to_string()
+                            } else {
+                                "glu purge --yes --json".to_string()
+                            }],
+                            Some(CliErrorDetails::PurgeConfirmation(
+                                PurgeConfirmationDetails {
+                                    planned_removals,
+                                    declaration: summary.declaration,
+                                    declared_packages: summary.declared_packages,
+                                    reclaimable_bytes: summary.would_reclaim_bytes,
+                                },
+                            )),
+                        ),
+                    )));
+                }
+                if !confirm::confirm_purge(&purge_plan)? {
+                    return Ok((None, globals));
+                }
+            }
+            let removed = client.execute_purge(&purge_plan)?;
+            let leftover =
+                glu_client::remove::leftover_config_files(&client.config().prefix, &removed);
+            final_output = Some(CommandOutput::Purge(output::purge_output(
+                &purge_plan,
+                &leftover,
+            )));
         }
         Command::Remove { names } => {
             let removal_plan =

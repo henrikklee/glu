@@ -91,6 +91,8 @@ A dangling package is automatic and no longer reachable from any package in `glu
 
 `autoremove` removes dangling packages. Normal sync-style mutations also account for dangling packages so the prefix converges back to the declaration closure. `deps`, `why`, removal planning, autoremove, and post-mutation dangling checks all traverse the same receipt-backed package-key graph.
 
+`purge` is the explicit exception to normal convergence: it removes every installed package. By default it also removes `glu.json`; `--keep-declaration` preserves the declaration verbatim so installed truth is temporarily empty while intent remains available for a later bare `glu install`.
+
 ## Sync
 
 Sync reconciles three inputs:
