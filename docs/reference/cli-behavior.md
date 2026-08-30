@@ -169,6 +169,11 @@ Some read-only questions can be answered from local receipts or from the registr
 
 These sources answer different questions. Output makes the source clear when it matters and does not silently mix local and registry data in one answer.
 
+`info` reports the registry package's exposure policy. Human output says `global` or `isolated`
+and explains isolated policy when a reason is available. JSON carries the same source-neutral
+`exposure` object. Exposure policy is distinct from whether an installed package was deactivated
+by the user.
+
 ## Short flag composition
 
 Short flags compose when the command supports those flags:

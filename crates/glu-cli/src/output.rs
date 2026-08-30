@@ -2934,6 +2934,17 @@ pub(crate) fn print_info(info: &InfoResponse, installed: Option<&InstalledPackag
         "  {:<16} {} total ({} direct)",
         "Dependencies", info.dependencies.total, info.dependencies.direct
     );
+    match &info.exposure {
+        glu_core::Exposure::Global => println!("  {:<16} global", "Exposure"),
+        glu_core::Exposure::Isolated { reason } => {
+            println!("  {:<16} isolated", "Exposure");
+            println!(
+                "  {:<16} {}",
+                "Reason",
+                reason.as_deref().unwrap_or("Not specified")
+            );
+        }
+    }
 }
 
 fn fmt_size(bytes: Option<u64>) -> String {
@@ -3453,6 +3464,7 @@ mod tests {
                 download_bytes_with_dependencies: None,
                 installed_bytes_with_dependencies: None,
                 bottle: "test".to_string(),
+                exposure: glu_core::Exposure::Global,
             },
             installed: None,
             declared: false,

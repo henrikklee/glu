@@ -116,6 +116,11 @@ GET /v1/info?name=vips&target=arm64_sequoia
 
 The client may combine registry info with local installed receipts for command output.
 
+Info includes the package's target-effective exposure policy. Global packages are normally
+exposed through the shared prefix. Isolated packages include a concise reason when the source
+provides one. This is registry metadata for the prospective package; local activation state is a
+separate receipt and declaration concern.
+
 ## Outdated
 
 `/v1/outdated` returns staleness envelopes for requested names and target.

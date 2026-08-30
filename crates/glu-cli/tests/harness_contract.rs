@@ -517,7 +517,7 @@ fn help_manifest_uses_explicit_result_identities_and_runtime_fields() {
             "missing StatusResult.{field}"
         );
     }
-    for field in ["requested_as", "package_key", "package"] {
+    for field in ["requested_as", "package_key", "package", "exposure"] {
         assert!(
             schemas["InfoResult"]["$defs"]["InfoResponse"]["properties"]
                 .get(field)

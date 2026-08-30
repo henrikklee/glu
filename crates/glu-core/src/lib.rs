@@ -277,6 +277,17 @@ pub struct InfoResponse {
     #[serde(default)]
     pub installed_bytes_with_dependencies: Option<u64>,
     pub bottle: String,
+    pub exposure: Exposure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum Exposure {
+    Global,
+    Isolated {
+        #[schemars(required)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -351,6 +362,21 @@ mod tests {
         }"#;
         let metadata: PackageInstallMetadata = serde_json::from_str(json).unwrap();
         assert!(metadata.postinstall_network_access_allowed);
+    }
+
+    #[test]
+    fn exposure_has_a_source_neutral_discriminated_shape() {
+        let global: Exposure = serde_json::from_str(r#"{"mode":"global"}"#).unwrap();
+        assert_eq!(global, Exposure::Global);
+
+        let isolated: Exposure =
+            serde_json::from_str(r#"{"mode":"isolated","reason":"Conflicts with rust"}"#).unwrap();
+        assert_eq!(
+            isolated,
+            Exposure::Isolated {
+                reason: Some("Conflicts with rust".to_string())
+            }
+        );
     }
 
     #[test]
