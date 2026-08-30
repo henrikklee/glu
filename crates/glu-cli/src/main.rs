@@ -1,5 +1,6 @@
 mod args;
 mod command_model;
+mod commands;
 mod confirm;
 mod diagnostic;
 mod events;
@@ -10,24 +11,18 @@ mod progress;
 mod tables;
 mod trace_cmd;
 
-use anyhow::anyhow;
 use args::{Cli, Command};
 use clap::Parser;
 use command_model::{
-    command_spec_by_id, CleanupConfirmationDetails, CleanupConfirmationRecord, CliError,
-    CliErrorDetails, CommandId, CommandOutput, CommandSpec, ErrorCode, ErrorPackageRecord,
-    ErrorUpdateRecord, ExitClass, GlobalOptions, InfoManyOutput, InfoOutput, InfoPackageError,
-    InfoPackageResult, InstallConfirmationDetails, InvocationInfo, ListOutput, ListScope, ListView,
-    OperationErrorDetails, PackagesErrorDetails, PartialInstallDetails, PlannedRemovalsDetails,
-    PurgeConfirmationDetails, RegistryErrorDetails, RemovalConfirmationDetails,
-    RequirementErrorDetails, ReverseDepsOutput, ReverseDepsSource, UnsupportedOptionDetails,
-    UpdateConfirmationDetails, COMMAND_SPECS,
+    command_spec_by_id, CliError, CliErrorDetails, CommandId, CommandOutput, CommandSpec,
+    ErrorCode, ExitClass, GlobalOptions, InvocationInfo, OperationErrorDetails,
+    PackagesErrorDetails, PartialInstallDetails, RegistryErrorDetails, RequirementErrorDetails,
+    UnsupportedOptionDetails, COMMAND_SPECS,
 };
-use glu_client::{config::ClientConfig, install::InstallOptions, GluClient};
+use glu_client::{config::ClientConfig, GluClient};
 #[cfg(test)]
 use glu_core::PackageName;
-use glu_core::PackageSelector;
-use std::{collections::BTreeMap, future::Future, io::IsTerminal, time::Duration};
+use std::{future::Future, io::IsTerminal, time::Duration};
 
 #[tokio::main]
 async fn main() {
@@ -154,7 +149,7 @@ impl std::error::Error for ResolutionInterrupted {}
 /// Runs a registry-bound future with transient first-line feedback. Machine
 /// output and non-interactive output await the future without touching the
 /// terminal. Dropping the future clears the spinner through its RAII guard.
-async fn while_resolving<F>(enabled: bool, future: F) -> Result<F::Output, CliFailure>
+pub(crate) async fn while_resolving<F>(enabled: bool, future: F) -> Result<F::Output, CliFailure>
 where
     F: Future,
 {
@@ -191,10 +186,7 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
     let globals = GlobalOptions::from_args(cli.globals);
     let json = globals.is_json();
     let null = globals.is_null();
-    let tree = globals.tree;
-    let verbose = globals.verbose;
     let plan = globals.plan;
-    let yes = globals.yes;
     let show_resolution = !json && !null && std::io::stdout().is_terminal();
     let Some(command) = cli.command else {
         // Bare JSON is the discoverable machine contract; bare human output
@@ -229,677 +221,81 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
     }
     let client = GluClient::new(config);
     let events = events::for_invocation(&globals);
-    let final_output;
-
-    match command {
+    let context = commands::CommandContext {
+        client: &client,
+        globals,
+        events: events.clone(),
+        show_resolution,
+    };
+    let final_output = match command {
         Command::Install { names, force, deps } => {
-            if deps && !force {
-                return Err(CliFailure::Structured(Box::new(
-                    CliError::invalid_flag_combination(
-                        "--deps requires --force (or use 'reinstall --deps' to reinstall installed packages)",
-                        "--deps",
-                        vec![
-                            "glu install --force --deps <name>".to_string(),
-                            "glu reinstall --deps <name>".to_string(),
-                        ],
-                        Some(CliErrorDetails::Requirement(RequirementErrorDetails {
-                            requires: "--force",
-                        })),
-                    ),
-                )));
-            }
-            let names = if names.is_empty() {
-                // Bare `glu install` = sync the declaration (glu.json):
-                // install every declared package that isn't installed yet.
-                let declared = client.declaration_names()?;
-                if declared.is_empty() {
-                    return Err(CliFailure::Structured(Box::new(
-                        CliError::empty_declaration(
-                            "nothing declared in glu.json — add a package with `glu add <name>`",
-                            vec!["glu add <name>".to_string()],
-                        ),
-                    )));
-                }
-                declared
-                    .into_iter()
-                    .map(|name| PackageSelector(name.0))
-                    .collect()
-            } else {
-                names.into_iter().map(PackageSelector).collect()
-            };
-            let options = InstallOptions {
-                force,
-                deps,
-                yes,
-                verbose,
-                ..Default::default()
-            };
-            let install_plan =
-                while_resolving(show_resolution, client.plan_install(names, options)).await??;
-            if plan {
-                final_output = Some(CommandOutput::InstallPlan(output::install_plan_output(
-                    &install_plan,
-                )));
-                return Ok((final_output, globals));
-            }
-            if !json {
-                output::render_install_preflight(&install_plan);
-            }
-            if !json {
-                output::render_install_execution_plan(&install_plan, "install", tree);
-            }
-            if install_plan.requires_confirmation && !yes {
-                if json {
-                    return Err(install_confirmation_failure(&install_plan, "install"));
-                }
-                if !confirm::confirm_install(&install_plan, "install")? {
-                    return Ok((None, globals));
-                }
-            }
-            let summary = client
-                .execute_install(install_plan, options, events.clone())
-                .await?;
-            final_output = Some(CommandOutput::Install(output::install_output(&summary)));
+            commands::packages::install(&context, names, force, deps)
+                .await?
+                .into_output()
         }
-        Command::Reinstall { deps, names } => {
-            let names: Vec<PackageSelector> = names.into_iter().map(PackageSelector).collect();
-            client.validate_reinstall_targets(&names)?;
-            let options = InstallOptions {
-                force: true,
-                deps,
-                yes,
-                verbose: false,
-                declared_policy: glu_client::install::DeclaredPolicy::Preserve,
-            };
-            let install_plan =
-                while_resolving(show_resolution, client.plan_install(names, options)).await??;
-            if plan {
-                final_output = Some(CommandOutput::ReinstallPlan(output::reinstall_plan_output(
-                    &install_plan,
-                )));
-                return Ok((final_output, globals));
-            }
-            if !json {
-                output::render_install_preflight(&install_plan);
-            }
-            if !json {
-                output::render_install_execution_plan(&install_plan, "reinstall", false);
-            }
-            if install_plan.requires_confirmation && !yes {
-                if json {
-                    return Err(install_confirmation_failure(&install_plan, "reinstall"));
-                }
-                if !confirm::confirm_install(&install_plan, "reinstall")? {
-                    return Ok((None, globals));
-                }
-            }
-            let summary = client
-                .execute_install(install_plan, options, events.clone())
-                .await?;
-            final_output = Some(CommandOutput::Reinstall(output::reinstall_output(&summary)));
-        }
-        Command::Autoremove {} => {
-            let dangling = client.plan_autoremove()?;
-            if plan {
-                final_output = Some(CommandOutput::AutoremovePlan(
-                    output::autoremove_plan_output(&dangling),
-                ));
-                return Ok((final_output, globals));
-            }
-            if dangling.is_empty() {
-                final_output = Some(CommandOutput::Autoremove(output::autoremove_output(&[])));
-                return Ok((final_output, globals));
-            }
-            if !json {
-                output::render_autoremove_execution_plan(&dangling);
-            }
-            if !yes {
-                if json {
-                    let planned_removals = dangling
-                        .iter()
-                        .map(|package| ErrorPackageRecord {
-                            name: package.name.0.clone(),
-                            version: package.keg_version.0.clone(),
-                        })
-                        .collect();
-                    return Err(CliFailure::Structured(Box::new(
-                        CliError::confirmation_required(
-                            "autoremove would remove packages; rerun with --yes to approve this computed plan",
-                            vec!["glu autoremove --yes --json".to_string()],
-                            Some(CliErrorDetails::PlannedRemovals(
-                                PlannedRemovalsDetails { planned_removals },
-                            )),
-                        ),
-                    )));
-                }
-                if !confirm::confirm_autoremove(&dangling)? {
-                    return Ok((None, globals));
-                }
-            }
-            let removed = client.execute_autoremove(&dangling)?;
-            final_output = Some(CommandOutput::Autoremove(output::autoremove_output(
-                &removed,
-            )));
-        }
-        Command::Cleanup {} => {
-            let cleanup_plan = client.plan_cache_cleanup()?;
-            if plan {
-                final_output = Some(CommandOutput::CleanupPlan(output::cleanup_plan_output(
-                    &cleanup_plan,
-                )));
-                return Ok((final_output, globals));
-            }
-            if cleanup_plan.bottles().is_empty() {
-                final_output = Some(CommandOutput::Cleanup(output::cleanup_output(
-                    &glu_client::download::cache::CacheCleanupResult::default(),
-                )));
-                return Ok((final_output, globals));
-            }
-            if !json {
-                output::render_cleanup_execution_plan(&cleanup_plan);
-            }
-            if !yes {
-                if json {
-                    let summary = output::cleanup_plan_output(&cleanup_plan);
-                    let planned_removals = summary
-                        .would_remove
-                        .into_iter()
-                        .map(|bottle| CleanupConfirmationRecord {
-                            name: bottle.name,
-                            version: bottle.version,
-                            downloads: bottle.downloads,
-                            bytes: bottle.bytes,
-                        })
-                        .collect();
-                    return Err(CliFailure::Structured(Box::new(
-                        CliError::confirmation_required(
-                            "cleanup would remove cached downloads; rerun with --yes to approve this computed plan",
-                            vec!["glu cleanup --yes --json".to_string()],
-                            Some(CliErrorDetails::CleanupConfirmation(
-                                CleanupConfirmationDetails {
-                                    planned_removals,
-                                    planned_downloads: summary.would_remove_downloads,
-                                    unassociated_downloads: summary.unassociated_downloads,
-                                    unassociated_bytes: summary.unassociated_bytes,
-                                    reclaimable_bytes: summary.would_reclaim_bytes,
-                                },
-                            )),
-                        ),
-                    )));
-                }
-                if !confirm::confirm_cleanup(&cleanup_plan)? {
-                    return Ok((None, globals));
-                }
-            }
-            let cleaned = client.execute_cache_cleanup(&cleanup_plan)?;
-            final_output = Some(CommandOutput::Cleanup(output::cleanup_output(&cleaned)));
-        }
+        Command::Reinstall { deps, names } => commands::packages::reinstall(&context, names, deps)
+            .await?
+            .into_output(),
+        Command::Autoremove {} => commands::removal::autoremove(&context)?.into_output(),
+        Command::Cleanup {} => commands::removal::cleanup(&context)?.into_output(),
         Command::Purge { keep_declaration } => {
-            let purge_plan = client.plan_purge(keep_declaration)?;
-            if plan {
-                final_output = Some(CommandOutput::PurgePlan(output::purge_plan_output(
-                    &purge_plan,
-                )));
-                return Ok((final_output, globals));
-            }
-            if !purge_plan.requires_confirmation() {
-                final_output = Some(CommandOutput::Purge(output::purge_output(&purge_plan, &[])));
-                return Ok((final_output, globals));
-            }
-            if !json {
-                output::render_purge_execution_plan(&purge_plan);
-            }
-            if !yes {
-                if json {
-                    let summary = output::purge_plan_output(&purge_plan);
-                    let planned_removals = purge_plan
-                        .packages
-                        .iter()
-                        .map(|package| ErrorPackageRecord {
-                            name: package.name.0.clone(),
-                            version: package.keg_version.0.clone(),
-                        })
-                        .collect();
-                    return Err(CliFailure::Structured(Box::new(
-                        CliError::confirmation_required(
-                            "purge would remove installed packages or glu.json; rerun with --yes to approve this computed plan",
-                            vec![if keep_declaration {
-                                "glu purge --keep-declaration --yes --json".to_string()
-                            } else {
-                                "glu purge --yes --json".to_string()
-                            }],
-                            Some(CliErrorDetails::PurgeConfirmation(
-                                PurgeConfirmationDetails {
-                                    planned_removals,
-                                    declaration: summary.declaration,
-                                    declared_packages: summary.declared_packages,
-                                    reclaimable_bytes: summary.would_reclaim_bytes,
-                                },
-                            )),
-                        ),
-                    )));
-                }
-                if !confirm::confirm_purge(&purge_plan)? {
-                    return Ok((None, globals));
-                }
-            }
-            let removed = client.execute_purge(&purge_plan)?;
-            let leftover =
-                glu_client::remove::leftover_config_files(&client.config().prefix, &removed);
-            final_output = Some(CommandOutput::Purge(output::purge_output(
-                &purge_plan,
-                &leftover,
-            )));
+            commands::removal::purge(&context, keep_declaration)?.into_output()
         }
-        Command::Remove { names } => {
-            let removal_plan =
-                client.plan_removal(names.into_iter().map(PackageSelector).collect())?;
-            if plan {
-                final_output = Some(CommandOutput::RemovalPlan(output::removal_plan_output(
-                    &removal_plan,
-                )));
-                return Ok((final_output, globals));
-            }
-            if !json {
-                output::render_removal_execution_plan(&removal_plan);
-            }
-            if !yes && removal_plan.to_remove.len() > removal_plan.named.len() {
-                if json {
-                    let named = removal_plan
-                        .named
-                        .iter()
-                        .map(|package| ErrorPackageRecord {
-                            name: package.name.0.clone(),
-                            version: package.keg_version.0.clone(),
-                        })
-                        .collect();
-                    let planned_removals = removal_plan
-                        .to_remove
-                        .iter()
-                        .map(|package| ErrorPackageRecord {
-                            name: package.name.0.clone(),
-                            version: package.keg_version.0.clone(),
-                        })
-                        .collect();
-                    return Err(CliFailure::Structured(Box::new(
-                        CliError::confirmation_required(
-                            "remove would remove packages beyond the named selectors; rerun with --yes to approve this computed plan",
-                            vec!["glu remove --yes --json <selector>...".to_string()],
-                            Some(CliErrorDetails::RemovalConfirmation(
-                                RemovalConfirmationDetails {
-                                    named,
-                                    planned_removals,
-                                },
-                            )),
-                        ),
-                    )));
-                }
-                if !confirm::confirm_removal(&removal_plan)? {
-                    return Ok((None, globals));
-                }
-            }
-            let removed = client.execute_removal(&removal_plan)?;
-            // `.bottle`-sourced config files are real copies in the prefix now
-            // (install_etc_var) and `rm` deliberately does not delete them —
-            // Homebrew parity (uninstall.rb:76-118). Report the same notice/result
-            // through the selected renderer so JSON stays a single final document.
-            let leftover =
-                glu_client::remove::leftover_config_files(&client.config().prefix, &removed);
-            final_output = Some(CommandOutput::Removal(output::removal_output(
-                &removed,
-                &removal_plan.kept,
-                &leftover,
-            )));
-        }
+        Command::Remove { names } => commands::removal::remove(&context, names)?.into_output(),
         Command::List {
             declared: explicit_declared,
             installed,
             all,
-        } => {
-            let query = client.query_state(events.as_ref())?;
-            let installed_scope = (globals.tree && !explicit_declared) || installed || all;
-            let statuses = if null {
-                BTreeMap::new()
-            } else {
-                query.package_statuses()
-            };
-            let scope = if installed_scope {
-                ListScope::Installed
-            } else {
-                ListScope::Declared
-            };
-            let view = if globals.tree {
-                ListView::Tree(if explicit_declared {
-                    query.list_tree()
-                } else {
-                    query.list_tree_all()
-                })
-            } else if installed_scope {
-                ListView::Flat(query.list())
-            } else {
-                ListView::Flat(query.declared())
-            };
-            let hidden_dependencies = match &view {
-                ListView::Flat(packages) if !installed_scope => {
-                    query.total_kegs().saturating_sub(packages.len())
-                }
-                _ => 0,
-            };
-            final_output = Some(CommandOutput::List(ListOutput {
-                scope,
-                view,
-                statuses,
-                hidden_dependencies,
-                show_dependency_hint: !explicit_declared,
-            }));
-        }
+        } => commands::query::list(&context, explicit_declared, installed, all)?.into_output(),
         Command::Deps {
             name,
             all,
             status,
             online,
-        } => {
-            let query = client.query_state(events.as_ref())?;
-            let target = name.clone();
-            let selector = PackageSelector(name);
-            let queries_registry = online || query.resolve_selector(&selector).is_none();
-            let view = while_resolving(
-                show_resolution && queries_registry,
-                client.deps(&query, selector, online, !null),
-            )
-            .await??;
-            let direct = !tree && !all;
-            final_output = Some(CommandOutput::Deps(output::deps_output(
-                view, target, direct, status,
-            )));
-        }
-        Command::Why { all, name } => {
-            let query = client.query_state(events.as_ref())?;
-            let view = query.why(&PackageSelector(name.clone()), true);
-            final_output = Some(CommandOutput::ReverseDeps(ReverseDepsOutput {
-                command: CommandId::Why,
-                source: ReverseDepsSource::Installed,
-                target: name,
-                direct: false,
-                all: all && !tree,
-                root: view.root,
-                statuses: view.statuses,
-            }));
-        }
-        Command::Uses { all, name } => {
-            let selector = PackageSelector(name.clone());
-            let direct = !tree && !all;
-            let statuses = if null {
-                BTreeMap::new()
-            } else {
-                client.query_state(events.as_ref())?.package_statuses()
-            };
-            let Some(root) =
-                while_resolving(show_resolution, client.uses(selector, direct)).await??
-            else {
-                return Err(anyhow!("registry returned nothing for '{name}'").into());
-            };
-            final_output = Some(CommandOutput::ReverseDeps(ReverseDepsOutput {
-                command: CommandId::Uses,
-                source: ReverseDepsSource::Registry,
-                target: name,
-                direct,
-                all: all && !tree,
-                root: Some(root),
-                statuses,
-            }));
-        }
-        Command::Info { names } => {
-            let query = client.query_state(events.as_ref())?;
-            if names.len() == 1 {
-                let requested = PackageSelector(names.into_iter().next().expect("one info name"));
-                let (info, installed) =
-                    while_resolving(show_resolution, client.info(&query, requested.clone()))
-                        .await??;
-                let status = query.package_status(&info.package_key);
-                final_output = Some(CommandOutput::Info(Box::new(InfoOutput {
-                    package: info,
-                    installed,
-                    declared: status.as_ref().is_some_and(|status| status.declared),
-                    deactivated: status.is_some_and(|status| status.deactivated),
-                })));
-            } else {
-                let config = client.config().clone();
-                let registry = glu_client::registry::resolve_client::HttpResolveClient::new(
-                    &config.registry_base_url,
-                )?;
-                let mut handles = Vec::new();
-                for name in names {
-                    let selector = PackageSelector(name.clone());
-                    let registry = registry.clone();
-                    let target = config.target.clone();
-                    handles.push(tokio::spawn(async move {
-                        let result = registry.info(&selector, &target).await;
-                        (name, result)
-                    }));
-                }
-
-                let results = while_resolving(show_resolution, async {
-                    let mut results = Vec::with_capacity(handles.len());
-                    for handle in handles {
-                        results.push(handle.await);
-                    }
-                    results
-                })
-                .await?;
-                let mut packages = Vec::new();
-                for result in results {
-                    match result {
-                        Ok((name, Ok(info))) => {
-                            let installed = query.find_by_key(&info.package_key).cloned();
-                            let status = query.package_status(&info.package_key);
-                            packages.push(InfoPackageResult {
-                                requested: name,
-                                found: true,
-                                package: Some(info),
-                                installed,
-                                declared: status.as_ref().is_some_and(|status| status.declared),
-                                deactivated: status.is_some_and(|status| status.deactivated),
-                                error: None,
-                            });
-                        }
-                        Ok((name, Err(error))) => {
-                            let selector = PackageSelector(name.clone());
-                            let installed = query.resolve_selector(&selector).cloned();
-                            let status = query.package_status_for_selector(&selector);
-                            packages.push(InfoPackageResult {
-                                requested: name,
-                                found: false,
-                                package: None,
-                                installed,
-                                declared: status.as_ref().is_some_and(|status| status.declared),
-                                deactivated: status.is_some_and(|status| status.deactivated),
-                                error: Some(InfoPackageError {
-                                    code: ErrorCode::PackageInfoFailed,
-                                    message: error.to_string(),
-                                }),
-                            });
-                        }
-                        Err(error) => packages.push(InfoPackageResult {
-                            requested: "<task>".to_string(),
-                            found: false,
-                            package: None,
-                            installed: None,
-                            declared: false,
-                            deactivated: false,
-                            error: Some(InfoPackageError {
-                                code: ErrorCode::PackageInfoTaskFailed,
-                                message: error.to_string(),
-                            }),
-                        }),
-                    }
-                }
-                final_output = Some(CommandOutput::InfoMany(InfoManyOutput { packages }));
-            }
-        }
+        } => commands::query::deps(&context, name, all, status, online)
+            .await?
+            .into_output(),
+        Command::Why { all, name } => commands::query::why(&context, name, all)?.into_output(),
+        Command::Uses { all, name } => commands::query::uses(&context, name, all)
+            .await?
+            .into_output(),
+        Command::Info { names } => commands::query::info(&context, names).await?.into_output(),
         Command::Deactivate { names } => {
-            let names = names.into_iter().map(PackageSelector).collect();
-            let results = client.deactivate(names)?;
-            final_output = Some(CommandOutput::Deactivation(output::deactivation_output(
-                &results,
-            )));
+            commands::configuration::deactivate(&context, names)?.into_output()
         }
         Command::Activate { force, names } => {
-            let names = names.into_iter().map(PackageSelector).collect();
-            let results = client.activate(names, force)?;
-            final_output = Some(CommandOutput::Activation(output::activation_output(
-                force, &results,
-            )));
+            commands::configuration::activate(&context, names, force)?.into_output()
         }
         Command::Shellenv { shell } => {
-            final_output = Some(CommandOutput::Shellenv(client.shellenv(shell.as_deref())?));
+            commands::configuration::shellenv(&context, shell)?.into_output()
         }
-        Command::Setup => {
-            final_output = Some(CommandOutput::Setup(client.setup_shells()?));
-        }
+        Command::Setup => commands::configuration::setup(&context)?.into_output(),
         Command::Outdated {
             declared,
             installed: _,
             all: _,
-        } => {
-            let query = client.query_state(events.as_ref())?;
-            let mut outdated = while_resolving(show_resolution, client.outdated(&query)).await??;
-            let scope = if declared {
-                outdated.packages.retain(|package| {
-                    query
-                        .package_status(&package.package_key)
-                        .is_some_and(|status| status.declared)
-                });
-                "declared"
-            } else {
-                "installed"
-            };
-            final_output = Some(CommandOutput::Outdated(output::outdated_output(
-                scope, outdated,
-            )));
-        }
+        } => commands::query::outdated(&context, declared)
+            .await?
+            .into_output(),
         Command::Update {
             all,
             dependents,
             names,
-        } => {
-            // Bare `glu up` / `glu up --all` are broad mutations and always
-            // present their plan; a named update asks only when it would
-            // remove something (a dependency the new version dropped) — the
-            // same removal-triggered rule as install/reinstall.
-            let is_broad = all || names.is_empty();
-            let names = names.into_iter().map(PackageSelector).collect();
-            let plan_result =
-                while_resolving(show_resolution, client.plan_update(names, all, dependents))
-                    .await??;
-            if plan {
-                final_output = Some(CommandOutput::UpdatePlan(output::update_plan_output(
-                    &plan_result,
-                    is_broad,
-                )));
-                return Ok((final_output, globals));
-            }
-            let plan = plan_result;
-            if !json {
-                output::render_update_preflight(&plan);
-            }
-            if plan.to_update.is_empty() && plan.to_remove.is_empty() {
-                let summary = client.execute_update(plan, verbose, events.clone()).await?;
-                final_output = Some(CommandOutput::Update(output::update_output(&summary)));
-                return Ok((final_output, globals));
-            }
-            if !json {
-                output::render_update_execution_plan(&plan, tree);
-            }
-            if !yes && (is_broad || !plan.to_remove.is_empty()) {
-                if json {
-                    let planned_updates = plan
-                        .to_update
-                        .iter()
-                        .map(|update| ErrorUpdateRecord {
-                            current: update.current.clone(),
-                            latest: update.latest.clone(),
-                            name: update.name.0.clone(),
-                        })
-                        .collect();
-                    let planned_removals = plan
-                        .to_remove
-                        .iter()
-                        .map(|package| ErrorPackageRecord {
-                            name: package.name.0.clone(),
-                            version: package.keg_version.0.clone(),
-                        })
-                        .collect();
-                    return Err(CliFailure::Structured(Box::new(
-                        CliError::confirmation_required(
-                            "update requires confirmation; rerun with --yes to approve this computed plan",
-                            vec!["glu update --yes --json".to_string()],
-                            Some(CliErrorDetails::UpdateConfirmation(
-                                UpdateConfirmationDetails {
-                                    broad: is_broad,
-                                    planned_removals,
-                                    planned_updates,
-                                },
-                            )),
-                        ),
-                    )));
-                }
-                if !confirm::confirm_update(&plan)? {
-                    return Ok((None, globals));
-                }
-            }
-            let summary = client.execute_update(plan, verbose, events.clone()).await?;
-            final_output = Some(CommandOutput::Update(output::update_output(&summary)));
-        }
-        Command::Upgrade => {
-            final_output = Some(CommandOutput::Upgrade(
-                client.upgrade(events.as_ref()).await?,
-            ));
-        }
-        Command::Status => {
-            let query = client.query_state(events.as_ref())?;
-            final_output = Some(CommandOutput::Status(output::status_output(
-                &client, &query,
-            )?));
-        }
-        Command::Trace(cmd) => {
-            final_output = Some(trace_cmd::run_trace(&client, cmd, verbose)?);
-        }
+        } => commands::packages::update(&context, names, all, dependents)
+            .await?
+            .into_output(),
+        Command::Upgrade => commands::configuration::upgrade(&context)
+            .await?
+            .into_output(),
+        Command::Status => commands::query::status(&context)?.into_output(),
+        Command::Trace(command) => commands::observability::trace(&context, command)?.into_output(),
         Command::Help { command, schemas } => {
-            final_output = Some(CommandOutput::Help(help::help_output(
-                &command, json, schemas,
-            )?));
+            commands::observability::help(&context, command, schemas)?.into_output()
         }
         Command::PostinstallWorker { .. } => unreachable!("handled before config setup"),
-    }
+    };
 
     Ok((final_output, globals))
-}
-
-fn install_confirmation_failure(
-    plan: &glu_client::install::InstallPlan,
-    command: &'static str,
-) -> CliFailure {
-    let planned_removals = plan
-        .would_remove
-        .iter()
-        .map(|package| ErrorPackageRecord {
-            name: package.name.0.clone(),
-            version: package.keg_version.0.clone(),
-        })
-        .collect();
-    CliFailure::Structured(Box::new(CliError::confirmation_required(
-        format!(
-            "{command} would remove unused packages; rerun with --yes to approve this computed plan"
-        ),
-        vec![format!("glu {command} --yes --json <name>...")],
-        Some(CliErrorDetails::InstallConfirmation(
-            InstallConfirmationDetails {
-                command: command.to_string(),
-                planned_removals,
-            },
-        )),
-    )))
 }
 
 fn validate_global_options(
