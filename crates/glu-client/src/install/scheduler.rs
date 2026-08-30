@@ -641,6 +641,11 @@ const KNOWN_NODE_COSTS: &[KnownNodeCost] = &[
         milliseconds: 4_000,
     },
     KnownNodeCost {
+        node_kind: NodeKind::BottlePrepare,
+        subject: KnownCostSubject::Formula("llvm@22"),
+        milliseconds: 2_500,
+    },
+    KnownNodeCost {
         node_kind: NodeKind::FormulaPostinstall,
         subject: KnownCostSubject::Formula("ca-certificates"),
         milliseconds: 5_000,
@@ -992,6 +997,14 @@ mod tests {
             0,
             0.0,
         );
+        let llvm_22 = node(
+            "bottle_prepare:llvm@22",
+            NodeKind::BottlePrepare,
+            "prepare",
+            Some("llvm@22"),
+            0,
+            0.0,
+        );
         let unknown = node(
             "formula_postinstall:unknown",
             NodeKind::FormulaPostinstall,
@@ -1012,6 +1025,7 @@ mod tests {
 
         assert_eq!(known_node_cost(&gcc), 2_000);
         assert_eq!(known_node_cost(&llvm), 4_000);
+        assert_eq!(known_node_cost(&llvm_22), 2_500);
         assert_eq!(known_node_cost(&cache), 15_000);
         assert_eq!(known_node_cost(&unknown), 0);
     }
