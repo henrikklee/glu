@@ -16,9 +16,11 @@ use std::{
 /// called from `formula_installer.rb:1015` right before `post_install` — an
 /// install-time step, not a link operation. `brew link`/`unlink` never touch
 /// these files, and `uninstall` leaves them in place with a notice
-/// (uninstall.rb:76-118). glu mirrors that: this runs from
-/// `commit_prepared_keg` (install/relink), never from `link_keg`
-/// (symlink linking) or `unlink_keg`/`rm` (no removal).
+/// (uninstall.rb:76-118). glu improves removal semantics by deleting an exact
+/// copied default when it is unchanged and no retained package claims it,
+/// while preserving modified/shared files by default. Installation still runs
+/// from `commit_prepared_keg` (install/relink), never from `link_keg` or
+/// `unlink_keg`; removal derives its own pre-mutation `.bottle` inventory.
 ///
 /// Only `etc` and `var` are considered — formula.rb:1589
 /// (`etc_var_dirs = [bottle_prefix/"etc", bottle_prefix/"var"]`). Real

@@ -1,8 +1,8 @@
 use super::{approval, CommandContext, CommandOutcome, CommandResult};
 use crate::command_model::{
     CleanupConfirmationDetails, CleanupConfirmationRecord, CliError, CliErrorDetails,
-    CommandOutput, ErrorPackageRecord, PlannedRemovalsDetails, PurgeConfirmationDetails,
-    RemovalConfirmationDetails,
+    CommandOutput, ErrorPackageRecord, ModifiedConfigConfirmationDetails, PlannedRemovalsDetails,
+    PurgeConfirmationDetails, RemovalConfirmationDetails,
 };
 use crate::{confirm, output};
 use glu_core::PackageSelector;
@@ -105,25 +105,41 @@ pub(crate) fn cleanup(context: &CommandContext<'_>) -> CommandResult {
     )))
 }
 
-pub(crate) fn purge(context: &CommandContext<'_>, keep_declaration: bool) -> CommandResult {
+pub(crate) fn purge(
+    context: &CommandContext<'_>,
+    keep_declaration: bool,
+    remove_config: bool,
+) -> CommandResult {
     let purge_plan = context.client.plan_purge(keep_declaration)?;
     if context.globals.plan {
         return Ok(CommandOutcome::output(CommandOutput::PurgePlan(
-            output::purge_plan_output(&purge_plan),
+            output::purge_plan_output(&purge_plan, remove_config),
         )));
     }
     if !purge_plan.requires_confirmation() {
         return Ok(CommandOutcome::output(CommandOutput::Purge(
-            output::purge_output(&purge_plan, &[]),
+            output::purge_output(
+                &purge_plan,
+                &glu_client::remove::RemovalResult {
+                    removed: Vec::new(),
+                    mutable_files: Default::default(),
+                },
+            ),
         )));
     }
     if !context.globals.is_json() {
-        output::render_purge_execution_plan(&purge_plan);
+        output::render_purge_execution_plan(&purge_plan, remove_config, context.globals.verbose);
     }
+    let purge_hint = match (keep_declaration, remove_config) {
+        (true, true) => "glu purge --keep-declaration --remove-config --yes --json",
+        (true, false) => "glu purge --keep-declaration --yes --json",
+        (false, true) => "glu purge --remove-config --yes --json",
+        (false, false) => "glu purge --yes --json",
+    };
     let approved = approval::approve(
         context.globals,
         || {
-            let summary = output::purge_plan_output(&purge_plan);
+            let summary = output::purge_plan_output(&purge_plan, remove_config);
             let planned_removals = purge_plan
                 .packages
                 .iter()
@@ -134,11 +150,7 @@ pub(crate) fn purge(context: &CommandContext<'_>, keep_declaration: bool) -> Com
                 .collect();
             CliError::confirmation_required(
                 "purge would remove installed packages or glu.json; rerun with --yes to approve this computed plan",
-                vec![if keep_declaration {
-                    "glu purge --keep-declaration --yes --json".to_string()
-                } else {
-                    "glu purge --yes --json".to_string()
-                }],
+                vec![purge_hint.to_string()],
                 Some(CliErrorDetails::PurgeConfirmation(
                     PurgeConfirmationDetails {
                         planned_removals,
@@ -149,30 +161,42 @@ pub(crate) fn purge(context: &CommandContext<'_>, keep_declaration: bool) -> Com
                 )),
             )
         },
-        || confirm::confirm_purge(&purge_plan),
+        || confirm::confirm_purge(&purge_plan, remove_config),
     )?;
     if !approved {
         return Ok(CommandOutcome::cancelled());
     }
-    let removed = context.client.execute_purge(&purge_plan)?;
-    let leftover =
-        glu_client::remove::leftover_config_files(&context.client.config().prefix, &removed);
+    let remove_modified = approve_modified_config_cleanup(
+        context,
+        &purge_plan.mutable_files.modified,
+        remove_config,
+        "glu purge --remove-config --yes --json",
+    )?;
+    let result = context.client.execute_purge(&purge_plan, remove_modified)?;
     Ok(CommandOutcome::output(CommandOutput::Purge(
-        output::purge_output(&purge_plan, &leftover),
+        output::purge_output(&purge_plan, &result),
     )))
 }
 
-pub(crate) fn remove(context: &CommandContext<'_>, names: Vec<String>) -> CommandResult {
+pub(crate) fn remove(
+    context: &CommandContext<'_>,
+    names: Vec<String>,
+    remove_config: bool,
+) -> CommandResult {
     let removal_plan = context
         .client
         .plan_removal(names.into_iter().map(PackageSelector).collect())?;
     if context.globals.plan {
         return Ok(CommandOutcome::output(CommandOutput::RemovalPlan(
-            output::removal_plan_output(&removal_plan),
+            output::removal_plan_output(&removal_plan, remove_config),
         )));
     }
     if !context.globals.is_json() {
-        output::render_removal_execution_plan(&removal_plan);
+        output::render_removal_execution_plan(
+            &removal_plan,
+            remove_config,
+            context.globals.verbose,
+        );
     }
     if removal_plan.to_remove.len() > removal_plan.named.len() {
         let approved = approval::approve(
@@ -194,9 +218,14 @@ pub(crate) fn remove(context: &CommandContext<'_>, names: Vec<String>) -> Comman
                         version: package.keg_version.0.clone(),
                     })
                     .collect();
+                let hint = if remove_config {
+                    "glu remove --remove-config --yes --json <selector>..."
+                } else {
+                    "glu remove --yes --json <selector>..."
+                };
                 CliError::confirmation_required(
                     "remove would remove packages beyond the named selectors; rerun with --yes to approve this computed plan",
-                    vec!["glu remove --yes --json <selector>...".to_string()],
+                    vec![hint.to_string()],
                     Some(CliErrorDetails::RemovalConfirmation(
                         RemovalConfirmationDetails {
                             named,
@@ -205,16 +234,58 @@ pub(crate) fn remove(context: &CommandContext<'_>, names: Vec<String>) -> Comman
                     )),
                 )
             },
-            || confirm::confirm_removal(&removal_plan),
+            || confirm::confirm_removal(&removal_plan, remove_config),
         )?;
         if !approved {
             return Ok(CommandOutcome::cancelled());
         }
     }
-    let removed = context.client.execute_removal(&removal_plan)?;
-    let leftover =
-        glu_client::remove::leftover_config_files(&context.client.config().prefix, &removed);
+    let remove_modified = approve_modified_config_cleanup(
+        context,
+        &removal_plan.mutable_files.modified,
+        remove_config,
+        "glu remove --remove-config --yes --json <selector>...",
+    )?;
+    let result = context
+        .client
+        .execute_removal(&removal_plan, remove_modified)?;
     Ok(CommandOutcome::output(CommandOutput::Removal(
-        output::removal_output(&removed, &removal_plan.kept, &leftover),
+        output::removal_output(&result, &removal_plan.kept),
     )))
+}
+
+fn approve_modified_config_cleanup(
+    context: &CommandContext<'_>,
+    modified: &[glu_client::remove::MutableFilePlan],
+    requested: bool,
+    command_hint: &str,
+) -> Result<bool, crate::CliFailure> {
+    if modified.is_empty() {
+        return Ok(false);
+    }
+    if !requested {
+        if context.globals.yes || context.globals.is_json() {
+            return Ok(false);
+        }
+        return confirm::offer_modified_config_cleanup(modified.len())
+            .map_err(crate::CliFailure::from);
+    }
+    approval::approve(
+        context.globals,
+        || {
+            CliError::confirmation_required(
+                "remove would delete modified configuration files; rerun with --remove-config --yes to approve this computed plan",
+                vec![command_hint.to_string()],
+                Some(CliErrorDetails::ModifiedConfigConfirmation(
+                    ModifiedConfigConfirmationDetails {
+                        modified_config_files: modified
+                            .iter()
+                            .map(|file| file.path.to_string_lossy().into_owned())
+                            .collect(),
+                    },
+                )),
+            )
+        },
+        || confirm::confirm_modified_config_cleanup(modified.len()),
+    )
 }

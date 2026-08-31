@@ -1,4 +1,4 @@
-use crate::remove::{self, RemovedPackage};
+use crate::remove::{self, MutableFileCleanupPlan, RemovalResult};
 use crate::state::{store::InstalledStateStore, Declaration};
 use anyhow::Result;
 use glu_core::{InstalledPackage, Prefix};
@@ -9,6 +9,7 @@ use glu_core::{InstalledPackage, Prefix};
 #[derive(Debug)]
 pub struct PurgePlan {
     pub packages: Vec<InstalledPackage>,
+    pub mutable_files: MutableFileCleanupPlan,
     pub declaration: Option<Declaration>,
     pub keep_declaration: bool,
 }
@@ -43,8 +44,11 @@ pub fn plan_purge(prefix: &Prefix, keep_declaration: bool) -> Result<PurgePlan> 
     let installed = store.load_installed_state_with_declaration(
         declaration.as_ref().unwrap_or(&Declaration::default()),
     )?;
+    let packages = installed.list();
+    let mutable_files = remove::plan_mutable_file_cleanup(prefix, &packages, &packages)?;
     Ok(PurgePlan {
-        packages: installed.list(),
+        packages,
+        mutable_files,
         declaration,
         keep_declaration,
     })
@@ -53,9 +57,19 @@ pub fn plan_purge(prefix: &Prefix, keep_declaration: bool) -> Result<PurgePlan> 
 /// Executes exactly the package set captured by `plan`. Declaration removal
 /// happens first so interrupted default purges retain the user's requested
 /// intent change; `--keep-declaration` never writes or prunes the declaration.
-pub fn execute_purge(prefix: &Prefix, plan: &PurgePlan) -> Result<Vec<RemovedPackage>> {
+pub fn execute_purge(
+    prefix: &Prefix,
+    plan: &PurgePlan,
+    remove_modified: bool,
+) -> Result<RemovalResult> {
     if !plan.keep_declaration && plan.declaration_present() {
         InstalledStateStore::new(prefix.clone()).remove_declaration()?;
     }
-    remove::remove_installed_packages(prefix, &plan.packages)
+    let removed = remove::remove_installed_packages_raw(prefix, &plan.packages)?;
+    let mutable_files =
+        remove::execute_mutable_file_cleanup(prefix, &plan.mutable_files, remove_modified)?;
+    Ok(RemovalResult {
+        removed,
+        mutable_files,
+    })
 }

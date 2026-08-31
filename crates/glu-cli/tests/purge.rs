@@ -233,3 +233,90 @@ fn purge_human_plan_explains_kept_declaration_and_restore_path() {
         )
     );
 }
+
+#[test]
+fn purge_removes_unchanged_configuration_and_keeps_modified_configuration_by_default() {
+    let prefix = tempfile::tempdir().unwrap();
+    prepare_prefix(prefix.path());
+    let unchanged = write_mutable_file(
+        prefix.path(),
+        "root",
+        "1.0",
+        "etc/root/default.conf",
+        b"default\n",
+        b"default\n",
+    );
+    let modified = write_mutable_file(
+        prefix.path(),
+        "root",
+        "1.0",
+        "etc/root/user.conf",
+        b"default\n",
+        b"changed\n",
+    );
+
+    let plan = json_command(prefix.path(), &["purge", "--plan", "--json"]);
+    assert_eq!(
+        plan["result"]["configuration"]["would_remove"],
+        serde_json::json!([unchanged.clone()])
+    );
+    assert_eq!(
+        plan["result"]["configuration"]["would_retain_modified"],
+        serde_json::json!([modified.clone()])
+    );
+
+    let result = json_command(prefix.path(), &["purge", "--yes", "--json"]);
+    assert!(!unchanged.exists());
+    assert!(modified.exists());
+    assert_eq!(
+        result["result"]["configuration"]["retained_modified"],
+        serde_json::json!([modified])
+    );
+}
+
+#[test]
+fn purge_remove_config_deletes_modified_attributable_files() {
+    let prefix = tempfile::tempdir().unwrap();
+    prepare_prefix(prefix.path());
+    let modified = write_mutable_file(
+        prefix.path(),
+        "root",
+        "1.0",
+        "etc/root/user.conf",
+        b"default\n",
+        b"changed\n",
+    );
+
+    let result = json_command(
+        prefix.path(),
+        &["purge", "--remove-config", "--yes", "--json"],
+    );
+
+    assert_eq!(
+        result["result"]["configuration"]["removed"],
+        serde_json::json!([modified.clone()])
+    );
+    assert!(!modified.exists());
+}
+
+fn write_mutable_file(
+    prefix: &Path,
+    name: &str,
+    version: &str,
+    relative: &str,
+    default: &[u8],
+    live: &[u8],
+) -> std::path::PathBuf {
+    let source = prefix
+        .join("Cellar")
+        .join(name)
+        .join(version)
+        .join(".bottle")
+        .join(relative);
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(source, default).unwrap();
+    let destination = prefix.join(relative);
+    fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    fs::write(&destination, live).unwrap();
+    destination
+}

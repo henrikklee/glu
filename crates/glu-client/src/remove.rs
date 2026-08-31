@@ -6,13 +6,27 @@ use crate::state::Declaration;
 use anyhow::{bail, Result};
 use glu_core::{InstalledPackage, KegVersion, PackageId, PackageName, Prefix};
 use std::collections::BTreeSet;
-use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct RemovedPackage {
     pub name: PackageName,
     pub keg_version: KegVersion,
+}
+
+mod mutable_files;
+
+pub use mutable_files::{
+    execute_mutable_file_cleanup, plan_mutable_file_cleanup, MutableFileArea,
+    MutableFileCleanupPlan, MutableFileCleanupResult, MutableFilePlan, RetainedMutableFile,
+    RetainedMutableFileReason,
+};
+
+#[derive(Debug)]
+pub struct RemovalResult {
+    pub removed: Vec<RemovedPackage>,
+    pub mutable_files: MutableFileCleanupResult,
 }
 
 /// A declared package that `glu rm` removed from the declaration but kept
@@ -42,6 +56,7 @@ pub struct RemovalPlan {
     /// Declared targets that other declared packages still need: kept
     /// installed and reported.
     pub kept: Vec<KeptDeclaredPackage>,
+    pub mutable_files: MutableFileCleanupPlan,
     post_declaration: Declaration,
 }
 
@@ -51,7 +66,10 @@ pub struct RemovalPlan {
 /// nor dangling) happen here, before the requested removal is touched.
 pub fn plan_removal(prefix: &Prefix, selectors: Vec<String>) -> Result<RemovalPlan> {
     let snapshot = StateSnapshot::load(prefix)?;
-    plan_removal_from_snapshot(&snapshot, selectors)
+    let mut plan = plan_removal_from_snapshot(&snapshot, selectors)?;
+    plan.mutable_files =
+        plan_mutable_file_cleanup(prefix, &snapshot.installed.list(), &plan.to_remove)?;
+    Ok(plan)
 }
 
 /// The removal-plan logic over an already-loaded installed list and the
@@ -184,6 +202,7 @@ fn plan_removal_from_parts(
         named: targets,
         to_remove,
         kept,
+        mutable_files: MutableFileCleanupPlan::default(),
         post_declaration,
     })
 }
@@ -192,12 +211,26 @@ fn plan_removal_from_parts(
 /// in `plan.to_remove`. Returns the removed packages, one per keg, in plan
 /// order.
 pub fn execute_removal(prefix: &Prefix, plan: &RemovalPlan) -> Result<Vec<RemovedPackage>> {
+    Ok(execute_removal_with_config(prefix, plan, false)?.removed)
+}
+
+pub fn execute_removal_with_config(
+    prefix: &Prefix,
+    plan: &RemovalPlan,
+    remove_modified: bool,
+) -> Result<RemovalResult> {
     // `rm` removes from the declaration first: the named targets leave
     // `glu.json` whether they are removed or demoted-and-kept. Written
     // before the keg surgery so an interrupted removal still reflects the
     // intent change (a keg left behind becomes dangling and is cleaned up
     // by the next sync).
-    execute_package_removal(prefix, &plan.to_remove, Some(&plan.post_declaration))
+    execute_package_removal(
+        prefix,
+        &plan.to_remove,
+        Some(&plan.post_declaration),
+        &plan.mutable_files,
+        remove_modified,
+    )
 }
 
 /// The dangling packages of a prefix: installed, not declared, and not
@@ -215,14 +248,18 @@ pub fn execute_autoremove(
     prefix: &Prefix,
     dangling: &[InstalledPackage],
 ) -> Result<Vec<RemovedPackage>> {
-    execute_package_removal(prefix, dangling, None)
+    let installed = StateSnapshot::load(prefix)?.installed.list();
+    let cleanup = plan_mutable_file_cleanup(prefix, &installed, dangling)?;
+    Ok(execute_package_removal(prefix, dangling, None, &cleanup, false)?.removed)
 }
 
 fn execute_package_removal(
     prefix: &Prefix,
     packages: &[InstalledPackage],
     planned_declaration: Option<&Declaration>,
-) -> Result<Vec<RemovedPackage>> {
+    cleanup: &MutableFileCleanupPlan,
+    remove_modified: bool,
+) -> Result<RemovalResult> {
     let store = InstalledStateStore::new(prefix.clone());
     let mut declaration = match planned_declaration {
         Some(declaration) => declaration.clone(),
@@ -233,7 +270,12 @@ fn execute_package_removal(
         store.write_declaration(&declaration)?;
     }
 
-    remove_installed_packages(prefix, packages)
+    let removed = remove_installed_packages_raw(prefix, packages)?;
+    let mutable_files = execute_mutable_file_cleanup(prefix, cleanup, remove_modified)?;
+    Ok(RemovalResult {
+        removed,
+        mutable_files,
+    })
 }
 
 fn prune_deactivated_entries_for_removed_names(
@@ -268,6 +310,17 @@ pub(crate) fn remove_installed_packages(
     prefix: &Prefix,
     packages: &[InstalledPackage],
 ) -> Result<Vec<RemovedPackage>> {
+    let installed = StateSnapshot::load(prefix)?.installed.list();
+    let cleanup = plan_mutable_file_cleanup(prefix, &installed, packages)?;
+    let removed = remove_installed_packages_raw(prefix, packages)?;
+    execute_mutable_file_cleanup(prefix, &cleanup, false)?;
+    Ok(removed)
+}
+
+pub(crate) fn remove_installed_packages_raw(
+    prefix: &Prefix,
+    packages: &[InstalledPackage],
+) -> Result<Vec<RemovedPackage>> {
     let mut removed = Vec::new();
     for package in packages {
         remove_keg(prefix, &package.name, &package.keg_path)?;
@@ -277,95 +330,6 @@ pub(crate) fn remove_installed_packages(
         });
     }
     Ok(removed)
-}
-
-/// The config files `glu rm` leaves behind: `.bottle`-sourced copies under
-/// `prefix/etc` that `link/bottle.rs::install_etc_var` wrote as real files and
-/// that removal deliberately does not delete. Homebrew parity — uninstall.rb
-/// never removes them and prints a notice instead (uninstall.rb:76-118); glu's
-/// `rm` prints the same after removal (see docs/explanation/install-pipeline.md).
-///
-/// Ported (simplified): the definite list is the recursive contents of
-/// `prefix/etc/<name>` per removed package (Homebrew's `f.pkgetc.find`), the
-/// "may be" list is Homebrew's `Dir.glob("#{f.etc}/#{unversioned_name}*")`
-/// (unversioned = name without an `@version` suffix) — merged, sorted,
-/// deduped, minus entries whose basename is another installed formula's name
-/// (Homebrew's `excluded_names`). Informational only: read failures inside
-/// `etc/` yield whatever was collected, never an error — a failed notice must
-/// not fail the removal it reports on.
-pub fn leftover_config_files(prefix: &Prefix, removed: &[RemovedPackage]) -> Vec<PathBuf> {
-    let etc = prefix.0.join("etc");
-    if !etc.is_dir() {
-        return Vec::new();
-    }
-    let installed_names: BTreeSet<PackageName> = StateSnapshot::load(prefix)
-        .map(|snapshot| {
-            snapshot
-                .installed
-                .list()
-                .into_iter()
-                .map(|p| p.name)
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let mut out = Vec::new();
-    for package in removed {
-        // Definite: everything under prefix/etc/<name> (Homebrew's `f.pkgetc.find`).
-        let name_dir = etc.join(&package.name.0);
-        if name_dir.is_dir() {
-            collect_recursive(&name_dir, &mut out);
-        }
-        // May-be: `Dir.glob("#{f.etc}/#{unversioned_name}*")`.
-        let unversioned = package.name.0.split('@').next().unwrap_or(&package.name.0);
-        if let Ok(entries) = fs::read_dir(&etc) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let Some(file_name) = path.file_name() else {
-                    continue;
-                };
-                let file_name = file_name.to_string_lossy();
-                if !file_name.starts_with(unversioned) {
-                    continue;
-                }
-                // Homebrew drops entries whose basename (extension stripped
-                // for files) is a known formula name — another formula's
-                // directory at `etc/openssl@4` is not `openssl@3`'s config.
-                let basename = if path.is_dir() {
-                    file_name.into_owned()
-                } else {
-                    Path::new(file_name.as_ref())
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| file_name.into_owned())
-                };
-                if installed_names.contains(&PackageName(basename)) {
-                    continue;
-                }
-                out.push(path);
-            }
-        }
-    }
-    out.sort();
-    out.dedup();
-    out
-}
-
-/// Push `dir` and every entry beneath it, depth-first (directories first) —
-/// the Rust equivalent of Ruby's `Pathname#find` used for Homebrew's
-/// definite list.
-fn collect_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
-    out.push(dir.to_path_buf());
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect_recursive(&path, out);
-            } else {
-                out.push(path);
-            }
-        }
-    }
 }
 
 /// Three-tier resolution against installed state, most specific match
@@ -907,55 +871,276 @@ mod tests {
         assert!(prefix.0.join("Cellar/vips/8.19.0").exists());
     }
 
-    #[test]
-    fn leftover_config_files_lists_copied_configs_after_removal() {
-        let tmp = TempDir::new().unwrap();
-        let prefix = Prefix(tmp.path().to_path_buf());
-        write_fixture_receipt(&prefix, "gnupg", "2.5.0", 0, true, vec![]);
-        // A `.bottle`-sourced config copied by install_etc_var — a real file
-        // in the prefix that `rm` deliberately leaves behind.
-        let conf = prefix.0.join("etc/gnupg/gpg.conf");
-        fs::create_dir_all(conf.parent().unwrap()).unwrap();
-        fs::write(&conf, b"user config\n").unwrap();
-
-        let plan = plan_removal(&prefix, vec!["gnupg".to_string()]).unwrap();
-        let removed = execute_removal(&prefix, &plan).unwrap();
-        // The keg is gone, the config file survives.
-        assert!(!prefix.0.join("Cellar/gnupg").exists());
-        assert!(conf.is_file());
-
-        let leftover = leftover_config_files(&prefix, &removed);
-        assert!(leftover.iter().any(|p| p == &conf));
-        assert!(leftover.iter().any(|p| p == &prefix.0.join("etc/gnupg")));
+    fn write_mutable_default(
+        prefix: &Prefix,
+        name: &str,
+        version: &str,
+        relative: &str,
+        default: &[u8],
+        live: &[u8],
+    ) -> PathBuf {
+        let source = prefix
+            .0
+            .join("Cellar")
+            .join(name)
+            .join(version)
+            .join(".bottle")
+            .join(relative);
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, default).unwrap();
+        let destination = prefix.0.join(relative);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, live).unwrap();
+        destination
     }
 
     #[test]
-    fn leftover_config_files_maybe_glob_skips_other_formulas_dirs() {
+    fn removal_automatically_deletes_unique_unchanged_defaults() {
         let tmp = TempDir::new().unwrap();
         let prefix = Prefix(tmp.path().to_path_buf());
-        write_fixture_receipt(&prefix, "openssl@3", "3.3.0", 0, true, vec![]);
-        write_fixture_receipt(&prefix, "openssl@4", "4.0.0", 0, true, vec![]);
-        let own_dir = prefix.0.join("etc/openssl@3");
-        fs::create_dir_all(&own_dir).unwrap();
-        fs::write(own_dir.join("openssl.cnf"), b"config\n").unwrap();
-        // A real sibling formula's dir at `etc/openssl@4` must not be reported
-        // as `openssl@3`'s leftover config (Homebrew's excluded_names).
-        let sibling = prefix.0.join("etc/openssl@4");
-        fs::create_dir_all(&sibling).unwrap();
-        fs::write(sibling.join("cnf"), b"other\n").unwrap();
-
-        let leftover = leftover_config_files(
+        write_fixture_receipt(&prefix, "fontconfig", "2.0", 0, true, vec![]);
+        let config = write_mutable_default(
             &prefix,
-            &[RemovedPackage {
-                name: PackageName("openssl@3".to_string()),
-                keg_version: KegVersion("3.3.0".to_string()),
-            }],
+            "fontconfig",
+            "2.0",
+            "etc/fonts/fonts.conf",
+            b"default\n",
+            b"default\n",
         );
 
-        assert!(leftover
-            .iter()
-            .any(|p| p == &prefix.0.join("etc/openssl@3")));
-        assert!(leftover.iter().any(|p| p == &own_dir.join("openssl.cnf")));
-        assert!(!leftover.iter().any(|p| p == &sibling));
+        let plan = plan_removal(&prefix, vec!["fontconfig".to_string()]).unwrap();
+        assert_eq!(plan.mutable_files.unchanged.len(), 1);
+        assert!(plan.mutable_files.modified.is_empty());
+
+        let result = execute_removal_with_config(&prefix, &plan, false).unwrap();
+        assert_eq!(result.mutable_files.removed, vec![config.clone()]);
+        assert!(!config.exists());
+        assert!(!prefix.0.join("etc/fonts").exists());
+    }
+
+    #[test]
+    fn removal_preserves_modified_defaults_unless_explicitly_approved() {
+        let tmp = TempDir::new().unwrap();
+        let prefix = Prefix(tmp.path().to_path_buf());
+        write_fixture_receipt(&prefix, "gnupg", "2.5.0", 0, true, vec![]);
+        let config = write_mutable_default(
+            &prefix,
+            "gnupg",
+            "2.5.0",
+            "etc/gnupg/gpg.conf",
+            b"default\n",
+            b"user config\n",
+        );
+
+        let plan = plan_removal(&prefix, vec!["gnupg".to_string()]).unwrap();
+        assert_eq!(plan.mutable_files.modified.len(), 1);
+        let result = execute_removal_with_config(&prefix, &plan, false).unwrap();
+        assert_eq!(result.mutable_files.retained_modified, vec![config.clone()]);
+        assert!(config.is_file());
+
+        // A fresh package verifies explicit modified-file cleanup separately.
+        write_fixture_receipt(&prefix, "gnupg", "2.5.1", 0, true, vec![]);
+        let config = write_mutable_default(
+            &prefix,
+            "gnupg",
+            "2.5.1",
+            "etc/gnupg/gpg.conf",
+            b"new default\n",
+            b"user config\n",
+        );
+        let plan = plan_removal(&prefix, vec!["gnupg".to_string()]).unwrap();
+        let result = execute_removal_with_config(&prefix, &plan, true).unwrap();
+        assert_eq!(result.mutable_files.removed, vec![config.clone()]);
+        assert!(!config.exists());
+    }
+
+    #[test]
+    fn retained_package_keeps_a_shared_mutable_file() {
+        let tmp = TempDir::new().unwrap();
+        let prefix = Prefix(tmp.path().to_path_buf());
+        write_fixture_receipt(&prefix, "one", "1.0", 0, true, vec![]);
+        write_fixture_receipt(&prefix, "two", "1.0", 0, true, vec![]);
+        let shared = write_mutable_default(
+            &prefix,
+            "one",
+            "1.0",
+            "etc/shared.conf",
+            b"default\n",
+            b"default\n",
+        );
+        write_mutable_default(
+            &prefix,
+            "two",
+            "1.0",
+            "etc/shared.conf",
+            b"default\n",
+            b"default\n",
+        );
+
+        let plan = plan_removal(&prefix, vec!["one".to_string()]).unwrap();
+        assert_eq!(plan.mutable_files.retained.len(), 1);
+        assert_eq!(
+            plan.mutable_files.retained[0].reason,
+            RetainedMutableFileReason::Shared
+        );
+        let result = execute_removal_with_config(&prefix, &plan, true).unwrap();
+        assert_eq!(result.mutable_files.retained_shared, vec![shared.clone()]);
+        assert!(shared.is_file());
+    }
+
+    #[test]
+    fn path_claimed_only_by_removed_packages_is_deleted_once() {
+        let tmp = TempDir::new().unwrap();
+        let prefix = Prefix(tmp.path().to_path_buf());
+        write_fixture_receipt(&prefix, "one", "1.0", 0, true, vec![]);
+        write_fixture_receipt(&prefix, "two", "1.0", 0, true, vec![]);
+        let shared = write_mutable_default(
+            &prefix,
+            "one",
+            "1.0",
+            "etc/shared.conf",
+            b"default\n",
+            b"default\n",
+        );
+        write_mutable_default(
+            &prefix,
+            "two",
+            "1.0",
+            "etc/shared.conf",
+            b"default\n",
+            b"default\n",
+        );
+
+        let plan = plan_removal(&prefix, vec!["one".to_string(), "two".to_string()]).unwrap();
+        assert_eq!(plan.mutable_files.unchanged.len(), 1);
+        assert!(plan.mutable_files.retained.is_empty());
+        let result = execute_removal_with_config(&prefix, &plan, false).unwrap();
+
+        assert_eq!(result.mutable_files.removed, vec![shared.clone()]);
+        assert!(!shared.exists());
+    }
+
+    #[test]
+    fn cleanup_removes_matching_default_but_keeps_unknown_descendants() {
+        let tmp = TempDir::new().unwrap();
+        let prefix = Prefix(tmp.path().to_path_buf());
+        write_fixture_receipt(&prefix, "server", "1.0", 0, true, vec![]);
+        let config = write_mutable_default(
+            &prefix,
+            "server",
+            "1.0",
+            "var/lib/server/config",
+            b"new default\n",
+            b"user value\n",
+        );
+        let default = PathBuf::from(format!("{}.default", config.display()));
+        fs::write(&default, b"new default\n").unwrap();
+        let runtime = prefix.0.join("var/lib/server/database");
+        fs::write(&runtime, b"runtime data\n").unwrap();
+
+        let plan = plan_removal(&prefix, vec!["server".to_string()]).unwrap();
+        assert_eq!(plan.mutable_files.unchanged.len(), 1);
+        assert_eq!(plan.mutable_files.modified.len(), 1);
+        let result = execute_removal_with_config(&prefix, &plan, false).unwrap();
+
+        assert_eq!(result.mutable_files.removed, vec![default]);
+        assert!(config.is_file());
+        assert!(runtime.is_file());
+        assert!(prefix.0.join("var/lib/server").is_dir());
+    }
+
+    #[test]
+    fn cleanup_retains_a_file_that_changes_after_planning() {
+        let tmp = TempDir::new().unwrap();
+        let prefix = Prefix(tmp.path().to_path_buf());
+        write_fixture_receipt(&prefix, "one", "1.0", 0, true, vec![]);
+        let config = write_mutable_default(
+            &prefix,
+            "one",
+            "1.0",
+            "etc/one.conf",
+            b"default\n",
+            b"default\n",
+        );
+        let plan = plan_removal(&prefix, vec!["one".to_string()]).unwrap();
+        fs::write(&config, b"changed after plan\n").unwrap();
+
+        let result = execute_removal_with_config(&prefix, &plan, false).unwrap();
+
+        assert_eq!(result.mutable_files.retained_changed, vec![config.clone()]);
+        assert_eq!(fs::read(config).unwrap(), b"changed after plan\n");
+    }
+
+    #[test]
+    fn cleanup_prunes_a_uniquely_owned_empty_bottled_directory() {
+        let tmp = TempDir::new().unwrap();
+        let prefix = Prefix(tmp.path().to_path_buf());
+        write_fixture_receipt(&prefix, "dbus", "1.0", 0, true, vec![]);
+        fs::create_dir_all(prefix.0.join("Cellar/dbus/1.0/.bottle/etc/dbus/session.d")).unwrap();
+        let live = prefix.0.join("etc/dbus/session.d");
+        fs::create_dir_all(&live).unwrap();
+
+        let plan = plan_removal(&prefix, vec!["dbus".to_string()]).unwrap();
+        execute_removal_with_config(&prefix, &plan, false).unwrap();
+
+        assert!(!live.exists());
+        assert!(!prefix.0.join("etc/dbus").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_never_follows_a_live_destination_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let prefix = Prefix(tmp.path().to_path_buf());
+        write_fixture_receipt(&prefix, "one", "1.0", 0, true, vec![]);
+        let source = prefix.0.join("Cellar/one/1.0/.bottle/etc/one.conf");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(source, b"default\n").unwrap();
+        let external = tmp.path().join("external");
+        fs::write(&external, b"keep\n").unwrap();
+        let destination = prefix.0.join("etc/one.conf");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        symlink(&external, &destination).unwrap();
+
+        let plan = plan_removal(&prefix, vec!["one".to_string()]).unwrap();
+        assert_eq!(
+            plan.mutable_files.retained[0].reason,
+            RetainedMutableFileReason::UnsafeType
+        );
+        execute_removal_with_config(&prefix, &plan, true).unwrap();
+
+        assert!(destination.is_symlink());
+        assert_eq!(fs::read(external).unwrap(), b"keep\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_never_traverses_a_symlinked_mutable_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let prefix = Prefix(tmp.path().to_path_buf());
+        write_fixture_receipt(&prefix, "one", "1.0", 0, true, vec![]);
+        let source = prefix.0.join("Cellar/one/1.0/.bottle/etc/nested/one.conf");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(source, b"default\n").unwrap();
+        fs::create_dir_all(prefix.0.join("etc")).unwrap();
+        fs::write(external.path().join("one.conf"), b"default\n").unwrap();
+        symlink(external.path(), prefix.0.join("etc/nested")).unwrap();
+
+        let plan = plan_removal(&prefix, vec!["one".to_string()]).unwrap();
+        assert_eq!(
+            plan.mutable_files.retained[0].reason,
+            RetainedMutableFileReason::UnsafeType
+        );
+        execute_removal_with_config(&prefix, &plan, true).unwrap();
+
+        assert_eq!(
+            fs::read(external.path().join("one.conf")).unwrap(),
+            b"default\n"
+        );
     }
 }

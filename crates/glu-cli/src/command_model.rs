@@ -162,6 +162,12 @@ const CAP_PLAN_YES: CommandCapabilities = CommandCapabilities {
     yes: true,
     ..CAP_NONE
 };
+const CAP_VERBOSE_PLAN_YES: CommandCapabilities = CommandCapabilities {
+    verbose: true,
+    plan: true,
+    yes: true,
+    ..CAP_NONE
+};
 const CAP_MUTATION_GRAPH: CommandCapabilities = CommandCapabilities {
     tree: true,
     verbose: true,
@@ -393,6 +399,25 @@ const YES_OPTIONS: &[OptionSpec] = &[OptionSpec {
     conflicts_with: &[],
 }];
 
+const REMOVE_OPTIONS: &[OptionSpec] = &[
+    OptionSpec {
+        long: "--remove-config",
+        short: None,
+        kind: OptionKind::Bool,
+        scope: OptionScope::CommandBehavior,
+        description: "also remove attributable configuration files that were modified",
+        conflicts_with: &[],
+    },
+    OptionSpec {
+        long: "--yes",
+        short: Some('y'),
+        kind: OptionKind::Bool,
+        scope: OptionScope::GlobalSafety,
+        description: "answer confirmation prompts for the already-computed plan",
+        conflicts_with: &[],
+    },
+];
+
 const PURGE_OPTIONS: &[OptionSpec] = &[
     OptionSpec {
         long: "--keep-declaration",
@@ -400,6 +425,14 @@ const PURGE_OPTIONS: &[OptionSpec] = &[
         kind: OptionKind::Bool,
         scope: OptionScope::CommandBehavior,
         description: "preserve glu.json so declared packages can be restored with `glu install`",
+        conflicts_with: &[],
+    },
+    OptionSpec {
+        long: "--remove-config",
+        short: None,
+        kind: OptionKind::Bool,
+        scope: OptionScope::CommandBehavior,
+        description: "also remove attributable configuration files that were modified",
         conflicts_with: &[],
     },
     OptionSpec {
@@ -625,15 +658,19 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         group: CommandGroup::PackageManagement,
         aliases: &["rm", "uninstall"],
         summary: "Remove packages",
-        default_behavior: "Removes selected packages from the declaration and syncs installed state; extra removals require confirmation or --yes.",
+        default_behavior: "Removes selected packages and unchanged uniquely owned defaults; extra packages require confirmation, while modified configuration requires separate approval.",
         arguments: REMOVE_ARGUMENTS,
         mutates: true,
         default_scope: None,
         output_protocols: HUMAN_JSON,
-        capabilities: CAP_PLAN_YES,
+        capabilities: CAP_VERBOSE_PLAN_YES,
         result_schema: Some("RemovalResult"),
-        options: YES_OPTIONS,
-        examples: &["glu rm vips", "glu rm -y vips", "glu rm -yj vips"],
+        options: REMOVE_OPTIONS,
+        examples: &[
+            "glu rm vips",
+            "glu rm --remove-config vips",
+            "glu rm -yj vips",
+        ],
         subcommands: EMPTY_COMMANDS,
     },
     CommandSpec {
@@ -676,18 +713,19 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         group: CommandGroup::Maintenance,
         aliases: &[],
         summary: "Remove every installed package",
-        default_behavior: "Removes every installed package and glu.json while preserving the glu executable and download cache; --keep-declaration preserves glu.json.",
+        default_behavior: "Removes every installed package, unchanged uniquely owned defaults, and glu.json while preserving the glu executable, download cache, and modified configuration; --keep-declaration preserves glu.json.",
         arguments: EMPTY_ARGUMENTS,
         mutates: true,
         default_scope: Some("installed packages"),
         output_protocols: HUMAN_JSON,
-        capabilities: CAP_PLAN_YES,
+        capabilities: CAP_VERBOSE_PLAN_YES,
         result_schema: Some("PurgeResult"),
         options: PURGE_OPTIONS,
         examples: &[
             "glu purge --plan",
             "glu purge --keep-declaration",
             "glu purge --keep-declaration -yj",
+            "glu purge --remove-config -y",
         ],
         subcommands: EMPTY_COMMANDS,
     },
@@ -1234,6 +1272,7 @@ pub(crate) enum CliErrorDetails {
     CleanupConfirmation(CleanupConfirmationDetails),
     PurgeConfirmation(PurgeConfirmationDetails),
     RemovalConfirmation(RemovalConfirmationDetails),
+    ModifiedConfigConfirmation(ModifiedConfigConfirmationDetails),
     UpdateConfirmation(UpdateConfirmationDetails),
     InstallConfirmation(InstallConfirmationDetails),
     Registry(RegistryErrorDetails),
@@ -1309,6 +1348,11 @@ pub(crate) struct PurgeConfirmationDetails {
 pub(crate) struct RemovalConfirmationDetails {
     pub(crate) named: Vec<ErrorPackageRecord>,
     pub(crate) planned_removals: Vec<ErrorPackageRecord>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct ModifiedConfigConfirmationDetails {
+    pub(crate) modified_config_files: Vec<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
@@ -1900,7 +1944,7 @@ pub(crate) struct RemovalOutput {
     pub(crate) mode: ExecutedMode,
     pub(crate) removed: Vec<MutationPackageRecord>,
     pub(crate) kept: Vec<KeptPackageRecord>,
-    pub(crate) leftover_config_files: Vec<String>,
+    pub(crate) configuration: MutableFileCleanupOutput,
 }
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
@@ -1910,6 +1954,25 @@ pub(crate) struct RemovalPlanOutput {
     pub(crate) would_remove: Vec<MutationPackageRecord>,
     pub(crate) would_keep: Vec<KeptPackageRecord>,
     pub(crate) requires_confirmation: bool,
+    pub(crate) configuration: MutableFileCleanupPlanOutput,
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct MutableFileCleanupOutput {
+    pub(crate) removed: Vec<String>,
+    pub(crate) retained_modified: Vec<String>,
+    pub(crate) retained_shared: Vec<String>,
+    pub(crate) retained_ambiguous: Vec<String>,
+    pub(crate) retained_changed: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct MutableFileCleanupPlanOutput {
+    pub(crate) would_remove: Vec<String>,
+    pub(crate) would_remove_modified: Vec<String>,
+    pub(crate) would_retain_modified: Vec<String>,
+    pub(crate) would_retain_shared: Vec<String>,
+    pub(crate) would_retain_ambiguous: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
@@ -2021,7 +2084,7 @@ pub(crate) struct PurgeOutput {
     pub(crate) declaration: PurgeDeclarationAction,
     pub(crate) declared_packages: usize,
     pub(crate) reclaimed_bytes: Option<u64>,
-    pub(crate) leftover_config_files: Vec<String>,
+    pub(crate) configuration: MutableFileCleanupOutput,
 }
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
@@ -2032,6 +2095,7 @@ pub(crate) struct PurgePlanOutput {
     pub(crate) declared_packages: usize,
     pub(crate) requires_confirmation: bool,
     pub(crate) would_reclaim_bytes: Option<u64>,
+    pub(crate) configuration: MutableFileCleanupPlanOutput,
 }
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]

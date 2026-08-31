@@ -257,6 +257,147 @@ fn autoremove_json_execution_reports_executed_mode() {
     assert_eq!(names(&result["packages"]), vec!["dep"]);
 }
 
+#[test]
+fn remove_plan_summarizes_configuration_and_json_keeps_exact_paths() {
+    let prefix = tempfile::tempdir().unwrap();
+    write_declaration(prefix.path(), &[("root", "1.0")]);
+    write_receipt(prefix.path(), "root", "1.0", &[]);
+    let unchanged = write_mutable_file(
+        prefix.path(),
+        "root",
+        "1.0",
+        "etc/root/default.conf",
+        b"default\n",
+        b"default\n",
+    );
+    let modified = write_mutable_file(
+        prefix.path(),
+        "root",
+        "1.0",
+        "etc/root/user.conf",
+        b"default\n",
+        b"changed\n",
+    );
+
+    let human = human_command(prefix.path(), &["rm", "--plan", "root"]);
+    assert!(human.contains(
+        "Configuration: 1 unchanged file will be removed · 1 modified file kept by default\n"
+    ));
+    assert!(!human.contains(unchanged.to_string_lossy().as_ref()));
+    assert!(!human.contains(modified.to_string_lossy().as_ref()));
+
+    let verbose = human_command(prefix.path(), &["rm", "--plan", "--verbose", "root"]);
+    assert!(verbose.contains(unchanged.to_string_lossy().as_ref()));
+    assert!(verbose.contains(modified.to_string_lossy().as_ref()));
+
+    let json = json_command(prefix.path(), &["rm", "--plan", "--json", "root"]);
+    assert_eq!(
+        json["result"]["configuration"]["would_remove"],
+        serde_json::json!([unchanged])
+    );
+    assert_eq!(
+        json["result"]["configuration"]["would_retain_modified"],
+        serde_json::json!([modified.clone()])
+    );
+
+    let explicit = human_command(prefix.path(), &["rm", "--plan", "--remove-config", "root"]);
+    assert!(explicit.contains(
+        "Configuration: 1 unchanged file will be removed · 1 modified file will be removed\n"
+    ));
+    let explicit_json = json_command(
+        prefix.path(),
+        &["rm", "--plan", "--remove-config", "--json", "root"],
+    );
+    assert_eq!(explicit_json["result"]["requires_confirmation"], true);
+    assert_eq!(
+        explicit_json["result"]["configuration"]["would_remove_modified"],
+        serde_json::json!([modified])
+    );
+    assert!(
+        explicit_json["result"]["configuration"]["would_retain_modified"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn remove_cleans_unchanged_files_and_preserves_modified_files_by_default() {
+    let prefix = tempfile::tempdir().unwrap();
+    write_declaration(prefix.path(), &[("root", "1.0")]);
+    write_receipt(prefix.path(), "root", "1.0", &[]);
+    let unchanged = write_mutable_file(
+        prefix.path(),
+        "root",
+        "1.0",
+        "etc/root/default.conf",
+        b"default\n",
+        b"default\n",
+    );
+    let modified = write_mutable_file(
+        prefix.path(),
+        "root",
+        "1.0",
+        "etc/root/user.conf",
+        b"default\n",
+        b"changed\n",
+    );
+
+    let result = json_command(prefix.path(), &["rm", "--yes", "--json", "root"]);
+
+    assert!(!unchanged.exists());
+    assert!(modified.exists());
+    assert_eq!(
+        result["result"]["configuration"]["removed"],
+        serde_json::json!([unchanged])
+    );
+    assert_eq!(
+        result["result"]["configuration"]["retained_modified"],
+        serde_json::json!([modified])
+    );
+}
+
+#[test]
+fn modified_configuration_requires_explicit_approved_cleanup() {
+    let prefix = tempfile::tempdir().unwrap();
+    write_declaration(prefix.path(), &[("root", "1.0")]);
+    write_receipt(prefix.path(), "root", "1.0", &[]);
+    let modified = write_mutable_file(
+        prefix.path(),
+        "root",
+        "1.0",
+        "etc/root/user.conf",
+        b"default\n",
+        b"changed\n",
+    );
+
+    let refused = glu()
+        .args(["rm", "--remove-config", "--json", "root"])
+        .env("GLU_PREFIX", prefix.path())
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_slice(&refused.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "confirmation_required");
+    assert_eq!(
+        error["error"]["details"]["modified_config_files"],
+        serde_json::json!([modified.clone()])
+    );
+    assert!(prefix.path().join("Cellar/root/1.0").exists());
+    assert!(modified.exists());
+
+    let result = json_command(
+        prefix.path(),
+        &["rm", "--remove-config", "--yes", "--json", "root"],
+    );
+    assert_eq!(
+        result["result"]["configuration"]["removed"],
+        serde_json::json!([modified.clone()])
+    );
+    assert!(!modified.exists());
+}
+
 fn human_command(prefix: &Path, args: &[&str]) -> String {
     let output = glu()
         .args(args)
@@ -371,4 +512,26 @@ fn write_receipt(prefix: &Path, name: &str, version: &str, deps: &[&str]) {
     );
     fs::create_dir_all(keg.join(".glu")).unwrap();
     fs::write(keg.join(".glu/receipt.json"), receipt).unwrap();
+}
+
+fn write_mutable_file(
+    prefix: &Path,
+    name: &str,
+    version: &str,
+    relative: &str,
+    default: &[u8],
+    live: &[u8],
+) -> std::path::PathBuf {
+    let source = prefix
+        .join("Cellar")
+        .join(name)
+        .join(version)
+        .join(".bottle")
+        .join(relative);
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(source, default).unwrap();
+    let destination = prefix.join(relative);
+    fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    fs::write(&destination, live).unwrap();
+    destination
 }

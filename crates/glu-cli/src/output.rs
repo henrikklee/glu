@@ -4,11 +4,12 @@ use crate::command_model::{
     DeactivationOutput, DepsOutput, DepsSource, ExecutedMode, ExecutionSummaryRecord,
     GlobalOptions, InfoManyOutput, InfoOutput, InstallOutput, InstallPlanOutput,
     InstallPoolStatsRecord, InstallStatsRecord, JsonSuccessEnvelope, KeptPackageRecord, ListOutput,
-    ListScope, ListView, MutationPackageRecord, MutationStatus, OutdatedOutput, OutdatedRecord,
-    OutputFormat, PlanMode, PurgeDeclarationAction, PurgeOutput, PurgePlanOutput, ReinstallOutput,
-    ReinstallPlanOutput, RemovalOutput, RemovalPlanOutput, RenamePackageRecord, ReverseDepsOutput,
-    ReverseDepsSource, StatusOutput, StatusShell, TimingBreakdownRecord, UpdateOutput,
-    UpdatePackageRecord, UpdatePlanOutput,
+    ListScope, ListView, MutableFileCleanupOutput, MutableFileCleanupPlanOutput,
+    MutationPackageRecord, MutationStatus, OutdatedOutput, OutdatedRecord, OutputFormat, PlanMode,
+    PurgeDeclarationAction, PurgeOutput, PurgePlanOutput, ReinstallOutput, ReinstallPlanOutput,
+    RemovalOutput, RemovalPlanOutput, RenamePackageRecord, ReverseDepsOutput, ReverseDepsSource,
+    StatusOutput, StatusShell, TimingBreakdownRecord, UpdateOutput, UpdatePackageRecord,
+    UpdatePlanOutput,
 };
 use crate::package_list::{self, PackageListItem};
 use crate::tables;
@@ -18,7 +19,10 @@ use glu_client::activation::{
 };
 use glu_client::dependency_query::DependencyTreeNode;
 use glu_client::download::cache::{CacheCleanupPlan, CacheCleanupResult, CachedBottle};
-use glu_client::remove::{KeptDeclaredPackage, RemovedPackage};
+use glu_client::remove::{
+    KeptDeclaredPackage, MutableFileCleanupPlan, MutableFileCleanupResult, RemovedPackage,
+    RetainedMutableFileReason,
+};
 use glu_client::tree_render::{
     format_minimum_version, render_dependency_tree, render_dependency_tree_with_context, RootStyle,
     TreeRenderOptions,
@@ -1075,13 +1079,13 @@ pub(crate) fn deactivation_output(results: &[DeactivationResult]) -> Deactivatio
 }
 
 pub(crate) fn removal_output(
-    removed: &[RemovedPackage],
+    result: &glu_client::remove::RemovalResult,
     kept: &[KeptDeclaredPackage],
-    leftover_config_files: &[std::path::PathBuf],
 ) -> RemovalOutput {
     RemovalOutput {
         mode: ExecutedMode::Executed,
-        removed: removed
+        removed: result
+            .removed
             .iter()
             .map(|result| {
                 plain_mutation_package_record(
@@ -1100,14 +1104,14 @@ pub(crate) fn removal_output(
                 status: MutationStatus::KeptNeededByDeclared,
             })
             .collect(),
-        leftover_config_files: leftover_config_files
-            .iter()
-            .map(|path| display_path(path))
-            .collect(),
+        configuration: mutable_file_cleanup_output(&result.mutable_files),
     }
 }
 
-pub(crate) fn removal_plan_output(plan: &glu_client::remove::RemovalPlan) -> RemovalPlanOutput {
+pub(crate) fn removal_plan_output(
+    plan: &glu_client::remove::RemovalPlan,
+    remove_modified_config: bool,
+) -> RemovalPlanOutput {
     RemovalPlanOutput {
         mode: PlanMode::Plan,
         named: plan
@@ -1136,7 +1140,85 @@ pub(crate) fn removal_plan_output(plan: &glu_client::remove::RemovalPlan) -> Rem
                 status: MutationStatus::WouldKeepNeededByDeclared,
             })
             .collect(),
-        requires_confirmation: plan.to_remove.len() > plan.named.len(),
+        requires_confirmation: plan.to_remove.len() > plan.named.len()
+            || (remove_modified_config && !plan.mutable_files.modified.is_empty()),
+        configuration: mutable_file_cleanup_plan_output(
+            &plan.mutable_files,
+            remove_modified_config,
+        ),
+    }
+}
+
+fn mutable_file_cleanup_output(result: &MutableFileCleanupResult) -> MutableFileCleanupOutput {
+    MutableFileCleanupOutput {
+        removed: result
+            .removed
+            .iter()
+            .map(|path| display_path(path))
+            .collect(),
+        retained_modified: result
+            .retained_modified
+            .iter()
+            .map(|path| display_path(path))
+            .collect(),
+        retained_shared: result
+            .retained_shared
+            .iter()
+            .map(|path| display_path(path))
+            .collect(),
+        retained_ambiguous: result
+            .retained_ambiguous
+            .iter()
+            .map(|path| display_path(path))
+            .collect(),
+        retained_changed: result
+            .retained_changed
+            .iter()
+            .map(|path| display_path(path))
+            .collect(),
+    }
+}
+
+fn mutable_file_cleanup_plan_output(
+    plan: &MutableFileCleanupPlan,
+    remove_modified_config: bool,
+) -> MutableFileCleanupPlanOutput {
+    let would_remove: Vec<String> = plan
+        .unchanged
+        .iter()
+        .map(|file| display_path(&file.path))
+        .collect();
+    let would_remove_modified = if remove_modified_config {
+        plan.modified
+            .iter()
+            .map(|file| display_path(&file.path))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    MutableFileCleanupPlanOutput {
+        would_remove,
+        would_remove_modified,
+        would_retain_modified: if remove_modified_config {
+            Vec::new()
+        } else {
+            plan.modified
+                .iter()
+                .map(|file| display_path(&file.path))
+                .collect()
+        },
+        would_retain_shared: plan
+            .retained
+            .iter()
+            .filter(|file| file.reason == RetainedMutableFileReason::Shared)
+            .map(|file| display_path(&file.path))
+            .collect(),
+        would_retain_ambiguous: plan
+            .retained
+            .iter()
+            .filter(|file| file.reason != RetainedMutableFileReason::Shared)
+            .map(|file| display_path(&file.path))
+            .collect(),
     }
 }
 
@@ -1243,7 +1325,7 @@ fn purge_declaration_action(plan: &glu_client::purge::PurgePlan) -> PurgeDeclara
 
 pub(crate) fn purge_output(
     plan: &glu_client::purge::PurgePlan,
-    leftover_config_files: &[std::path::PathBuf],
+    result: &glu_client::remove::RemovalResult,
 ) -> PurgeOutput {
     PurgeOutput {
         mode: ExecutedMode::Executed,
@@ -1257,14 +1339,14 @@ pub(crate) fn purge_output(
         declaration: purge_declaration_action(plan),
         declared_packages: plan.declared_packages(),
         reclaimed_bytes: plan.reclaimable_bytes(),
-        leftover_config_files: leftover_config_files
-            .iter()
-            .map(|path| display_path(path))
-            .collect(),
+        configuration: mutable_file_cleanup_output(&result.mutable_files),
     }
 }
 
-pub(crate) fn purge_plan_output(plan: &glu_client::purge::PurgePlan) -> PurgePlanOutput {
+pub(crate) fn purge_plan_output(
+    plan: &glu_client::purge::PurgePlan,
+    remove_modified_config: bool,
+) -> PurgePlanOutput {
     PurgePlanOutput {
         mode: PlanMode::Plan,
         would_remove: plan
@@ -1282,6 +1364,10 @@ pub(crate) fn purge_plan_output(plan: &glu_client::purge::PurgePlan) -> PurgePla
         declared_packages: plan.declared_packages(),
         requires_confirmation: plan.requires_confirmation(),
         would_reclaim_bytes: plan.reclaimable_bytes(),
+        configuration: mutable_file_cleanup_plan_output(
+            &plan.mutable_files,
+            remove_modified_config,
+        ),
     }
 }
 
@@ -1591,7 +1677,11 @@ pub(crate) fn render_update_execution_plan(plan: &glu_client::install::UpdatePla
     package_list::print_section("Will also remove", &removals);
 }
 
-pub(crate) fn render_removal_execution_plan(plan: &glu_client::remove::RemovalPlan) {
+pub(crate) fn render_removal_execution_plan(
+    plan: &glu_client::remove::RemovalPlan,
+    remove_modified_config: bool,
+    verbose: bool,
+) {
     let removals: Vec<_> = plan
         .to_remove
         .iter()
@@ -1607,6 +1697,9 @@ pub(crate) fn render_removal_execution_plan(plan: &glu_client::remove::RemovalPl
         })
         .collect();
     package_list::print_section("Will retain", &retained);
+    let configuration =
+        mutable_file_cleanup_plan_output(&plan.mutable_files, remove_modified_config);
+    render_mutable_file_plan(&configuration, verbose);
 }
 
 pub(crate) fn render_autoremove_execution_plan(packages: &[InstalledPackage]) {
@@ -2147,22 +2240,115 @@ fn render_removal_output(removal: &RemovalOutput, globals: &GlobalOptions) {
         print_json_success(CommandId::Remove, &RemovalResult::Executed(removal));
         return;
     }
-    render_leftover_config_files(&removal.leftover_config_files);
+    render_mutable_file_result(&removal.configuration, globals.verbose);
 }
 
-fn render_leftover_config_files(paths: &[String]) {
+fn render_mutable_file_result(configuration: &MutableFileCleanupOutput, verbose: bool) {
+    let retained = configuration.retained_modified.len()
+        + configuration.retained_shared.len()
+        + configuration.retained_ambiguous.len()
+        + configuration.retained_changed.len();
+    if retained == 0 {
+        return;
+    }
+    let mut parts = Vec::new();
+    if !configuration.retained_modified.is_empty() {
+        parts.push(glu_client::format::plural(
+            configuration.retained_modified.len(),
+            "modified file",
+        ));
+    }
+    if !configuration.retained_shared.is_empty() {
+        parts.push(glu_client::format::plural(
+            configuration.retained_shared.len(),
+            "shared file",
+        ));
+    }
+    if !configuration.retained_ambiguous.is_empty() {
+        parts.push(glu_client::format::plural(
+            configuration.retained_ambiguous.len(),
+            "ambiguous file",
+        ));
+    }
+    if !configuration.retained_changed.is_empty() {
+        parts.push(format!(
+            "{} changed after planning",
+            glu_client::format::plural(configuration.retained_changed.len(), "file")
+        ));
+    }
+    println!("Configuration retained: {}", parts.join(" · "));
+    if verbose {
+        print_path_group("Retained modified", &configuration.retained_modified);
+        print_path_group("Retained shared", &configuration.retained_shared);
+        print_path_group("Retained ambiguous", &configuration.retained_ambiguous);
+        print_path_group("Retained after plan drift", &configuration.retained_changed);
+    }
+}
+
+fn render_mutable_file_plan(configuration: &MutableFileCleanupPlanOutput, verbose: bool) {
+    let remove = configuration.would_remove.len();
+    let remove_modified = configuration.would_remove_modified.len();
+    let modified = configuration.would_retain_modified.len();
+    let shared = configuration.would_retain_shared.len();
+    let ambiguous = configuration.would_retain_ambiguous.len();
+    if remove + remove_modified + modified + shared + ambiguous == 0 {
+        return;
+    }
+    let mut parts = Vec::new();
+    if remove > 0 {
+        parts.push(format!(
+            "{} will be removed",
+            glu_client::format::plural(remove, "unchanged file")
+        ));
+    }
+    if remove_modified > 0 {
+        parts.push(format!(
+            "{} will be removed",
+            glu_client::format::plural(remove_modified, "modified file")
+        ));
+    }
+    if modified > 0 {
+        parts.push(format!(
+            "{} kept by default",
+            glu_client::format::plural(modified, "modified file")
+        ));
+    }
+    if shared > 0 {
+        parts.push(format!(
+            "{} retained",
+            glu_client::format::plural(shared, "shared file")
+        ));
+    }
+    if ambiguous > 0 {
+        parts.push(format!(
+            "{} retained",
+            glu_client::format::plural(ambiguous, "ambiguous file")
+        ));
+    }
+    println!("Configuration: {}", parts.join(" · "));
+    if verbose {
+        print_path_group("Would remove", &configuration.would_remove);
+        print_path_group(
+            "Would remove modified",
+            &configuration.would_remove_modified,
+        );
+        print_path_group(
+            "Would retain modified",
+            &configuration.would_retain_modified,
+        );
+        print_path_group("Would retain shared", &configuration.would_retain_shared);
+        print_path_group(
+            "Would retain ambiguous",
+            &configuration.would_retain_ambiguous,
+        );
+    }
+}
+
+fn print_path_group(label: &str, paths: &[String]) {
     if paths.is_empty() {
         return;
     }
-    println!();
-    println!(
-        "{}",
-        glu_client::style::bold_yellow("The following configuration files have not been removed!",)
-    );
-    println!(
-        "{}",
-        glu_client::style::yellow("If desired, remove them manually with `rm -rf`:")
-    );
+    println!("{label}:");
     for path in paths {
         println!("  {path}");
     }
@@ -2183,6 +2369,7 @@ fn render_removal_plan_output(plan: &RemovalPlanOutput, globals: &GlobalOptions)
         })
         .collect();
     package_list::print_section("Would retain", &kept);
+    render_mutable_file_plan(&plan.configuration, globals.verbose);
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -2306,8 +2493,17 @@ enum PurgeResult<'a> {
     Plan(&'a PurgePlanOutput),
 }
 
-pub(crate) fn render_purge_execution_plan(plan: &glu_client::purge::PurgePlan) {
-    print_purge_plan(&purge_plan_output(plan), "Will remove", "Will reclaim");
+pub(crate) fn render_purge_execution_plan(
+    plan: &glu_client::purge::PurgePlan,
+    remove_modified_config: bool,
+    verbose: bool,
+) {
+    print_purge_plan(
+        &purge_plan_output(plan, remove_modified_config),
+        "Will remove",
+        "Will reclaim",
+        verbose,
+    );
 }
 
 fn render_purge_output(purge: &PurgeOutput, globals: &GlobalOptions) {
@@ -2340,7 +2536,7 @@ fn render_purge_output(purge: &PurgeOutput, globals: &GlobalOptions) {
         ),
         PurgeDeclarationAction::Absent | PurgeDeclarationAction::Preserved => {}
     }
-    render_leftover_config_files(&purge.leftover_config_files);
+    render_mutable_file_result(&purge.configuration, globals.verbose);
 }
 
 fn render_purge_plan_output(plan: &PurgePlanOutput, globals: &GlobalOptions) {
@@ -2348,10 +2544,10 @@ fn render_purge_plan_output(plan: &PurgePlanOutput, globals: &GlobalOptions) {
         print_json_success(CommandId::Purge, &PurgeResult::Plan(plan));
         return;
     }
-    print_purge_plan(plan, "Would remove", "Would reclaim");
+    print_purge_plan(plan, "Would remove", "Would reclaim", globals.verbose);
 }
 
-fn print_purge_plan(plan: &PurgePlanOutput, heading: &str, reclaim_label: &str) {
+fn print_purge_plan(plan: &PurgePlanOutput, heading: &str, reclaim_label: &str, verbose: bool) {
     if plan.would_remove.is_empty() && plan.declaration != PurgeDeclarationAction::Removed {
         println!("Nothing to purge.");
         return;
@@ -2386,6 +2582,7 @@ fn print_purge_plan(plan: &PurgePlanOutput, heading: &str, reclaim_label: &str) 
             glu_client::format::human_bytes(bytes)
         );
     }
+    render_mutable_file_plan(&plan.configuration, verbose);
 }
 
 fn render_status_output(status: &StatusOutput, globals: &GlobalOptions) {
@@ -3775,7 +3972,13 @@ mod tests {
             mode: ExecutedMode::Executed,
             removed: Vec::new(),
             kept: Vec::new(),
-            leftover_config_files: Vec::new(),
+            configuration: MutableFileCleanupOutput {
+                removed: Vec::new(),
+                retained_modified: Vec::new(),
+                retained_shared: Vec::new(),
+                retained_ambiguous: Vec::new(),
+                retained_changed: Vec::new(),
+            },
         };
         assert_result_valid("RemovalResult", &RemovalResult::Executed(&removal));
         let removal_plan = RemovalPlanOutput {
@@ -3784,6 +3987,13 @@ mod tests {
             would_remove: Vec::new(),
             would_keep: Vec::new(),
             requires_confirmation: false,
+            configuration: MutableFileCleanupPlanOutput {
+                would_remove: Vec::new(),
+                would_remove_modified: Vec::new(),
+                would_retain_modified: Vec::new(),
+                would_retain_shared: Vec::new(),
+                would_retain_ambiguous: Vec::new(),
+            },
         };
         assert_result_valid("RemovalResult", &RemovalResult::Plan(&removal_plan));
 
@@ -3838,7 +4048,13 @@ mod tests {
             declaration: PurgeDeclarationAction::Preserved,
             declared_packages: 1,
             reclaimed_bytes: Some(42),
-            leftover_config_files: Vec::new(),
+            configuration: MutableFileCleanupOutput {
+                removed: Vec::new(),
+                retained_modified: Vec::new(),
+                retained_shared: Vec::new(),
+                retained_ambiguous: Vec::new(),
+                retained_changed: Vec::new(),
+            },
         };
         assert_result_valid("PurgeResult", &PurgeResult::Executed(&purge));
         let purge_plan = PurgePlanOutput {
@@ -3848,6 +4064,13 @@ mod tests {
             declared_packages: 1,
             requires_confirmation: true,
             would_reclaim_bytes: Some(42),
+            configuration: MutableFileCleanupPlanOutput {
+                would_remove: Vec::new(),
+                would_remove_modified: Vec::new(),
+                would_retain_modified: Vec::new(),
+                would_retain_shared: Vec::new(),
+                would_retain_ambiguous: Vec::new(),
+            },
         };
         assert_result_valid("PurgeResult", &PurgeResult::Plan(&purge_plan));
 

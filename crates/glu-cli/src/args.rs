@@ -128,9 +128,13 @@ removes automatic packages that become dangling — if removal exceeds what \
 you named, glu lists the full set and asks first. A declared package another \
 declared package still needs is demoted instead (`Removed X from your \
 packages — it stays installed because Y needs it`); an automatic package a \
-declared package needs can't be removed. There is no force flag."
+declared package needs can't be removed. Unchanged, uniquely owned package defaults are removed automatically; modified configuration is kept unless separately approved with `--remove-config`. There is no force flag."
     )]
     Remove {
+        /// Also remove attributable configuration files that were modified.
+        #[arg(long)]
+        remove_config: bool,
+
         /// Package selectors: `name` (every installed version), `name@version`
         /// (every revision of that version), or `name@version_revision`
         /// (exactly that version).
@@ -160,12 +164,15 @@ Removes every package installed by glu, including declared packages, \
 dependencies, and dangling packages. The glu executable and download cache \
 are always preserved. By default glu.json is also removed; \
 `--keep-declaration` preserves it verbatim so bare `glu install` can restore \
-the declared environment. Always lists the plan and asks before changing \
-anything; `--plan` previews and `--yes` approves the computed plan.")]
+the declared environment. Unchanged package defaults are removed automatically; modified configuration is kept unless separately approved with `--remove-config`. Always lists the plan and asks before changing anything; `--plan` previews and `--yes` approves the computed plan.")]
     Purge {
         /// Preserve glu.json so bare `glu install` can restore the packages.
         #[arg(long)]
         keep_declaration: bool,
+
+        /// Also remove attributable configuration files that were modified.
+        #[arg(long)]
+        remove_config: bool,
     },
 
     /// Keep packages installed but remove their public prefix links.

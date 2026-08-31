@@ -243,8 +243,9 @@ impl GluClient {
     pub fn execute_removal(
         &self,
         plan: &remove::RemovalPlan,
-    ) -> Result<Vec<remove::RemovedPackage>> {
-        remove::execute_removal(&self.config.prefix, plan)
+        remove_modified_config: bool,
+    ) -> Result<remove::RemovalResult> {
+        remove::execute_removal_with_config(&self.config.prefix, plan, remove_modified_config)
     }
 
     /// `glu deps <name>`: the forward dependency tree of one package.
@@ -349,8 +350,12 @@ impl GluClient {
     }
 
     /// Executes a previously computed prefix-wide purge plan.
-    pub fn execute_purge(&self, plan: &purge::PurgePlan) -> Result<Vec<remove::RemovedPackage>> {
-        purge::execute_purge(&self.config.prefix, plan)
+    pub fn execute_purge(
+        &self,
+        plan: &purge::PurgePlan,
+        remove_modified_config: bool,
+    ) -> Result<remove::RemovalResult> {
+        purge::execute_purge(&self.config.prefix, plan, remove_modified_config)
     }
 
     /// Registry info for `name`, plus the locally installed keg (if any).

@@ -238,10 +238,14 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
             .into_output(),
         Command::Autoremove {} => commands::removal::autoremove(&context)?.into_output(),
         Command::Cleanup {} => commands::removal::cleanup(&context)?.into_output(),
-        Command::Purge { keep_declaration } => {
-            commands::removal::purge(&context, keep_declaration)?.into_output()
-        }
-        Command::Remove { names } => commands::removal::remove(&context, names)?.into_output(),
+        Command::Purge {
+            keep_declaration,
+            remove_config,
+        } => commands::removal::purge(&context, keep_declaration, remove_config)?.into_output(),
+        Command::Remove {
+            names,
+            remove_config,
+        } => commands::removal::remove(&context, names, remove_config)?.into_output(),
         Command::List {
             declared: explicit_declared,
             installed,
