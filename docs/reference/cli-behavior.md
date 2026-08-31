@@ -137,6 +137,14 @@ Plan output shows the meaningful transition: install, update, reinstall, promote
 
 Plan mode is a read-only boundary between decision and execution. Recovery cleanup, lock-protected mutation, and package changes happen only on the execution side. Install and update plans preserve their dependency graph when `--tree` is selected.
 
+### Homebrew migration
+
+`glu migrate` discovers explicitly requested packages from package-local Homebrew `INSTALL_RECEIPT.json` records and passes those package names to the ordinary install planner. It does not invoke Homebrew, copy historical package trees, synthesize receipts, or resolve historical versions. Existing glu declarations remain in the declaration, and successful migration installs current supported versions through the same resolver, preparation, linking, postinstall, receipt, and autoremove path as `glu install`.
+
+Migration is broad and always asks before a non-empty execution. `--from` selects the Homebrew prefix and defaults to `/opt/homebrew`; `--plan` performs source discovery and normal install planning without mutation. A valid source with no `installed_on_request` records is a successful no-op. Missing or structurally invalid source prefixes fail before registry work or state mutation.
+
+A live Homebrew linked marker preserves active intent. When a newly declared source root has no live marker, migration marks it deactivated only if current registry exposure is global. Registry-isolated packages are not mistaken for deactivated packages, and existing glu declaration/deactivation choices win. Homebrew configuration, service state, databases, and runtime data are not copied; human and JSON results state that boundary explicitly.
+
 ### Update scopes
 
 Update has three deliberate scopes:

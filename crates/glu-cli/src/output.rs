@@ -4,12 +4,12 @@ use crate::command_model::{
     DeactivationOutput, DepsOutput, DepsSource, ExecutedMode, ExecutionSummaryRecord,
     GlobalOptions, InfoManyOutput, InfoOutput, InstallOutput, InstallPlanOutput,
     InstallPoolStatsRecord, InstallStatsRecord, JsonSuccessEnvelope, KeptPackageRecord, ListOutput,
-    ListScope, ListView, MutableFileCleanupOutput, MutableFileCleanupPlanOutput,
-    MutationPackageRecord, MutationStatus, OutdatedOutput, OutdatedRecord, OutputFormat, PlanMode,
-    PurgeDeclarationAction, PurgeOutput, PurgePlanOutput, ReinstallOutput, ReinstallPlanOutput,
-    RemovalOutput, RemovalPlanOutput, RenamePackageRecord, ReverseDepsOutput, ReverseDepsSource,
-    StatusOutput, StatusShell, TimingBreakdownRecord, UpdateOutput, UpdatePackageRecord,
-    UpdatePlanOutput,
+    ListScope, ListView, MigrateOutput, MigratePlanOutput, MutableFileCleanupOutput,
+    MutableFileCleanupPlanOutput, MutationPackageRecord, MutationStatus, OutdatedOutput,
+    OutdatedRecord, OutputFormat, PlanMode, PurgeDeclarationAction, PurgeOutput, PurgePlanOutput,
+    ReinstallOutput, ReinstallPlanOutput, RemovalOutput, RemovalPlanOutput, RenamePackageRecord,
+    ReverseDepsOutput, ReverseDepsSource, StatusOutput, StatusShell, TimingBreakdownRecord,
+    UpdateOutput, UpdatePackageRecord, UpdatePlanOutput,
 };
 use crate::package_list::{self, PackageListItem};
 use crate::tables;
@@ -51,6 +51,8 @@ fn render_human(output: &CommandOutput, globals: &GlobalOptions) {
         CommandOutput::InfoMany(info) => render_info_many_output(info, globals),
         CommandOutput::Install(install) => render_install_output(install, globals),
         CommandOutput::InstallPlan(plan) => render_install_plan_output(plan, globals),
+        CommandOutput::Migrate(migrate) => render_migrate_output(migrate, globals),
+        CommandOutput::MigratePlan(plan) => render_migrate_plan_output(plan, globals),
         CommandOutput::Reinstall(reinstall) => render_reinstall_output(reinstall, globals),
         CommandOutput::ReinstallPlan(plan) => render_reinstall_plan_output(plan, globals),
         CommandOutput::Update(update) => render_update_output(update, globals),
@@ -90,6 +92,12 @@ fn render_json(output: &CommandOutput, globals: &GlobalOptions) {
         CommandOutput::InfoMany(info) => render_info_many_output(info, globals),
         CommandOutput::Install(install) => render_install_output(install, globals),
         CommandOutput::InstallPlan(plan) => render_install_plan_output(plan, globals),
+        CommandOutput::Migrate(migrate) => {
+            print_json_success(CommandId::Migrate, &MigrateResult::Executed(migrate))
+        }
+        CommandOutput::MigratePlan(plan) => {
+            print_json_success(CommandId::Migrate, &MigrateResult::Plan(plan))
+        }
         CommandOutput::Reinstall(reinstall) => render_reinstall_output(reinstall, globals),
         CommandOutput::ReinstallPlan(plan) => render_reinstall_plan_output(plan, globals),
         CommandOutput::Update(update) => render_update_output(update, globals),
@@ -129,6 +137,8 @@ fn render_null(output: &CommandOutput, globals: &GlobalOptions) {
         | CommandOutput::InfoMany(_)
         | CommandOutput::Install(_)
         | CommandOutput::InstallPlan(_)
+        | CommandOutput::Migrate(_)
+        | CommandOutput::MigratePlan(_)
         | CommandOutput::Reinstall(_)
         | CommandOutput::ReinstallPlan(_)
         | CommandOutput::Update(_)
@@ -205,6 +215,7 @@ enum TreeView {
 pub(crate) fn result_schema(name: &str) -> Option<serde_json::Value> {
     match name {
         "InstallResult" => Some(generated_schema::<InstallResult<'static>>()),
+        "MigrateResult" => Some(generated_schema::<MigrateResult<'static>>()),
         "ReinstallResult" => Some(generated_schema::<ReinstallResult<'static>>()),
         "UpdateResult" => Some(generated_schema::<UpdateResult<'static>>()),
         "ListResult" => Some(generated_schema::<ListResult>()),
@@ -776,6 +787,50 @@ pub(crate) fn install_plan_output(plan: &glu_client::install::InstallPlan) -> In
         requires_confirmation: plan.requires_confirmation,
         would_download_bytes: plan.would_download_bytes,
         dependency_tree: plan.dependency_tree(),
+    }
+}
+
+pub(crate) fn render_migration_preflight(
+    plan: &glu_client::migrate::MigrationPlan,
+    globals: GlobalOptions,
+) {
+    let mut output = migrate_plan_output(plan);
+    // Execution renders source-discovery warnings with the final result. Keep
+    // the preflight package plan from printing the same warning twice.
+    output.warnings.clear();
+    render_migrate_plan_output(&output, &globals);
+}
+
+pub(crate) fn migrate_output(summary: &glu_client::migrate::MigrationSummary) -> MigrateOutput {
+    MigrateOutput {
+        mode: ExecutedMode::Executed,
+        source: summary.source.display().to_string(),
+        roots: summary.roots.iter().map(|name| name.0.clone()).collect(),
+        inferred_deactivated: summary
+            .inferred_deactivated
+            .iter()
+            .map(|name| name.0.clone())
+            .collect(),
+        warnings: summary.warnings.clone(),
+        install: summary.install.as_ref().map(install_output),
+        configuration_migrated: summary.configuration_migrated,
+    }
+}
+
+pub(crate) fn migrate_plan_output(plan: &glu_client::migrate::MigrationPlan) -> MigratePlanOutput {
+    MigratePlanOutput {
+        mode: PlanMode::Plan,
+        source: plan.source.display().to_string(),
+        roots: plan.roots.iter().map(|name| name.0.clone()).collect(),
+        requires_confirmation: !plan.roots.is_empty(),
+        inferred_deactivated: plan
+            .inferred_deactivated
+            .iter()
+            .map(|name| name.0.clone())
+            .collect(),
+        warnings: plan.warnings.clone(),
+        install: plan.install.as_ref().map(install_plan_output),
+        configuration_migrated: plan.configuration_migrated,
     }
 }
 
@@ -1477,6 +1532,13 @@ impl<'a> InstallPlanTreeResult<'a> {
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
+enum MigrateResult<'a> {
+    Executed(&'a MigrateOutput),
+    Plan(&'a MigratePlanOutput),
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
 enum ReinstallResult<'a> {
     Executed(&'a ReinstallOutput),
     Plan(&'a ReinstallPlanOutput),
@@ -1765,6 +1827,55 @@ fn render_install_plan_output(plan: &InstallPlanOutput, globals: &GlobalOptions)
     print_install_rename_section("Would rename", &plan.would_rename, &requested);
     print_package_section("Would remove", &plan.would_remove);
     print_would_download(plan.would_download_bytes);
+}
+
+fn render_migrate_output(migrate: &MigrateOutput, globals: &GlobalOptions) {
+    for warning in &migrate.warnings {
+        eprintln!("{warning}");
+    }
+    if migrate.roots.is_empty() {
+        println!("No requested Homebrew packages found.");
+        return;
+    }
+    if let Some(install) = &migrate.install {
+        render_install_output(install, globals);
+    }
+    println!(
+        "Migrated {}",
+        glu_client::format::plural(migrate.roots.len(), "requested package")
+    );
+    if !migrate.configuration_migrated {
+        println!("Homebrew configuration and runtime data were left untouched.");
+    }
+}
+
+fn render_migrate_plan_output(plan: &MigratePlanOutput, globals: &GlobalOptions) {
+    for warning in &plan.warnings {
+        eprintln!("{warning}");
+    }
+    if globals.verbose {
+        println!("Homebrew source: {}", plan.source);
+    }
+    if plan.roots.is_empty() {
+        println!("No requested Homebrew packages found.");
+        return;
+    }
+    println!(
+        "Would migrate {}:",
+        glu_client::format::plural(plan.roots.len(), "requested package")
+    );
+    if let Some(install) = &plan.install {
+        render_install_plan_output(install, globals);
+    }
+    if !plan.inferred_deactivated.is_empty() {
+        println!(
+            "Would keep {} deactivated.",
+            glu_client::format::plural(plan.inferred_deactivated.len(), "package")
+        );
+    }
+    if !plan.configuration_migrated {
+        println!("Homebrew configuration and runtime data would be left untouched.");
+    }
 }
 
 fn render_reinstall_output(reinstall: &ReinstallOutput, globals: &GlobalOptions) {
@@ -3908,6 +4019,28 @@ mod tests {
             "InstallResult",
             &InstallResult::PlanTree(InstallPlanTreeResult::new(&install_plan, &BTreeMap::new())),
         );
+
+        let migrate = MigrateOutput {
+            mode: ExecutedMode::Executed,
+            source: "/opt/homebrew".to_string(),
+            roots: Vec::new(),
+            inferred_deactivated: Vec::new(),
+            warnings: Vec::new(),
+            install: None,
+            configuration_migrated: false,
+        };
+        assert_result_valid("MigrateResult", &MigrateResult::Executed(&migrate));
+        let migrate_plan = MigratePlanOutput {
+            mode: PlanMode::Plan,
+            source: "/opt/homebrew".to_string(),
+            roots: Vec::new(),
+            requires_confirmation: false,
+            inferred_deactivated: Vec::new(),
+            warnings: Vec::new(),
+            install: None,
+            configuration_migrated: false,
+        };
+        assert_result_valid("MigrateResult", &MigrateResult::Plan(&migrate_plan));
 
         let reinstall = ReinstallOutput {
             mode: ExecutedMode::Executed,

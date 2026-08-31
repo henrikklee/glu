@@ -65,6 +65,8 @@ The file may also contain `deactivated`, a map of packages that remain installed
 
 Versions in `glu.json` are advisory state and history, not lockfile constraints. Sync resolves the closure, installs what is needed, and writes resolved versions back for declared packages.
 
+`glu migrate` imports declaration intent from an external Homebrew prefix, not installed truth. Its source scanner reads only foreign package-local receipts to identify names marked `installed_on_request`; it never treats those records as glu receipts or writes state directly. The resulting names go through the normal install planner and executor, so `InstalledStateStore` remains the only owner of glu declarations and receipts. Existing declarations and deactivation choices are preserved.
+
 ## Receipts
 
 Each complete installed keg has a package-local `glu.install-receipt.v1` receipt. The receipt is the installed authority for:

@@ -71,6 +71,19 @@ it (a package installed only as a dependency gets promoted to declared)."
         names: Vec<String>,
     },
 
+    /// Migrate explicitly requested packages from Homebrew.
+    #[command(long_about = "\
+Discovers packages explicitly requested in an existing Homebrew installation, \
+then installs their current supported versions through glu's normal pipeline. \
+Existing glu declarations and deactivation choices are preserved. Homebrew \
+configuration, runtime data, and package files are left untouched. Always \
+presents the plan and asks before execution; --plan previews and --yes approves.")]
+    Migrate {
+        /// Homebrew installation prefix to inspect.
+        #[arg(long, default_value = "/opt/homebrew", value_name = "PREFIX")]
+        from: PathBuf,
+    },
+
     /// Reinstall installed packages.
     #[command(long_about = "\
 Resolves and reinstalls named packages even when already installed. Errors \
@@ -404,6 +417,7 @@ impl Command {
     pub(crate) fn id(&self) -> CommandId {
         match self {
             Self::Install { .. } => CommandId::Install,
+            Self::Migrate { .. } => CommandId::Migrate,
             Self::Reinstall { .. } => CommandId::Reinstall,
             Self::Update { .. } => CommandId::Update,
             Self::Remove { .. } => CommandId::Remove,

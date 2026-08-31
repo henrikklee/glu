@@ -19,6 +19,16 @@ pub(super) fn confirm_install(
     ask_yes_no("Continue?", true)
 }
 
+pub(super) fn confirm_migration(packages: usize) -> Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "would migrate {}; re-run with `glu migrate -y` to confirm",
+            glu_client::format::plural(packages, "requested package")
+        );
+    }
+    ask_yes_no("Continue?", true)
+}
+
 pub(super) fn confirm_removal(plan: &RemovalPlan, remove_config: bool) -> Result<bool> {
     if !std::io::stdin().is_terminal() {
         let command = if remove_config {

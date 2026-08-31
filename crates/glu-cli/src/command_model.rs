@@ -108,6 +108,7 @@ pub(crate) struct OptionSpec {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OptionKind {
     Bool,
+    Path,
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -191,6 +192,14 @@ const INTERNAL_WORKER: &[OutputProtocol] = &[OutputProtocol::InternalWorker];
 const INSTALL_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec {
     name: "NAMES",
     description: "optional package names; without NAMES, sync declared packages",
+}];
+const MIGRATE_OPTIONS: &[OptionSpec] = &[OptionSpec {
+    long: "--from",
+    short: None,
+    kind: OptionKind::Path,
+    scope: OptionScope::CommandSelection,
+    description: "Homebrew installation prefix to inspect (default: /opt/homebrew)",
+    conflicts_with: &[],
 }];
 const REINSTALL_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec {
     name: "NAMES",
@@ -616,6 +625,27 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         result_schema: Some("InstallResult"),
         options: INSTALL_OPTIONS,
         examples: &["glu install curl", "glu i -yft vips", "glu install curl -j"],
+        subcommands: EMPTY_COMMANDS,
+    },
+    CommandSpec {
+        id: CommandId::Migrate,
+        name: "migrate",
+        group: CommandGroup::PackageManagement,
+        aliases: &[],
+        summary: "Migrate explicitly requested packages from Homebrew",
+        default_behavior: "Discovers Homebrew packages installed on request and installs current supported versions through glu while preserving declarations and clear deactivation intent.",
+        arguments: EMPTY_ARGUMENTS,
+        mutates: true,
+        default_scope: Some("Homebrew requested packages"),
+        output_protocols: HUMAN_JSON,
+        capabilities: CAP_VERBOSE_PLAN_YES,
+        result_schema: Some("MigrateResult"),
+        options: MIGRATE_OPTIONS,
+        examples: &[
+            "glu migrate --plan",
+            "glu migrate",
+            "glu migrate --from /opt/homebrew -yj",
+        ],
         subcommands: EMPTY_COMMANDS,
     },
     CommandSpec {
@@ -1063,6 +1093,8 @@ pub(crate) struct InvocationInfo {
 pub(crate) enum CommandId {
     #[serde(rename = "install")]
     Install,
+    #[serde(rename = "migrate")]
+    Migrate,
     #[serde(rename = "reinstall")]
     Reinstall,
     #[serde(rename = "update")]
@@ -1117,6 +1149,7 @@ impl CommandId {
     #[cfg(test)]
     pub(crate) const ALL: &'static [Self] = &[
         Self::Install,
+        Self::Migrate,
         Self::Reinstall,
         Self::Update,
         Self::Remove,
@@ -1146,6 +1179,7 @@ impl CommandId {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Install => "install",
+            Self::Migrate => "migrate",
             Self::Reinstall => "reinstall",
             Self::Update => "update",
             Self::Remove => "remove",
@@ -1711,6 +1745,8 @@ pub(crate) enum CommandOutput {
     InfoMany(InfoManyOutput),
     Install(InstallOutput),
     InstallPlan(InstallPlanOutput),
+    Migrate(MigrateOutput),
+    MigratePlan(MigratePlanOutput),
     Reinstall(ReinstallOutput),
     ReinstallPlan(ReinstallPlanOutput),
     Update(UpdateOutput),
@@ -1872,6 +1908,35 @@ pub(crate) struct InstallPlanOutput {
     pub(crate) would_download_bytes: Option<u64>,
     #[serde(skip)]
     pub(crate) dependency_tree: Vec<DependencyTreeNode>,
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+#[schemars(rename = "MigrateResult")]
+pub(crate) struct MigrateOutput {
+    pub(crate) mode: ExecutedMode,
+    pub(crate) source: String,
+    pub(crate) roots: Vec<String>,
+    pub(crate) inferred_deactivated: Vec<String>,
+    pub(crate) warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(required)]
+    pub(crate) install: Option<InstallOutput>,
+    pub(crate) configuration_migrated: bool,
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+#[schemars(rename = "MigratePlanResult")]
+pub(crate) struct MigratePlanOutput {
+    pub(crate) mode: PlanMode,
+    pub(crate) source: String,
+    pub(crate) roots: Vec<String>,
+    pub(crate) requires_confirmation: bool,
+    pub(crate) inferred_deactivated: Vec<String>,
+    pub(crate) warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(required)]
+    pub(crate) install: Option<InstallPlanOutput>,
+    pub(crate) configuration_migrated: bool,
 }
 
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]

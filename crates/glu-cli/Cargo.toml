@@ -32,5 +32,8 @@ serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+flate2.workspace = true
 jsonschema = { version = "0.51", default-features = false }
+ring.workspace = true
+tar.workspace = true
 tempfile.workspace = true

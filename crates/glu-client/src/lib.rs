@@ -11,6 +11,7 @@ pub mod hash;
 mod homebrew_version;
 pub mod install;
 pub mod link;
+pub mod migrate;
 pub mod outdated;
 mod path_component;
 pub mod postinstall;
@@ -155,6 +156,22 @@ impl GluClient {
         events: std::sync::Arc<dyn events::ExecutionEvents>,
     ) -> Result<install::InstallSummary> {
         install::execute_install(self, plan, options, events).await
+    }
+
+    pub async fn plan_migration(
+        &self,
+        source: std::path::PathBuf,
+    ) -> Result<migrate::MigrationPlan> {
+        migrate::plan_migration(self, source).await
+    }
+
+    pub async fn execute_migration(
+        &self,
+        plan: migrate::MigrationPlan,
+        options: InstallOptions,
+        events: std::sync::Arc<dyn events::ExecutionEvents>,
+    ) -> Result<migrate::MigrationSummary> {
+        migrate::execute_migration(self, plan, options, events).await
     }
 
     pub fn plan_cache_cleanup(&self) -> Result<download::cache::CacheCleanupPlan> {

@@ -1,5 +1,6 @@
 pub(crate) mod approval;
 pub(crate) mod configuration;
+pub(crate) mod migration;
 pub(crate) mod observability;
 pub(crate) mod packages;
 pub(crate) mod query;

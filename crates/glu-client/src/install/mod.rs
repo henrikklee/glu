@@ -170,6 +170,7 @@ pub struct InstallPlan {
     pub(crate) workset: planner::InstallWorkSet,
     pub(crate) declaration_after: Declaration,
     pub(crate) deactivated_after: BTreeSet<PackageName>,
+    declared_before: BTreeSet<PackageName>,
     command_start: std::time::Instant,
 }
 
@@ -195,7 +196,41 @@ impl InstallPlan {
             .find(|package| &package.name == name)
             .map(|package| package.version.as_str())
     }
+
+    /// Preserves an external source's explicit unlink intent for newly
+    /// declared roots, after resolve has supplied authoritative exposure.
+    /// Existing glu declarations win, and isolated packages are not confused
+    /// with deactivated global packages merely because they have no public
+    /// linked marker in the source package manager.
+    pub(crate) fn preserve_deactivation_for_new_global_roots(
+        &mut self,
+        unlinked_requested_as: &BTreeSet<PackageSelector>,
+    ) -> Vec<PackageName> {
+        let mut inferred = BTreeSet::new();
+        for root in &self.manifest.roots {
+            if !unlinked_requested_as.contains(&root.requested_as) {
+                continue;
+            }
+            let Some(package) = self.manifest.packages.get(&root.package) else {
+                continue;
+            };
+            if !matches!(package.exposure, glu_core::Exposure::Global)
+                || self.declared_before.contains(&package.name)
+            {
+                continue;
+            }
+            self.declaration_after
+                .deactivated
+                .insert(package.name.clone(), true);
+            self.deactivated_after.insert(package.name.clone());
+            inferred.insert(package.name.clone());
+        }
+        inferred.into_iter().collect()
+    }
 }
+
+#[cfg(test)]
+mod migration_tests;
 
 #[derive(Debug, Clone, Default)]
 pub struct InstallSummary {
@@ -431,6 +466,7 @@ pub async fn plan_install(
         workset,
         declaration_after: declaration,
         deactivated_after,
+        declared_before: declaration_before.names(),
         command_start,
     })
 }

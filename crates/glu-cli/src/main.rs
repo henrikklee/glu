@@ -233,6 +233,9 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
                 .await?
                 .into_output()
         }
+        Command::Migrate { from } => commands::migration::migrate(&context, from)
+            .await?
+            .into_output(),
         Command::Reinstall { deps, names } => commands::packages::reinstall(&context, names, deps)
             .await?
             .into_output(),
