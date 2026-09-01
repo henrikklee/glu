@@ -228,8 +228,8 @@ impl GluClient {
     /// against the installed set, decides what would be removed (the named
     /// targets plus everything that becomes dangling once they are gone)
     /// and what would be demoted-and-kept because other declared packages
-    /// still need it. The CLI uses the difference between `to_remove` and
-    /// `named` to decide whether to ask for confirmation. See
+    /// still need it. The CLI asks for confirmation when an actual removal's
+    /// package ID is absent from the concrete selector matches in `named`. See
     /// `remove::plan_removal`.
     pub fn activate(
         &self,

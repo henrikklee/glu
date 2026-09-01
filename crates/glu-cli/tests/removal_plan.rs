@@ -194,6 +194,44 @@ fn remove_plan_json_reports_would_remove_without_mutating() {
 }
 
 #[test]
+fn removal_confirmation_compares_concrete_package_identities() {
+    let prefix = tempfile::tempdir().unwrap();
+    write_declaration(
+        prefix.path(),
+        &[("app", "1.0"), ("shared", "1.0"), ("tool", "1.0")],
+    );
+    write_receipt(prefix.path(), "app", "1.0", &["shared"]);
+    write_receipt(prefix.path(), "shared", "1.0", &[]);
+    write_receipt(prefix.path(), "tool", "1.0", &["leaf"]);
+    write_receipt(prefix.path(), "leaf", "1.0", &[]);
+
+    // `shared` is explicitly selected but retained because `app` needs it.
+    // Removing `tool` makes the unselected `leaf` package dangling, so the
+    // selected and removed lists have equal lengths but different identities.
+    let plan = json_command(prefix.path(), &["rm", "--plan", "--json", "shared", "tool"]);
+    assert_eq!(plan["result"]["requires_confirmation"], true);
+    assert_eq!(names(&plan["result"]["named"]), vec!["shared", "tool"]);
+    assert_eq!(names(&plan["result"]["would_remove"]), vec!["leaf", "tool"]);
+    assert_eq!(names(&plan["result"]["would_keep"]), vec!["shared"]);
+
+    let refused = glu()
+        .args(["rm", "--json", "shared", "tool"])
+        .env("GLU_PREFIX", prefix.path())
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_slice(&refused.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "confirmation_required");
+    assert!(prefix.path().join("Cellar/tool/1.0").exists());
+    assert!(prefix.path().join("Cellar/leaf/1.0").exists());
+
+    let executed = json_command(prefix.path(), &["rm", "--yes", "--json", "shared", "tool"]);
+    assert_eq!(names(&executed["result"]["removed"]), vec!["leaf", "tool"]);
+    assert_eq!(names(&executed["result"]["kept"]), vec!["shared"]);
+}
+
+#[test]
 fn remove_json_execution_reports_executed_mode() {
     let prefix = tempfile::tempdir().unwrap();
     write_declaration(prefix.path(), &[("root", "1.0")]);

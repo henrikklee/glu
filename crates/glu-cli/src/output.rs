@@ -1195,7 +1195,7 @@ pub(crate) fn removal_plan_output(
                 status: MutationStatus::WouldKeepNeededByDeclared,
             })
             .collect(),
-        requires_confirmation: plan.to_remove.len() > plan.named.len()
+        requires_confirmation: plan.has_unnamed_removals()
             || (remove_modified_config && !plan.mutable_files.modified.is_empty()),
         configuration: mutable_file_cleanup_plan_output(
             &plan.mutable_files,

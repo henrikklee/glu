@@ -42,9 +42,9 @@ pub struct KeptDeclaredPackage {
 /// the plan + execute split) reconciles disk state: the named targets plus
 /// everything that becomes dangling once they are gone are removed;
 /// declared targets that other declared packages still need are demoted and
-/// kept. The CLI uses the difference between `to_remove` and `named` to
-/// decide whether to ask for confirmation (docs/reference/cli-behavior.md,
-/// Confirmation policy).
+/// kept. The CLI asks for confirmation when an actual removal's package ID
+/// was not among the concrete packages selected by the user's selectors
+/// (docs/reference/cli-behavior.md, Confirmation policy).
 #[derive(Debug)]
 pub struct RemovalPlan {
     /// The kegs the selectors resolved to — what the user explicitly named.
@@ -58,6 +58,24 @@ pub struct RemovalPlan {
     pub kept: Vec<KeptDeclaredPackage>,
     pub mutable_files: MutableFileCleanupPlan,
     post_declaration: Declaration,
+}
+
+impl RemovalPlan {
+    /// Whether execution would remove at least one concrete package that the
+    /// user's selectors did not resolve to. Identity, rather than vector
+    /// cardinality, is the confirmation boundary: a named package may be kept
+    /// while a different package becomes dangling, leaving equal-length lists
+    /// that do not contain the same packages.
+    pub fn has_unnamed_removals(&self) -> bool {
+        let named_ids: BTreeSet<PackageId> = self
+            .named
+            .iter()
+            .map(|package| package.id.clone())
+            .collect();
+        self.to_remove
+            .iter()
+            .any(|package| !named_ids.contains(&package.id))
+    }
 }
 
 /// Plans a removal against the installed state on disk. Loads the receipt
@@ -621,6 +639,72 @@ mod tests {
         assert_eq!(plan.kept.len(), 1);
         assert_eq!(plan.kept[0].package.name.0, "glib");
         assert_eq!(plan.kept[0].needed_by, vec!["vips"]);
+        assert!(!plan.has_unnamed_removals());
+    }
+
+    #[test]
+    fn confirmation_uses_package_identity_when_named_and_removal_counts_match() {
+        let app = installed(
+            "pkg:app@1.0",
+            "app",
+            "1.0",
+            0,
+            vec![("shared", "pkg:shared@1.0")],
+        );
+        let shared = installed("pkg:shared@1.0", "shared", "1.0", 0, vec![]);
+        let tool = installed(
+            "pkg:tool@1.0",
+            "tool",
+            "1.0",
+            0,
+            vec![("leaf", "pkg:leaf@1.0")],
+        );
+        let leaf = installed("pkg:leaf@1.0", "leaf", "1.0", 0, vec![]);
+        let all = vec![app, shared, tool, leaf];
+
+        let plan = plan_removal_from_installed(
+            &all,
+            &declared_names(&["app", "shared", "tool"]),
+            vec!["shared".to_string(), "tool".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(plan.named.len(), 2);
+        assert_eq!(plan.to_remove.len(), 2);
+        assert_eq!(plan.kept.len(), 1);
+        assert_eq!(plan.kept[0].package.name.0, "shared");
+        assert_eq!(
+            plan.to_remove
+                .iter()
+                .map(|package| package.name.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["leaf", "tool"]
+        );
+        assert!(plan.has_unnamed_removals());
+    }
+
+    #[test]
+    fn confirmation_tracks_concrete_versions_selected_by_the_selector() {
+        let v1 = installed("pkg:vips@1.0", "vips", "1.0", 0, vec![]);
+        let v2 = installed("pkg:vips@2.0", "vips", "2.0", 0, vec![]);
+        let all = vec![v1, v2];
+        let declared = declared_names(&["vips"]);
+
+        let all_versions = plan_removal_from_installed(
+            &all,
+            &declared,
+            vec!["vips".to_string(), "vips".to_string()],
+        )
+        .unwrap();
+        assert_eq!(all_versions.named.len(), 2);
+        assert_eq!(all_versions.to_remove.len(), 2);
+        assert!(!all_versions.has_unnamed_removals());
+
+        let one_version =
+            plan_removal_from_installed(&all, &declared, vec!["vips@2.0".to_string()]).unwrap();
+        assert_eq!(one_version.named.len(), 1);
+        assert_eq!(one_version.to_remove.len(), 2);
+        assert!(one_version.has_unnamed_removals());
     }
 
     #[test]
@@ -649,6 +733,7 @@ mod tests {
         assert_eq!(plan.named.len(), 1);
         let names: Vec<&str> = plan.to_remove.iter().map(|p| p.name.0.as_str()).collect();
         assert_eq!(names, vec!["glib", "pcre2", "vips"]);
+        assert!(plan.has_unnamed_removals());
     }
 
     #[test]
@@ -679,6 +764,7 @@ mod tests {
 
         let names: Vec<&str> = plan.to_remove.iter().map(|p| p.name.0.as_str()).collect();
         assert_eq!(names, vec!["vips"]);
+        assert!(!plan.has_unnamed_removals());
     }
 
     #[test]
@@ -703,6 +789,7 @@ mod tests {
         let names: Vec<&str> = plan.to_remove.iter().map(|p| p.name.0.as_str()).collect();
         assert_eq!(names, vec!["glib", "pcre2"]);
         assert_eq!(plan.named.len(), 1);
+        assert!(plan.has_unnamed_removals());
     }
 
     #[test]
@@ -727,6 +814,7 @@ mod tests {
         assert!(plan.kept.is_empty());
         let names: Vec<&str> = plan.to_remove.iter().map(|p| p.name.0.as_str()).collect();
         assert_eq!(names, vec!["glib", "vips"]);
+        assert!(!plan.has_unnamed_removals());
     }
 
     #[test]

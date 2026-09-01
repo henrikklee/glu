@@ -198,7 +198,7 @@ pub(crate) fn remove(
             context.globals.verbose,
         );
     }
-    if removal_plan.to_remove.len() > removal_plan.named.len() {
+    if removal_plan.has_unnamed_removals() {
         let approved = approval::approve(
             context.globals,
             || {
