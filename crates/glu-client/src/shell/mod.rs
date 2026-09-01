@@ -1,5 +1,5 @@
 use crate::config::ClientConfig;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::{
     env, fs,
     io::Write,
@@ -120,48 +120,95 @@ fn install_managed_block(path: &Path, block: &str) -> Result<()> {
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let existing = fs::read_to_string(path).unwrap_or_default();
-    let next = if let (Some(start), Some(end)) =
-        (existing.find(MANAGED_START), existing.find(MANAGED_END))
-    {
-        let end = end + MANAGED_END.len();
-        let mut next = String::new();
-        next.push_str(&existing[..start]);
-        if !next.ends_with('\n') && !next.is_empty() {
-            next.push('\n');
+    let write_path = shell_config_write_target(path)?;
+    let existing = match fs::read(&write_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", write_path.display()));
         }
-        next.push_str(block.trim_end());
-        next.push_str(&existing[end..]);
-        if !next.ends_with('\n') {
-            next.push('\n');
-        }
-        next
-    } else {
-        let mut next = existing;
-        if !next.is_empty() && !next.ends_with('\n') {
-            next.push('\n');
-        }
-        if !next.is_empty() {
-            next.push('\n');
-        }
-        next.push_str(block);
-        next
     };
+    let next = updated_managed_contents(&existing, block.as_bytes())
+        .with_context(|| format!("refusing to modify {}", path.display()))?;
 
-    atomic_write_shell_config(path, next.as_bytes())
-        .with_context(|| format!("failed to write {}", path.display()))
+    atomic_write_shell_config(&write_path, &next)
+        .with_context(|| format!("failed to write {}", write_path.display()))
 }
 
-fn atomic_write_shell_config(path: &Path, contents: &[u8]) -> Result<()> {
-    let write_path = symlink_write_target(path)?;
+fn updated_managed_contents(existing: &[u8], block: &[u8]) -> Result<Vec<u8>> {
+    let range = managed_block_range(existing)?;
+    let block = block.strip_suffix(b"\n").unwrap_or(block);
+    let mut next = Vec::with_capacity(existing.len().saturating_add(block.len() + 2));
+
+    if let Some((start, end)) = range {
+        next.extend_from_slice(&existing[..start]);
+        if !next.is_empty() && !next.ends_with(b"\n") {
+            next.push(b'\n');
+        }
+        next.extend_from_slice(block);
+        next.extend_from_slice(&existing[end..]);
+    } else {
+        next.extend_from_slice(existing);
+        if !next.is_empty() && !next.ends_with(b"\n") {
+            next.push(b'\n');
+        }
+        if !next.is_empty() {
+            next.push(b'\n');
+        }
+        next.extend_from_slice(block);
+        next.push(b'\n');
+    }
+
+    if !next.ends_with(b"\n") {
+        next.push(b'\n');
+    }
+    Ok(next)
+}
+
+fn managed_block_range(contents: &[u8]) -> Result<Option<(usize, usize)>> {
+    let starts = byte_matches(contents, MANAGED_START.as_bytes());
+    let ends = byte_matches(contents, MANAGED_END.as_bytes());
+    match (starts.as_slice(), ends.as_slice()) {
+        ([], []) => Ok(None),
+        ([start], [end])
+            if start + MANAGED_START.len() <= *end
+                && marker_is_line(contents, *start, MANAGED_START.len())
+                && marker_is_line(contents, *end, MANAGED_END.len()) =>
+        {
+            Ok(Some((*start, end + MANAGED_END.len())))
+        }
+        _ => bail!(
+            "ambiguous glu shell markers: found {} start marker(s) and {} end marker(s); expected no markers or one well-ordered pair",
+            starts.len(),
+            ends.len()
+        ),
+    }
+}
+
+fn byte_matches(contents: &[u8], needle: &[u8]) -> Vec<usize> {
+    contents
+        .windows(needle.len())
+        .enumerate()
+        .filter_map(|(offset, candidate)| (candidate == needle).then_some(offset))
+        .collect()
+}
+
+fn marker_is_line(contents: &[u8], offset: usize, len: usize) -> bool {
+    let begins_line = offset == 0 || contents.get(offset.wrapping_sub(1)) == Some(&b'\n');
+    let after = offset + len;
+    let ends_line = after == contents.len()
+        || contents.get(after) == Some(&b'\n')
+        || (contents.get(after) == Some(&b'\r') && contents.get(after + 1) == Some(&b'\n'));
+    begins_line && ends_line
+}
+
+fn atomic_write_shell_config(write_path: &Path, contents: &[u8]) -> Result<()> {
     let parent = write_path.parent().unwrap_or_else(|| Path::new("."));
     let filename = write_path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "shellrc".to_string());
-    let original_permissions = fs::metadata(&write_path)
-        .ok()
-        .map(|meta| meta.permissions());
+    let original_permissions = fs::metadata(write_path).ok().map(|meta| meta.permissions());
 
     let mut last_error = None;
     for attempt in 0..16u32 {
@@ -189,7 +236,7 @@ fn atomic_write_shell_config(path: &Path, contents: &[u8]) -> Result<()> {
                     }
                     file.sync_all()?;
                     drop(file);
-                    fs::rename(&temp, &write_path)?;
+                    fs::rename(&temp, write_path)?;
                     let _ = fs::File::open(parent).and_then(|dir| dir.sync_all());
                     Ok(())
                 })();
@@ -210,26 +257,39 @@ fn atomic_write_shell_config(path: &Path, contents: &[u8]) -> Result<()> {
         .into())
 }
 
-fn symlink_write_target(path: &Path) -> Result<PathBuf> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(path.to_path_buf()),
-        Err(error) => return Err(error.into()),
-    };
-    if !metadata.file_type().is_symlink() {
-        return Ok(path.to_path_buf());
-    }
-    let target = fs::read_link(path)?;
-    if target.is_absolute() {
-        Ok(target)
-    } else {
-        Ok(path.parent().unwrap_or_else(|| Path::new(".")).join(target))
+fn shell_config_write_target(path: &Path) -> Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(target) => Ok(target),
+        Err(canonical_error) => match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                Err(canonical_error).with_context(|| {
+                    format!("failed to resolve shell config symlink {}", path.display())
+                })
+            }
+            Ok(_) => Err(canonical_error)
+                .with_context(|| format!("failed to resolve shell config {}", path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let parent = path.parent().unwrap_or_else(|| Path::new("."));
+                let parent = fs::canonicalize(parent).with_context(|| {
+                    format!(
+                        "failed to resolve shell config directory {}",
+                        parent.display()
+                    )
+                })?;
+                let filename = path
+                    .file_name()
+                    .context("shell config path has no filename")?;
+                Ok(parent.join(filename))
+            }
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to inspect shell config {}", path.display())),
+        },
     }
 }
 
 fn contains_managed_block(path: &Path) -> Result<bool> {
-    let content = fs::read_to_string(path)?;
-    Ok(content.contains(MANAGED_START) && content.contains(MANAGED_END))
+    let content = fs::read(path)?;
+    Ok(managed_block_range(&content)?.is_some())
 }
 
 fn ordered_path(config: &ClientConfig) -> String {
@@ -422,6 +482,74 @@ mod tests {
     }
 
     #[test]
+    fn managed_block_append_preserves_non_utf8_bytes_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rc");
+        let original = b"before-\xff\n";
+        let block = "# >>> glu >>>\nnew\n# <<< glu <<<\n";
+        fs::write(&path, original).unwrap();
+
+        install_managed_block(&path, block).unwrap();
+        let first = fs::read(&path).unwrap();
+        assert!(first.starts_with(original));
+        assert!(first.ends_with(block.as_bytes()));
+
+        install_managed_block(&path, block).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), first);
+    }
+
+    #[test]
+    fn managed_block_refuses_ambiguous_markers_without_writing() {
+        let cases = [
+            "# >>> glu >>>\nmissing end\n",
+            "# <<< glu <<<\nmissing start\n",
+            "# <<< glu <<<\nreversed\n# >>> glu >>>\n",
+            "# >>> glu >>>\n# >>> glu >>>\n# <<< glu <<<\n",
+            "# >>> glu >>>\n# <<< glu <<<\n# <<< glu <<<\n",
+            "prefix # >>> glu >>>\nvalue\n# <<< glu <<<\n",
+        ];
+
+        for (index, existing) in cases.into_iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("rc-{index}"));
+            fs::write(&path, existing).unwrap();
+
+            let error =
+                install_managed_block(&path, "# >>> glu >>>\nnew\n# <<< glu <<<\n").unwrap_err();
+
+            assert!(error.to_string().contains("refusing to modify"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), existing);
+            assert!(contains_managed_block(&path).is_err());
+        }
+    }
+
+    #[test]
+    fn managed_block_read_error_never_replaces_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rc-directory");
+        fs::create_dir(&path).unwrap();
+
+        install_managed_block(&path, "# >>> glu >>>\nnew\n# <<< glu <<<\n").unwrap_err();
+
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn managed_block_permission_error_preserves_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rc");
+        let original = b"private shell configuration\n";
+        fs::write(&path, original).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        install_managed_block(&path, "# >>> glu >>>\nnew\n# <<< glu <<<\n").unwrap_err();
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn managed_block_write_is_atomic_and_preserves_mode() {
         let dir = tempfile::tempdir().unwrap();
@@ -446,19 +574,43 @@ mod tests {
     fn managed_block_atomic_write_preserves_rc_symlink() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("dotfiles/zshrc");
+        let middle = dir.path().join("links/zshrc");
         fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::create_dir_all(middle.parent().unwrap()).unwrap();
         fs::write(&target, "before\n").unwrap();
+        std::os::unix::fs::symlink("../dotfiles/zshrc", &middle).unwrap();
         let link = dir.path().join(".zshrc");
-        std::os::unix::fs::symlink("dotfiles/zshrc", &link).unwrap();
+        std::os::unix::fs::symlink("links/zshrc", &link).unwrap();
 
         install_managed_block(&link, "# >>> glu >>>\nnew\n# <<< glu <<<\n").unwrap();
 
         assert!(link.is_symlink());
+        assert!(middle.is_symlink());
+        assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from("links/zshrc"));
         assert_eq!(
-            fs::read_link(&link).unwrap(),
-            PathBuf::from("dotfiles/zshrc")
+            fs::read_link(&middle).unwrap(),
+            PathBuf::from("../dotfiles/zshrc")
         );
         assert!(fs::read_to_string(&target).unwrap().contains("new"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn managed_block_refuses_dangling_and_cyclic_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink("missing", &dangling).unwrap();
+        install_managed_block(&dangling, "# >>> glu >>>\nnew\n# <<< glu <<<\n").unwrap_err();
+        assert_eq!(fs::read_link(&dangling).unwrap(), PathBuf::from("missing"));
+        assert!(!dir.path().join("missing").exists());
+
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::os::unix::fs::symlink("second", &first).unwrap();
+        std::os::unix::fs::symlink("first", &second).unwrap();
+        install_managed_block(&first, "# >>> glu >>>\nnew\n# <<< glu <<<\n").unwrap_err();
+        assert_eq!(fs::read_link(&first).unwrap(), PathBuf::from("second"));
+        assert_eq!(fs::read_link(&second).unwrap(), PathBuf::from("first"));
     }
 
     #[test]
