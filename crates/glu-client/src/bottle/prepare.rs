@@ -16,7 +16,7 @@ use tar::EntryType;
 
 use crate::bottle::macho::{self, PatchCounts};
 
-use super::{codesign::CodeSignPool, writer::WriterPool};
+use super::{codesign::CodeSignPool, extract_fs::ExtractionRoot, writer::WriterPool};
 
 #[derive(Clone)]
 pub struct PrepareInput {
@@ -93,6 +93,7 @@ struct PrefixProfile {
     build_prefix: String,
     replacements: Vec<ReplacementRule>,
 }
+#[derive(Debug)]
 struct StreamPatchResult {
     to_sign: BTreeSet<PathBuf>,
     warnings: Vec<String>,
@@ -281,17 +282,16 @@ fn prefix_profile(
 }
 
 fn find_staged_keg(root: &Path, name: &PackageName, keg_version: &KegVersion) -> Result<PathBuf> {
-    let direct = root.join(&name.0).join(&keg_version.0);
-    if direct.is_dir() {
-        return Ok(direct);
+    let direct_relative = PathBuf::from(&name.0).join(&keg_version.0);
+    if is_real_directory_beneath(root, &direct_relative)? {
+        return Ok(root.join(direct_relative));
     }
 
-    let cellar = root
-        .join("opt/homebrew/Cellar")
+    let cellar_relative = PathBuf::from("opt/homebrew/Cellar")
         .join(&name.0)
         .join(&keg_version.0);
-    if cellar.is_dir() {
-        return Ok(cellar);
+    if is_real_directory_beneath(root, &cellar_relative)? {
+        return Ok(root.join(cellar_relative));
     }
 
     let mut matches = Vec::new();
@@ -317,6 +317,19 @@ fn find_staged_keg(root: &Path, name: &PackageName, keg_version: &KegVersion) ->
             keg_version.0,
             root.display()
         ),
+    }
+}
+
+fn is_real_directory_beneath(root: &Path, relative: &Path) -> Result<bool> {
+    let path = root.join(relative);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            ExtractionRoot::open(root)?.require_directory(relative)?;
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("stat {}", path.display())),
     }
 }
 
@@ -369,36 +382,25 @@ fn extract_patch_tar_gz_parallel(
     let (write_reply_tx, write_reply_rx) = mpsc::channel::<Result<()>>();
     let mut pending_writes = 0usize;
     let mut hardlinks = Vec::new();
-    // Bottles pack many files per directory (aws-sdk-cpp: 85k regular files under 1.4k unique
-    // directories), but the previous implementation called `create_dir_all`
-    // unconditionally per file, paying a mkdir+stat syscall pair for a
-    // directory that's already there in the overwhelming majority of calls. Track what's already
-    // been created this package and skip the redundant ones.
-    let mut created_dirs = BTreeSet::new();
-    // Track symlinks created by earlier entries. A later entry
-    // writing under a symlinked ancestor would follow the link out of the
-    // staging root (classic tar-symlink traversal), so every entry's parent
-    // chain is checked against this set before any write.
-    let mut created_symlinks = BTreeSet::new();
+    let mut archive_paths = BTreeSet::new();
+    ensure_real_extraction_root(dst)?;
+    let mut extraction_root = ExtractionRoot::open(dst)?;
 
     for entry in archive.entries().context("read tar entries")? {
         let mut entry = entry.context("read tar entry")?;
-        let rel_path = entry.path().context("entry path")?.into_owned();
-        reject_unsafe_path(&rel_path)?;
+        let entry_path = entry.path().context("entry path")?;
+        let rel_path = normalize_archive_path(entry_path.as_ref())?;
+        reject_reserved_metadata_path(&rel_path)?;
+        if !archive_paths.insert(rel_path.clone()) {
+            bail!("duplicate archive path: {}", rel_path.display());
+        }
         let rel = rel_path.to_string_lossy().replace('\\', "/");
         let out = dst.join(&rel_path);
-        // Refuse to write through a symlink created by this archive.
-        if let Some(link) = symlink_ancestor(&out, &created_symlinks) {
-            bail!("archive writes through symlink {}", link.display());
-        }
         let kind = entry.header().entry_type();
 
         if kind == EntryType::Directory {
-            ensure_dir_created(&mut created_dirs, &out)?;
+            extraction_root.create_dir(&rel_path)?;
         } else if kind == EntryType::Regular {
-            if let Some(parent) = out.parent() {
-                ensure_dir_created(&mut created_dirs, parent)?;
-            }
             let entry_size = entry.size();
             let writer_wait_start = Instant::now();
             let memory = writer_pool.reserve_bytes(entry_size);
@@ -476,36 +478,35 @@ fn extract_patch_tar_gz_parallel(
                 }
             }
 
+            // Open the destination synchronously beneath the staging descriptor.
+            // Writer threads receive this descriptor and never resolve the pathname.
+            let output_file = extraction_root.create_file(&rel_path)?;
             let writer_wait_start = Instant::now();
-            writer_pool.submit_extracted(out, data, mode, write_reply_tx.clone(), memory)?;
+            writer_pool.submit_extracted(
+                out,
+                output_file,
+                data,
+                mode,
+                write_reply_tx.clone(),
+                memory,
+            )?;
             timings.writer_wait += writer_wait_start.elapsed();
             pending_writes += 1;
         } else if kind == EntryType::Symlink {
-            if let Some(parent) = out.parent() {
-                ensure_dir_created(&mut created_dirs, parent)?;
-            }
             let Some(target) = entry.link_name().context("symlink target")? else {
                 continue;
             };
-            create_symlink(&target, &out)
+            extraction_root
+                .create_symlink(&target, &rel_path)
                 .with_context(|| format!("symlink {} -> {}", out.display(), target.display()))?;
-            created_symlinks.insert(out.clone());
         } else if kind == EntryType::Link {
-            // Deferred below: tar always lists a hardlink's target before the hardlink entry
-            // itself, but the target's *write* may still be sitting in the shared pool's queue.
-            if let Some(parent) = out.parent() {
-                ensure_dir_created(&mut created_dirs, parent)?;
-            }
+            // Deferred below: tar lists a hardlink target before the hardlink entry,
+            // but the target write may still be queued in the shared writer pool.
             let Some(target) = entry.link_name().context("hardlink target")? else {
                 continue;
             };
-            // A hardlink target is resolved to a file
-            // later (read/copy), so its lexical path must remain within the
-            // staging root. Symlink targets are resolved and re-confined after
-            // pending writes drain, preserving safe keg-internal symlink chains
-            // while rejecting escapes.
-            let src = hardlink_target_path(&target, dst)?;
-            hardlinks.push((out, src));
+            let source = normalize_hardlink_target(&target)?;
+            hardlinks.push((rel_path, source));
         }
     }
 
@@ -517,17 +518,8 @@ fn extract_patch_tar_gz_parallel(
             .context("writer pool disconnected")??;
     }
     timings.writer_wait += writer_wait_start.elapsed();
-    for (out, src) in hardlinks {
-        let resolved_src = resolve_hardlink_source(dst, &src)?;
-        fs::hard_link(&resolved_src, &out)
-            .or_else(|_| fs::copy(&resolved_src, &out).map(|_| ()))
-            .with_context(|| {
-                format!(
-                    "hardlink/copy {} -> {}",
-                    out.display(),
-                    resolved_src.display()
-                )
-            })?;
+    for (out, source) in hardlinks {
+        extraction_root.create_hardlink(&source, &out)?;
     }
 
     // Fused verification (S4): drain the remaining decompressed stream so the
@@ -578,15 +570,6 @@ fn exclusive_extract_duration(total: Duration, timings: &PreparePhaseTimings) ->
             + timings.fixed_prefix_relocate
             + timings.macho_patch,
     )
-}
-
-fn ensure_dir_created(created: &mut BTreeSet<PathBuf>, dir: &Path) -> Result<()> {
-    if created.contains(dir) {
-        return Ok(());
-    }
-    fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
-    created.insert(dir.to_path_buf());
-    Ok(())
 }
 
 // Load-command relocation moved to `macho.rs` (see `macho::patch_macho`);
@@ -754,13 +737,63 @@ fn is_text_executable(data: &[u8]) -> bool {
         .any(|b| !b.is_ascii_whitespace())
 }
 
-fn reject_unsafe_path(path: &Path) -> Result<()> {
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        bail!("unsafe archive path: {}", path.display());
+fn ensure_real_extraction_root(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => bail!(
+            "extraction root is not a real directory: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)
+                .with_context(|| format!("create extraction root {}", path.display()))?;
+            let metadata = fs::symlink_metadata(path)
+                .with_context(|| format!("stat extraction root {}", path.display()))?;
+            if !metadata.file_type().is_dir() {
+                bail!(
+                    "extraction root is not a real directory: {}",
+                    path.display()
+                );
+            }
+            Ok(())
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("stat extraction root {}", path.display()))
+        }
+    }
+}
+
+fn normalize_archive_path(path: &Path) -> Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(segment) => normalized.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("unsafe archive path: {}", path.display())
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        bail!("unsafe empty archive path");
+    }
+    Ok(normalized)
+}
+
+fn reject_reserved_metadata_path(path: &Path) -> Result<()> {
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::Normal(segment)
+                if segment
+                    .to_str()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(".glu"))
+        )
+    }) {
+        bail!(
+            "archive path uses reserved .glu namespace: {}",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -771,106 +804,32 @@ fn reject_unsafe_path(path: &Path) -> Result<()> {
 /// if a file is legitimately larger, so capping only constrains the reserve.
 const MAX_ENTRY_PREALLOC: usize = 1 << 30; // 1 GiB
 
-/// Whether any ancestor of `out` (below the staging root) is a symlink created
-/// by an earlier entry in this archive — the write-through traversal guard.
-fn symlink_ancestor(out: &Path, symlinks: &BTreeSet<PathBuf>) -> Option<PathBuf> {
-    let mut parent = out.parent();
-    while let Some(dir) = parent {
-        if symlinks.contains(dir) {
-            return Some(dir.to_path_buf());
-        }
-        parent = dir.parent();
-    }
-    None
-}
-
-/// A hardlink target is resolved to a real file during
-/// extraction, so it must be a relative path that resolves (lexically, with
-/// `..` popped) inside `root` — never absolute, never escaping.
-fn hardlink_target_path(target: &Path, root: &Path) -> Result<PathBuf> {
+/// Normalize a tar hardlink target relative to the archive root. Internal `..`
+/// components are accepted, but they may never escape that root.
+fn normalize_hardlink_target(target: &Path) -> Result<PathBuf> {
     if target.is_absolute() {
         bail!("unsafe archive hardlink target: {}", target.display());
     }
-    let root = normalize_lexical(root)?;
-    let resolved = normalize_lexical(&root.join(target))?;
-    if !resolved.starts_with(&root) {
-        bail!("unsafe archive hardlink target: {}", target.display());
-    }
-    Ok(resolved)
-}
-
-/// Resolve a hardlink source that may itself be a symlink created by the
-/// archive. Each symlink hop is lexically normalized and re-confined to the
-/// staging root before following it, so safe keg-internal symlink targets keep
-/// working while symlink escapes cannot copy host files into the keg.
-fn resolve_hardlink_source(root: &Path, src: &Path) -> Result<PathBuf> {
-    const MAX_SYMLINK_DEPTH: usize = 40;
-
-    let root = normalize_lexical(root)?;
-    let mut current = normalize_lexical(src)?;
-    if !current.starts_with(&root) {
-        bail!("unsafe archive hardlink target: {}", src.display());
-    }
-
-    for _ in 0..MAX_SYMLINK_DEPTH {
-        let metadata = fs::symlink_metadata(&current)
-            .with_context(|| format!("stat hardlink target {}", current.display()))?;
-        if !metadata.file_type().is_symlink() {
-            return Ok(current);
-        }
-        let target = fs::read_link(&current)
-            .with_context(|| format!("read symlink target {}", current.display()))?;
-        let next = if target.is_absolute() {
-            target
-        } else {
-            current
-                .parent()
-                .unwrap_or_else(|| Path::new(""))
-                .join(target)
-        };
-        current = normalize_lexical(&next)?;
-        if !current.starts_with(&root) {
-            bail!(
-                "unsafe archive hardlink symlink target: {}",
-                current.display()
-            );
-        }
-    }
-
-    bail!("archive hardlink symlink chain too deep: {}", src.display())
-}
-
-fn normalize_lexical(path: &Path) -> Result<PathBuf> {
-    let mut out = PathBuf::new();
-    for component in path.components() {
+    let mut normalized = PathBuf::new();
+    for component in target.components() {
         match component {
-            Component::Prefix(_) => bail!("unsupported path prefix: {}", path.display()),
-            Component::RootDir => out.push(component.as_os_str()),
+            Component::Normal(segment) => normalized.push(segment),
             Component::CurDir => {}
             Component::ParentDir => {
-                if !out.pop() {
-                    bail!("path escapes root: {}", path.display());
+                if !normalized.pop() {
+                    bail!("unsafe archive hardlink target: {}", target.display());
                 }
             }
-            Component::Normal(segment) => out.push(segment),
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("unsafe archive hardlink target: {}", target.display())
+            }
         }
     }
-    Ok(out)
-}
-
-#[cfg(unix)]
-fn create_symlink(target: &Path, link: &Path) -> Result<()> {
-    if link.exists() || link.is_symlink() {
-        fs::remove_file(link)
-            .with_context(|| format!("removing existing symlink {}", link.display()))?;
+    if normalized.as_os_str().is_empty() {
+        bail!("unsafe archive hardlink target: {}", target.display());
     }
-    std::os::unix::fs::symlink(target, link)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn create_symlink(_target: &Path, _link: &Path) -> Result<()> {
-    Ok(())
+    reject_reserved_metadata_path(&normalized)?;
+    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -1159,70 +1118,81 @@ mod tests {
 #[cfg(test)]
 mod extraction_safety_tests {
     use super::*;
-    use std::collections::BTreeSet;
 
     #[test]
     fn hardlink_target_within_root_is_accepted() {
-        let root = Path::new("/tmp/glustore/var/glu/staging/x");
-        for good in ["bin/foo", "lib/../lib/libfoo.dylib", "a/./b"] {
-            let target = Path::new(good);
-            assert!(
-                hardlink_target_path(target, root).is_ok(),
-                "expected {good:?} to be accepted"
+        for (input, expected) in [
+            ("bin/foo", "bin/foo"),
+            ("lib/../lib/libfoo.dylib", "lib/libfoo.dylib"),
+            ("a/./b", "a/b"),
+        ] {
+            assert_eq!(
+                normalize_hardlink_target(Path::new(input)).unwrap(),
+                PathBuf::from(expected)
             );
         }
     }
 
     #[test]
     fn hardlink_target_escaping_root_is_rejected() {
-        let root = Path::new("/tmp/glustore/var/glu/staging/x");
         for bad in ["/etc/passwd", "../outside", "a/../../etc/passwd"] {
-            let target = Path::new(bad);
             assert!(
-                hardlink_target_path(target, root).is_err(),
+                normalize_hardlink_target(Path::new(bad)).is_err(),
                 "expected {bad:?} to be rejected"
             );
         }
     }
 
     #[test]
-    #[cfg(unix)]
-    fn hardlink_source_resolves_safe_internal_symlink() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("staging");
-        fs::create_dir_all(root.join("dir")).unwrap();
-        fs::write(root.join("real"), "ok").unwrap();
-        std::os::unix::fs::symlink("../real", root.join("dir/link")).unwrap();
-
-        let resolved = resolve_hardlink_source(&root, &root.join("dir/link")).unwrap();
-
-        assert_eq!(resolved, root.join("real"));
+    fn archive_paths_are_normalized_and_metadata_namespace_is_reserved() {
+        assert_eq!(
+            normalize_archive_path(Path::new("./foo/bar")).unwrap(),
+            PathBuf::from("foo/bar")
+        );
+        assert!(normalize_archive_path(Path::new("foo/../bar")).is_err());
+        assert!(reject_reserved_metadata_path(Path::new("foo/.glu/receipt.json")).is_err());
+        assert!(reject_reserved_metadata_path(Path::new("foo/.GLU/receipt.json")).is_err());
     }
 
     #[test]
     #[cfg(unix)]
-    fn hardlink_source_rejects_symlink_escape() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("staging");
-        fs::create_dir_all(&root).unwrap();
-        std::os::unix::fs::symlink("../../outside", root.join("link")).unwrap();
+    fn staged_keg_must_be_a_real_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("staging");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("package")).unwrap();
+        fs::create_dir(root.join("real-keg")).unwrap();
+        std::os::unix::fs::symlink("../real-keg", root.join("package/1.0")).unwrap();
 
-        let err = resolve_hardlink_source(&root, &root.join("link")).unwrap_err();
+        let error = find_staged_keg(
+            &root,
+            &PackageName("package".into()),
+            &KegVersion("1.0".into()),
+        )
+        .unwrap_err();
 
-        assert!(err.to_string().contains("unsafe archive hardlink"));
+        assert!(error.to_string().contains("could not find staged keg"));
     }
 
     #[test]
-    fn symlink_ancestor_detects_write_through() {
-        let root = Path::new("/tmp/x");
-        let mut symlinks = BTreeSet::new();
-        symlinks.insert(root.join("evil"));
-        // `evil/pwned` has `evil` as an ancestor -> flagged.
-        assert!(symlink_ancestor(&root.join("evil/pwned"), &symlinks).is_some());
-        // A sibling path is not under a symlink.
-        assert!(symlink_ancestor(&root.join("safe/pwned"), &symlinks).is_none());
-        // The symlink entry itself (no deeper parent) is fine.
-        assert!(symlink_ancestor(&root.join("evil"), &symlinks).is_none());
+    #[cfg(unix)]
+    fn staged_keg_rejects_a_symlinked_ancestor() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("staging");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::create_dir(outside.join("1.0")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("package")).unwrap();
+
+        let error = find_staged_keg(
+            &root,
+            &PackageName("package".into()),
+            &KegVersion("1.0".into()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("open archive directory"));
     }
 }
 
@@ -1236,19 +1206,52 @@ mod fused_verify_tests {
     /// Builds a small valid .tar.gz (one regular file `hello.txt`) containing
     /// `content`.
     fn build_artifact(dir: &Path, tag: &str, content: &[u8]) -> PathBuf {
+        build_custom_artifact(dir, tag, |tar| {
+            append_regular(tar, Path::new("hello.txt"), content);
+        })
+    }
+
+    fn build_custom_artifact(
+        dir: &Path,
+        tag: &str,
+        build: impl FnOnce(&mut tar::Builder<GzEncoder<File>>),
+    ) -> PathBuf {
         let path = dir.join(format!("{tag}.tar.gz"));
         let file = fs::File::create(&path).unwrap();
         let enc = GzEncoder::new(file, Compression::default());
         let mut tar = tar::Builder::new(enc);
-        let mut header = tar::Header::new_gnu();
-        header.set_size(content.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        tar.append_data(&mut header, "hello.txt", content).unwrap();
+        build(&mut tar);
         tar.finish().unwrap();
         let enc = tar.into_inner().unwrap();
         enc.finish().unwrap();
         path
+    }
+
+    fn append_regular(tar: &mut tar::Builder<GzEncoder<File>>, path: &Path, content: &[u8]) {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(EntryType::Regular);
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, path, content).unwrap();
+    }
+
+    fn append_symlink(tar: &mut tar::Builder<GzEncoder<File>>, path: &Path, target: &Path) {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_cksum();
+        tar.append_link(&mut header, path, target).unwrap();
+    }
+
+    fn append_hardlink(tar: &mut tar::Builder<GzEncoder<File>>, path: &Path, target: &Path) {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(EntryType::Link);
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_link(&mut header, path, target).unwrap();
     }
 
     fn sha_file(path: &Path) -> String {
@@ -1282,6 +1285,129 @@ mod fused_verify_tests {
             "extraction should succeed for a matching artifact"
         );
         assert!(dst.join("hello.txt").is_file());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn external_symlink_is_preserved_when_no_write_traverses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let artifact = build_custom_artifact(dir.path(), "external-link", |tar| {
+            append_symlink(tar, Path::new("external"), &outside);
+        });
+        let expected = sha_file(&artifact);
+        let dst = dir.path().join("out");
+        let pool = WriterPool::new();
+
+        extract_patch_tar_gz_parallel(&artifact, &dst, profile(), &pool, true, &expected).unwrap();
+
+        assert_eq!(fs::read_link(dst.join("external")).unwrap(), outside);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_then_regular_at_same_path_cannot_overwrite_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        fs::write(&outside, b"untouched").unwrap();
+        let artifact = build_custom_artifact(dir.path(), "symlink-first", |tar| {
+            append_symlink(tar, Path::new("victim"), &outside);
+            append_regular(tar, Path::new("victim"), b"overwrite");
+        });
+        let expected = sha_file(&artifact);
+        let dst = dir.path().join("out");
+        let pool = WriterPool::new();
+
+        let error =
+            extract_patch_tar_gz_parallel(&artifact, &dst, profile(), &pool, true, &expected)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("duplicate archive path"));
+        assert_eq!(fs::read(outside).unwrap(), b"untouched");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn queued_regular_then_symlink_at_same_path_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        fs::write(&outside, b"untouched").unwrap();
+        let artifact = build_custom_artifact(dir.path(), "regular-first", |tar| {
+            append_regular(tar, Path::new("victim"), b"payload");
+            append_symlink(tar, Path::new("victim"), &outside);
+        });
+        let expected = sha_file(&artifact);
+        let dst = dir.path().join("out");
+        let pool = WriterPool::new();
+
+        let error =
+            extract_patch_tar_gz_parallel(&artifact, &dst, profile(), &pool, true, &expected)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("duplicate archive path"));
+        assert_eq!(fs::read(outside).unwrap(), b"untouched");
+        assert!(!dst.join("victim").is_symlink());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_beneath_archive_symlink_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let artifact = build_custom_artifact(dir.path(), "symlink-ancestor", |tar| {
+            append_symlink(tar, Path::new("external"), &outside);
+            append_regular(tar, Path::new("external/escaped"), b"payload");
+        });
+        let expected = sha_file(&artifact);
+        let dst = dir.path().join("out");
+        let pool = WriterPool::new();
+
+        assert!(
+            extract_patch_tar_gz_parallel(&artifact, &dst, profile(), &pool, true, &expected)
+                .is_err()
+        );
+        assert!(!outside.join("escaped").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hardlink_cannot_copy_through_archive_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        fs::write(&outside, b"host data").unwrap();
+        let artifact = build_custom_artifact(dir.path(), "hardlink-symlink", |tar| {
+            append_symlink(tar, Path::new("source"), &outside);
+            append_hardlink(tar, Path::new("copy"), Path::new("source"));
+        });
+        let expected = sha_file(&artifact);
+        let dst = dir.path().join("out");
+        let pool = WriterPool::new();
+
+        let error =
+            extract_patch_tar_gz_parallel(&artifact, &dst, profile(), &pool, true, &expected)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("not a regular file"));
+        assert!(!dst.join("copy").exists());
+    }
+
+    #[test]
+    fn package_cannot_own_glu_metadata_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = build_custom_artifact(dir.path(), "reserved-metadata", |tar| {
+            append_regular(tar, Path::new("package/1.0/.glu/receipt.json"), b"fake");
+        });
+        let expected = sha_file(&artifact);
+        let dst = dir.path().join("out");
+        let pool = WriterPool::new();
+
+        let error =
+            extract_patch_tar_gz_parallel(&artifact, &dst, profile(), &pool, true, &expected)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("reserved .glu namespace"));
     }
 
     #[test]

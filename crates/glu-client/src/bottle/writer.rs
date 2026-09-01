@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use std::{
-    fs,
+    fs::{self, File},
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
@@ -32,7 +32,11 @@ struct WriteJob {
 }
 
 enum WriteOperation {
-    Extracted { data: Vec<u8>, mode: Option<u32> },
+    Extracted {
+        file: File,
+        data: Vec<u8>,
+        mode: Option<u32>,
+    },
     PatchExisting(FilePatch),
 }
 
@@ -216,9 +220,11 @@ impl WriterPool {
                 let Ok(job) = job else { break };
                 let start = Instant::now();
                 let result = match job.operation {
-                    WriteOperation::Extracted { data, mode } => {
-                        write_extracted_file(&job.path, &data, mode)
-                    }
+                    WriteOperation::Extracted {
+                        mut file,
+                        data,
+                        mode,
+                    } => write_extracted_file(&job.path, &mut file, &data, mode),
                     WriteOperation::PatchExisting(patch) => {
                         apply_existing_file_patch(&job.path, patch)
                     }
@@ -257,6 +263,7 @@ impl WriterPool {
     pub(crate) fn submit_extracted(
         &self,
         path: PathBuf,
+        file: File,
         data: Vec<u8>,
         mode: Option<u32>,
         reply: mpsc::Sender<Result<()>>,
@@ -264,7 +271,7 @@ impl WriterPool {
     ) -> Result<()> {
         self.submit(
             path,
-            WriteOperation::Extracted { data, mode },
+            WriteOperation::Extracted { file, data, mode },
             reply,
             memory,
         )
@@ -345,23 +352,12 @@ fn physical_memory_bytes() -> Option<u64> {
     Some((pages as u64).saturating_mul(page_size as u64))
 }
 
-fn write_extracted_file(path: &Path, data: &[u8], mode: Option<u32>) -> Result<()> {
-    #[cfg(unix)]
-    let mut file = {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        if let Some(mode) = mode {
-            options.mode(mode & 0o1777);
-        }
-        options
-            .open(path)
-            .with_context(|| format!("create {}", path.display()))?
-    };
-    #[cfg(not(unix))]
-    let mut file = fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
-
+fn write_extracted_file(
+    path: &Path,
+    file: &mut File,
+    data: &[u8],
+    mode: Option<u32>,
+) -> Result<()> {
     file.write_all(data)
         .with_context(|| format!("write {}", path.display()))?;
 
@@ -552,6 +548,15 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"after");
     }
 
+    fn write_test_file(path: &Path, data: &[u8], mode: Option<u32>) -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        write_extracted_file(path, &mut file, data, mode)
+    }
+
     #[cfg(unix)]
     #[test]
     fn extracted_files_keep_sanitized_archive_modes() {
@@ -564,7 +569,7 @@ mod tests {
             ("privileged", 0o6755, 0o755),
         ] {
             let path = tmp.path().join(name);
-            write_extracted_file(&path, b"payload", Some(archive_mode)).unwrap();
+            write_test_file(&path, b"payload", Some(archive_mode)).unwrap();
             assert_eq!(
                 file_mode(&path),
                 expected_mode,
@@ -583,7 +588,7 @@ mod tests {
         let path = tmp.path().join("existing");
         fs::write(&path, b"old").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o6600)).unwrap();
-        write_extracted_file(&path, b"new", Some(0o644)).unwrap();
+        write_test_file(&path, b"new", Some(0o644)).unwrap();
         assert_eq!(file_mode(&path), 0o644);
         assert_eq!(fs::read(path).unwrap(), b"new");
     }
@@ -596,7 +601,7 @@ mod tests {
             unsafe { libc::umask(0o077) };
             let tmp = tempfile::tempdir().unwrap();
             let path = tmp.path().join("restricted");
-            write_extracted_file(&path, b"payload", Some(0o644)).unwrap();
+            write_test_file(&path, b"payload", Some(0o644)).unwrap();
             assert_eq!(file_mode(&path), 0o644);
             return;
         }
@@ -613,8 +618,10 @@ mod tests {
     #[test]
     fn extracted_file_errors_include_the_path() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("missing").join("out");
-        let error = write_extracted_file(&path, b"payload", Some(0o644)).unwrap_err();
+        let path = tmp.path().join("read-only-descriptor");
+        fs::write(&path, b"before").unwrap();
+        let mut file = File::open(&path).unwrap();
+        let error = write_extracted_file(&path, &mut file, b"payload", Some(0o644)).unwrap_err();
         assert!(error.to_string().contains(&path.display().to_string()));
     }
 
@@ -666,9 +673,10 @@ mod tests {
         let pool = WriterPool::with_memory_budget(4);
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("out");
+        let file = fs::File::create(&path).unwrap();
         let (reply_tx, reply_rx) = mpsc::channel();
         let memory = pool.reserve_bytes(4);
-        pool.submit_extracted(path.clone(), vec![1, 2, 3, 4], None, reply_tx, memory)
+        pool.submit_extracted(path.clone(), file, vec![1, 2, 3, 4], None, reply_tx, memory)
             .unwrap();
         reply_rx
             .recv_timeout(Duration::from_secs(1))
@@ -682,10 +690,12 @@ mod tests {
     fn writer_pool_releases_budget_after_write_error() {
         let pool = WriterPool::with_memory_budget(4);
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("missing-parent/out");
+        let path = tmp.path().join("read-only");
+        fs::write(&path, b"before").unwrap();
+        let file = File::open(&path).unwrap();
         let (reply_tx, reply_rx) = mpsc::channel();
         let memory = pool.reserve_bytes(4);
-        pool.submit_extracted(path, vec![1, 2, 3, 4], None, reply_tx, memory)
+        pool.submit_extracted(path, file, vec![1, 2, 3, 4], None, reply_tx, memory)
             .unwrap();
         assert!(reply_rx
             .recv_timeout(Duration::from_secs(1))
