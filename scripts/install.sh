@@ -26,7 +26,7 @@
 #   GLU_BASE_URL   distribution root (see URL scheme above); file:// mirrors
 #                  work, which is how the offline test harness drives this
 #   GLU_VERSION    pin a version/tag (equivalent to passing it as $1)
-#   GLU_PREFIX     install prefix; default /opt/glustore
+#   GLU_PREFIX     unprivileged development/test prefix; default /opt/glustore
 #   GLU_ARCH       force a target triple (testing)
 #   GLU_BINARY     install this local binary instead of downloading (dev/test)
 #   GLU_NO_VERIFY  skip checksum verification (testing only)
@@ -64,10 +64,67 @@ tildify() {
 }
 
 # --- configuration ---------------------------------------------------------
-GLU_BASE_URL="${GLU_BASE_URL:-https://github.com/henrikklee/glu/releases}"
-GLU_PREFIX="${GLU_PREFIX:-/opt/glustore}"
+DEFAULT_BASE_URL='https://github.com/henrikklee/glu/releases'
+DEFAULT_PREFIX='/opt/glustore'
+base_url_overridden=0
+prefix_overridden=0
+[[ -n "${GLU_BASE_URL:-}" ]] && base_url_overridden=1
+if [[ -n "${GLU_PREFIX:-}" && "${GLU_PREFIX:-}" != "$DEFAULT_PREFIX" ]]; then
+  prefix_overridden=1
+fi
+GLU_BASE_URL="${GLU_BASE_URL:-$DEFAULT_BASE_URL}"
+GLU_PREFIX="${GLU_PREFIX:-$DEFAULT_PREFIX}"
 BIN_DIR="$GLU_PREFIX/bin"
 GLU_BIN="$BIN_DIR/glu"
+
+current_uid="$(id -u)"
+if [[ "$current_uid" = '0' ]]; then
+  if [[ -z "${SUDO_USER:-}" || "$SUDO_USER" = 'root' ]]; then
+    error 'Do not run the installer from a direct root shell. Run it as the account that should manage glu; the installer will request administrator approval only when needed.'
+  fi
+  install_user="$SUDO_USER"
+  id "$install_user" >/dev/null 2>&1 \
+    || error "Cannot resolve the invoking account from SUDO_USER=$install_user."
+else
+  install_user="$(id -un)"
+fi
+install_uid="$(id -u "$install_user")"
+install_gid="$(id -g "$install_user")"
+
+normalize_macos_path() {
+  case "$1" in
+  /private/tmp) printf '%s\n' '/tmp' ;;
+  /private/tmp/*) printf '/tmp/%s\n' "${1#/private/tmp/}" ;;
+  /private/var) printf '%s\n' '/var' ;;
+  /private/var/*) printf '/var/%s\n' "${1#/private/var/}" ;;
+  *) printf '%s\n' "$1" ;;
+  esac
+}
+
+validate_prefix_syntax() {
+  [[ "$GLU_PREFIX" == /* ]] \
+    || error "GLU_PREFIX must be an absolute path: $GLU_PREFIX"
+  [[ "$GLU_PREFIX" != '/' && "$GLU_PREFIX" != */ ]] \
+    || error "Unsafe glu prefix: $GLU_PREFIX"
+  case "$GLU_PREFIX/" in
+  *'//'*) error "GLU_PREFIX must not contain repeated separators: $GLU_PREFIX" ;;
+  *'/./'* | *'/../'*) error "GLU_PREFIX must not contain . or .. components: $GLU_PREFIX" ;;
+  esac
+
+  if [[ "$prefix_overridden" = '0' && "$GLU_PREFIX" != "$DEFAULT_PREFIX" ]]; then
+    error "The supported production prefix is $DEFAULT_PREFIX."
+  fi
+
+  if [[ "$prefix_overridden" = '1' ]]; then
+    case "$(normalize_macos_path "$GLU_PREFIX")" in
+    / | /opt | /usr | /bin | /sbin | /etc | /var | /tmp | /private | /Library | /System | /Applications | "$HOME")
+      error "GLU_PREFIX must name a dedicated development directory, not $GLU_PREFIX."
+      ;;
+    esac
+  fi
+}
+
+validate_prefix_syntax
 
 requested_version="${1:-${GLU_VERSION:-latest}}"
 if [[ "$requested_version" == 'latest' ]]; then
@@ -104,12 +161,32 @@ asset="glu-$target.tar.gz"
 asset_url="$download_base/$asset"
 checksum_url="$asset_url.sha256"
 
+case "$GLU_BASE_URL" in
+https://*) curl_transport=(--proto '=https' --proto-redir '=https' --tlsv1.2) ;;
+file://*)
+  [[ "$base_url_overridden" = '1' ]] \
+    || error 'file:// distribution URLs are available only through an explicit GLU_BASE_URL override.'
+  curl_transport=(--proto '=file' --proto-redir '=file')
+  ;;
+http://127.0.0.1:* | http://localhost:* | 'http://[::1]:'*)
+  [[ "$base_url_overridden" = '1' ]] \
+    || error 'Loopback HTTP distribution URLs require an explicit GLU_BASE_URL override.'
+  curl_transport=(--proto '=http' --proto-redir '=http')
+  ;;
+*) error "GLU_BASE_URL must use HTTPS (or an explicit file:// or loopback HTTP development mirror): $GLU_BASE_URL" ;;
+esac
+
 # --- download and verify ---------------------------------------------------
 command -v curl >/dev/null || error 'curl is required to install glu.'
 command -v tar >/dev/null || error 'tar is required to install glu.'
 
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/glu-install.XXXXXX")"
-trap 'rm -rf "$tmp"' EXIT
+tmp_bin=''
+cleanup() {
+  rm -rf "$tmp"
+  [[ -z "$tmp_bin" ]] || rm -f "$tmp_bin"
+}
+trap cleanup EXIT
 
 if [[ -n "${GLU_BINARY:-}" ]]; then
   [[ -x "$GLU_BINARY" ]] || error "GLU_BINARY is not executable: $GLU_BINARY"
@@ -117,7 +194,7 @@ if [[ -n "${GLU_BINARY:-}" ]]; then
   downloaded_bin="$GLU_BINARY"
 else
   info "Downloading glu ($target, $version)..."
-  curl --fail --location --progress-bar --output "$tmp/$asset" "$asset_url" \
+  curl "${curl_transport[@]}" --fail --location --progress-bar --output "$tmp/$asset" "$asset_url" \
     || error "Failed to download glu from $asset_url. If no distribution host is live yet, set GLU_BASE_URL to a mirror (e.g. file://...) or GLU_BINARY to a local build."
 
   if [[ "${GLU_NO_VERIFY:-0}" = '1' ]]; then
@@ -125,7 +202,7 @@ else
   else
     command -v shasum >/dev/null || command -v sha256sum >/dev/null \
       || error 'No sha256 tool found (need shasum or sha256sum) to verify the download.'
-    curl --fail --silent --show-error --output "$tmp/$asset.sha256" "$checksum_url" \
+    curl "${curl_transport[@]}" --fail --location --silent --show-error --output "$tmp/$asset.sha256" "$checksum_url" \
       || error "Failed to fetch checksum from $checksum_url."
     expected="$(awk '{print $1}' "$tmp/$asset.sha256")"
     [[ "$expected" =~ ^[0-9a-f]{64}$ ]] \
@@ -147,29 +224,114 @@ else
 fi
 
 # --- prefix (sudo once, then everything runs as the user) ------------------
-ensure_prefix() {
-  # Make $GLU_PREFIX writable by the current user, asking for sudo once only
-  # when needed. Package installs after setup run as the user, never as root.
-  if [[ -d "$GLU_PREFIX" ]]; then
-    if [[ ! -w "$GLU_PREFIX" ]]; then
-      sudo_prefix_create
-    fi
-  elif ! mkdir -p "$GLU_PREFIX" 2>/dev/null; then
-    # Fresh prefix under a non-writable parent (e.g. /opt) — escalate.
-    sudo_prefix_create
-  fi
-  mkdir -p "$BIN_DIR"
+canonical_directory_matches() {
+  local path="$1" physical
+  physical="$(cd "$path" 2>/dev/null && pwd -P)" || return 1
+  [[ "$(normalize_macos_path "$physical")" = "$(normalize_macos_path "$path")" ]]
 }
 
-sudo_prefix_create() {
-  if ! command -v sudo >/dev/null; then
-    error "Cannot write to $GLU_PREFIX and sudo is not available. Set GLU_PREFIX to a user-writable directory (e.g. ~/.glu)."
-  fi
-  if [[ -t 0 ]] || sudo -n true 2>/dev/null; then
-    sudo mkdir -p "$GLU_PREFIX"
-    sudo chown -R "$(id -un)":staff "$GLU_PREFIX" 2>/dev/null || true
+run_as_install_user() {
+  if [[ "$current_uid" = '0' ]]; then
+    /usr/bin/sudo -n -H -u "$install_user" "$@"
   else
-    error "Cannot write to $GLU_PREFIX and no passwordless sudo in a non-interactive shell. Run interactively, or set GLU_PREFIX to a user-writable directory (e.g. ~/.glu)."
+    "$@"
+  fi
+}
+
+install_user_can_write() {
+  if [[ "$current_uid" = '0' ]]; then
+    /usr/bin/sudo -n -H -u "$install_user" /usr/bin/test -w "$1"
+  else
+    [[ -w "$1" ]]
+  fi
+}
+
+require_owned_directory() {
+  local path="$1" label="$2" actual_uid actual_mode
+  [[ -d "$path" ]] || error "$label is not a directory: $path"
+  [[ ! -L "$path" ]] || error "$label must not be a symlink: $path"
+  canonical_directory_matches "$path" \
+    || error "$label resolves through an unsupported symlink: $path"
+  actual_uid="$(/usr/bin/stat -f '%u' "$path")" \
+    || error "Cannot inspect ownership of $path."
+  [[ "$actual_uid" = "$install_uid" ]] \
+    || error "$label is owned by uid $actual_uid, not $install_user (uid $install_uid); refusing to change ownership of an existing tree."
+  install_user_can_write "$path" \
+    || error "$label is not writable by $install_user: $path"
+  actual_mode="$(/usr/bin/stat -f '%OLp' "$path")" \
+    || error "Cannot inspect permissions of $path."
+  [[ "$actual_mode" = '755' ]] \
+    || error "$label has unsafe permissions $actual_mode; expected 755 and refusing to modify an existing tree: $path"
+}
+
+authorize_sudo_if_needed() {
+  [[ "$current_uid" != '0' ]] || return 0
+  [[ -x /usr/bin/sudo ]] \
+    || error "Administrator approval is required to create $DEFAULT_PREFIX, but sudo is not available."
+  if /usr/bin/sudo -n true 2>/dev/null; then
+    return 0
+  fi
+
+  info "glu installs shared tools in $DEFAULT_PREFIX."
+  info "Administrator approval is needed once to create that directory and assign package administration to $install_user."
+  info 'Package installations themselves do not run as root.'
+  [[ -c /dev/tty ]] \
+    || error 'Administrator approval is required, but this process has no controlling terminal.'
+  # The installer may itself arrive on stdin; this redirect deliberately gives
+  # sudo the process's controlling terminal instead of that script pipe.
+  # shellcheck disable=SC2024
+  /usr/bin/sudo -v -p "Administrator password for glu setup ($install_user): " </dev/tty \
+    || error 'Administrator approval was not granted.'
+}
+
+run_privileged() {
+  if [[ "$current_uid" = '0' ]]; then
+    "$@"
+  else
+    /usr/bin/sudo -n "$@"
+  fi
+}
+
+create_default_prefix() {
+  authorize_sudo_if_needed
+  run_privileged /bin/mkdir -m 0755 "$DEFAULT_PREFIX" \
+    || error "Failed to create $DEFAULT_PREFIX."
+  if ! run_privileged /usr/sbin/chown "$install_uid:$install_gid" "$DEFAULT_PREFIX"; then
+    run_privileged /bin/rmdir "$DEFAULT_PREFIX" 2>/dev/null || true
+    error "Failed to assign $DEFAULT_PREFIX to $install_user."
+  fi
+}
+
+create_custom_prefix() {
+  local parent="${GLU_PREFIX%/*}"
+  [[ -n "$parent" ]] || parent='/'
+  [[ -d "$parent" ]] \
+    || error "The parent of GLU_PREFIX must already exist: $parent"
+  canonical_directory_matches "$parent" \
+    || error "The parent of GLU_PREFIX resolves through an unsupported symlink: $parent"
+  install_user_can_write "$parent" \
+    || error "The parent of GLU_PREFIX is not writable by $install_user: $parent"
+  run_as_install_user /bin/mkdir -m 0755 "$GLU_PREFIX" \
+    || error "Failed to create development prefix $GLU_PREFIX."
+}
+
+ensure_prefix() {
+  if [[ -e "$GLU_PREFIX" || -L "$GLU_PREFIX" ]]; then
+    require_owned_directory "$GLU_PREFIX" 'The glu prefix'
+  elif [[ "$prefix_overridden" = '1' ]]; then
+    create_custom_prefix
+    require_owned_directory "$GLU_PREFIX" 'The glu prefix'
+  else
+    create_default_prefix
+    require_owned_directory "$GLU_PREFIX" 'The glu prefix'
+  fi
+
+  if [[ -e "$BIN_DIR" || -L "$BIN_DIR" ]]; then
+    require_owned_directory "$BIN_DIR" 'The glu binary directory'
+  else
+    run_as_install_user /bin/mkdir -m 0755 "$BIN_DIR" \
+      || error "Failed to create $BIN_DIR."
+    require_owned_directory "$BIN_DIR" 'The glu binary directory'
   fi
 }
 
@@ -177,12 +339,26 @@ ensure_prefix
 
 # --- install the binary (atomic replace) -----------------------------------
 info "Installing glu to $(tildify "$GLU_BIN")"
-tmp_bin="$BIN_DIR/.glu.$$.tmp"
+tmp_bin="$(mktemp "$BIN_DIR/.glu.XXXXXX")"
 install -m 0755 "$downloaded_bin" "$tmp_bin"
+if [[ "$current_uid" = '0' ]]; then
+  /usr/sbin/chown "$install_uid:$install_gid" "$tmp_bin" \
+    || error "Failed to assign the glu binary to $install_user."
+fi
 mv -f "$tmp_bin" "$GLU_BIN"
+tmp_bin=''
 
 # --- hand off to the binary -------------------------------------------------
-"$GLU_BIN" setup
+if [[ "$current_uid" = '0' ]]; then
+  install_home="$(/usr/bin/dscl . -read "/Users/$install_user" NFSHomeDirectory 2>/dev/null | cut -d' ' -f2-)"
+  install_shell="$(/usr/bin/dscl . -read "/Users/$install_user" UserShell 2>/dev/null | cut -d' ' -f2-)"
+  [[ -n "$install_home" && -n "$install_shell" ]] \
+    || error "Cannot resolve the home directory and shell for $install_user."
+  /usr/bin/sudo -n -H -u "$install_user" /usr/bin/env \
+    HOME="$install_home" SHELL="$install_shell" "$GLU_BIN" setup
+else
+  "$GLU_BIN" setup
+fi
 
 echo
 success "glu installed to $(tildify "$GLU_BIN")"

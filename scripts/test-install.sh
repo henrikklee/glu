@@ -50,8 +50,17 @@ PREFIX="$WORK/prefix"
 HOME_DIR="$WORK/home"
 export HOME="$HOME_DIR"
 export TMPDIR="$WORK/tmp"
+ORIGINAL_PATH="$PATH"
 mkdir -p "$TMPDIR"
-trap 'rm -rf "$WORK"' EXIT
+SERVER_PID=''
+cleanup() {
+  if [[ -n "$SERVER_PID" ]]; then
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
 
 fail() {
   echo "FAIL: $*" >&2
@@ -118,13 +127,25 @@ EOF
 fi
 
 # --- installer runner ------------------------------------------------------
-run_installer() {
+run_installer_from() {
+  local base_url="$1" prefix="$2"
+  shift 2
   env \
-    GLU_BASE_URL="file://$FIXTURE/releases" \
-    GLU_PREFIX="$PREFIX" \
+    GLU_BASE_URL="$base_url" \
+    GLU_PREFIX="$prefix" \
     GLU_MARKER="$WORK/marker" \
     GLU_FAKE_VERSION="$VERSION" \
     bash "$INSTALLER" "$@" < /dev/null
+}
+
+run_installer_at() {
+  local prefix="$1"
+  shift
+  run_installer_from "file://$FIXTURE/releases" "$prefix" "$@"
+}
+
+run_installer() {
+  run_installer_at "$PREFIX" "$@"
 }
 
 assert_installed() {
@@ -179,6 +200,374 @@ if run_installer "$VERSION" >/dev/null 2>"$WORK/err"; then
 fi
 grep -q 'Checksum mismatch' "$WORK/err" || fail "unexpected failure output: $(cat "$WORK/err")"
 echo "ok: checksum mismatch rejected"
+
+# Restore the valid sidecar for the remaining tests.
+sha256 "$pinned_dir/$ASSET" > "$pinned_dir/$ASSET.sha256"
+
+# --- test 6: archive and checksum redirects are followed ------------------
+echo "test 6: archive and checksum redirects are followed"
+cat > "$WORK/redirect-server.py" <<'PY'
+import os
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+root, port_file, request_log = sys.argv[1:]
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        with open(request_log, "a", encoding="utf-8") as log:
+            log.write(self.path + "\n")
+        prefix = "/releases/latest/download/"
+        if self.path.startswith(prefix):
+            name = self.path[len(prefix):]
+            self.send_response(302)
+            self.send_header("Location", f"/objects/{name}")
+            self.end_headers()
+            return
+        if self.path.startswith("/objects/"):
+            name = self.path[len("/objects/"):]
+            path = os.path.join(root, name)
+            if os.path.isfile(path):
+                with open(path, "rb") as source:
+                    body = source.read()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+with open(port_file, "w", encoding="ascii") as destination:
+    destination.write(str(server.server_port))
+server.serve_forever()
+PY
+redirect_port_file="$WORK/redirect-port"
+redirect_log="$WORK/redirect-requests"
+python3 "$WORK/redirect-server.py" "$latest_dir" "$redirect_port_file" "$redirect_log" &
+SERVER_PID=$!
+for _ in {1..50}; do
+  [[ -s "$redirect_port_file" ]] && break
+  sleep 0.1
+done
+[[ -s "$redirect_port_file" ]] || fail 'redirect server did not start'
+redirect_port="$(cat "$redirect_port_file")"
+redirect_prefix="$WORK/redirect-prefix"
+run_installer_from "http://127.0.0.1:$redirect_port/releases" "$redirect_prefix"
+kill "$SERVER_PID" 2>/dev/null || true
+wait "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=''
+[[ -x "$redirect_prefix/bin/glu" ]] || fail 'redirected artifact was not installed'
+grep -q "/releases/latest/download/$ASSET$" "$redirect_log" \
+  || fail 'archive redirect endpoint was not requested'
+grep -q "/objects/$ASSET$" "$redirect_log" \
+  || fail 'archive redirect was not followed'
+grep -q "/releases/latest/download/$ASSET.sha256$" "$redirect_log" \
+  || fail 'checksum redirect endpoint was not requested'
+grep -q "/objects/$ASSET.sha256$" "$redirect_log" \
+  || fail 'checksum redirect was not followed'
+echo "ok: archive and checksum redirects followed"
+
+# A harmless local binary keeps the prefix-policy tests independent of the
+# production binary and shell setup.
+SAFE_BIN="$WORK/safe-glu"
+cat > "$SAFE_BIN" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\${1:-}" >> "$WORK/safe-glu-invocations"
+EOF
+chmod +x "$SAFE_BIN"
+
+run_local_installer_at() {
+  local prefix="$1"
+  env \
+    GLU_BASE_URL="file://$FIXTURE/releases" \
+    GLU_PREFIX="$prefix" \
+    GLU_BINARY="$SAFE_BIN" \
+    HOME="$HOME_DIR" \
+    TMPDIR="$TMPDIR" \
+    bash "${LOCAL_INSTALLER:-$INSTALLER}" < /dev/null
+}
+
+# --- test 7: explicit temp prefixes never use sudo -------------------------
+echo "test 7: explicit temp prefixes are unprivileged"
+fake_path="$WORK/fake-path"
+mkdir -p "$fake_path"
+cat > "$fake_path/sudo" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${SUDO_LOG:?}"
+exit 99
+EOF
+chmod +x "$fake_path/sudo"
+sudo_spy_installer="$WORK/sudo-spy-install.sh"
+python3 - "$INSTALLER" "$sudo_spy_installer" "$fake_path/sudo" <<'PY'
+from pathlib import Path
+import sys
+source, destination, sudo = map(Path, sys.argv[1:])
+destination.write_text(source.read_text().replace("/usr/bin/sudo", str(sudo)))
+PY
+chmod +x "$sudo_spy_installer"
+unprivileged_prefix="$WORK/unprivileged-prefix"
+(
+  export LOCAL_INSTALLER="$sudo_spy_installer"
+  export SUDO_LOG="$WORK/unexpected-sudo"
+  run_local_installer_at "$unprivileged_prefix"
+)
+[[ -x "$unprivileged_prefix/bin/glu" ]] || fail 'explicit temp-prefix install failed'
+[[ ! -e "$WORK/unexpected-sudo" ]] || fail 'explicit temp-prefix install invoked sudo'
+echo "ok: explicit temp prefix remained unprivileged"
+
+# --- test 8: unsafe existing prefixes remain untouched --------------------
+echo "test 8: unsafe existing prefixes remain untouched"
+symlink_target="$WORK/symlink-target"
+symlink_prefix="$WORK/symlink-prefix"
+mkdir "$symlink_target"
+printf '%s\n' untouched > "$symlink_target/sentinel"
+ln -s "$symlink_target" "$symlink_prefix"
+if run_local_installer_at "$symlink_prefix" >"$WORK/symlink-out" 2>"$WORK/symlink-err"; then
+  fail 'installer accepted a symlinked prefix'
+fi
+grep -q 'prefix must not be a symlink' "$WORK/symlink-err" \
+  || fail "unexpected symlink-prefix failure: $(cat "$WORK/symlink-err")"
+[[ "$(cat "$symlink_target/sentinel")" == 'untouched' ]] || fail 'symlink target was modified'
+[[ ! -e "$symlink_target/bin" ]] || fail 'installer wrote through a symlinked prefix'
+
+nonwritable_prefix="$WORK/nonwritable-prefix"
+mkdir -m 0555 "$nonwritable_prefix"
+if run_local_installer_at "$nonwritable_prefix" >"$WORK/nonwritable-out" 2>"$WORK/nonwritable-err"; then
+  fail 'installer accepted a non-writable existing prefix'
+fi
+grep -q 'not writable' "$WORK/nonwritable-err" \
+  || fail "unexpected non-writable-prefix failure: $(cat "$WORK/nonwritable-err")"
+[[ ! -e "$nonwritable_prefix/bin" ]] || fail 'installer modified a non-writable prefix'
+chmod 0755 "$nonwritable_prefix"
+
+world_writable_prefix="$WORK/world-writable-prefix"
+mkdir -m 0777 "$world_writable_prefix"
+if run_local_installer_at "$world_writable_prefix" >"$WORK/mode-out" 2>"$WORK/mode-err"; then
+  fail 'installer accepted a world-writable existing prefix'
+fi
+grep -q 'unsafe permissions 777' "$WORK/mode-err" \
+  || fail "unexpected world-writable-prefix failure: $(cat "$WORK/mode-err")"
+[[ ! -e "$world_writable_prefix/bin" ]] || fail 'installer modified a world-writable prefix'
+
+outside_bin="$WORK/outside-bin"
+symlink_bin_prefix="$WORK/symlink-bin-prefix"
+mkdir "$outside_bin" "$symlink_bin_prefix"
+printf '%s\n' untouched > "$outside_bin/sentinel"
+ln -s "$outside_bin" "$symlink_bin_prefix/bin"
+if run_local_installer_at "$symlink_bin_prefix" >"$WORK/bin-out" 2>"$WORK/bin-err"; then
+  fail 'installer accepted a symlinked binary directory'
+fi
+grep -q 'binary directory must not be a symlink' "$WORK/bin-err" \
+  || fail "unexpected symlink-bin failure: $(cat "$WORK/bin-err")"
+[[ "$(cat "$outside_bin/sentinel")" == 'untouched' ]] || fail 'symlinked binary target was modified'
+[[ ! -e "$outside_bin/glu" ]] || fail 'installer wrote through a symlinked binary directory'
+echo "ok: unsafe existing prefixes remained untouched"
+
+# --- test 9: broad and remote development inputs fail closed --------------
+echo "test 9: broad and remote development inputs fail closed"
+if run_local_installer_at /tmp >"$WORK/broad-out" 2>"$WORK/broad-err"; then
+  fail 'installer accepted /tmp as a prefix'
+fi
+grep -q 'dedicated development directory' "$WORK/broad-err" \
+  || fail "unexpected broad-prefix failure: $(cat "$WORK/broad-err")"
+if env GLU_BASE_URL='http://example.com/releases' GLU_PREFIX="$WORK/remote-prefix" \
+  GLU_BINARY="$SAFE_BIN" bash "$INSTALLER" >"$WORK/remote-out" 2>"$WORK/remote-err"; then
+  fail 'installer accepted a remote plaintext distribution URL'
+fi
+grep -q 'must use HTTPS' "$WORK/remote-err" \
+  || fail "unexpected plaintext-URL failure: $(cat "$WORK/remote-err")"
+echo "ok: broad and remote development inputs rejected"
+
+# --- default-prefix harness ------------------------------------------------
+# Replace the one compile-time installer default with an isolated path. This
+# exercises the production branch without touching the host's /opt tree.
+default_installer="$WORK/default-install.sh"
+default_prefix="$WORK/default-prefix"
+python3 - "$INSTALLER" "$default_installer" "$default_prefix" <<'PY'
+from pathlib import Path
+import sys
+source, destination, prefix = map(Path, sys.argv[1:])
+text = source.read_text()
+text = text.replace("/opt/glustore", str(prefix))
+text = text.replace("/usr/bin/sudo", str(destination.parent / "sudo-path" / "sudo"))
+destination.write_text(text)
+PY
+chmod +x "$default_installer"
+
+sudo_path="$WORK/sudo-path"
+sudo_log="$WORK/sudo.log"
+mkdir -p "$sudo_path"
+cat > "$sudo_path/sudo" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${SUDO_LOG:?}"
+if [[ "${1:-}" == '-n' && "${2:-}" == 'true' ]]; then
+  [[ "${SUDO_REQUIRE_PASSWORD:-0}" == '0' ]]
+  exit
+fi
+if [[ "${1:-}" == '-v' ]]; then
+  printf 'fake sudo password: ' >/dev/tty
+  IFS= read -r password
+  [[ "$password" == 'test-password' ]]
+  exit
+fi
+if [[ "${1:-}" == '-n' ]]; then
+  shift
+fi
+exec "$@"
+EOF
+chmod +x "$sudo_path/sudo"
+
+run_default_installer() {
+  env -u GLU_PREFIX \
+    PATH="$sudo_path:$ORIGINAL_PATH" \
+    SUDO_LOG="$sudo_log" \
+    GLU_BASE_URL="file://$FIXTURE/releases" \
+    GLU_BINARY="$SAFE_BIN" \
+    HOME="$HOME_DIR" \
+    TMPDIR="$TMPDIR" \
+    bash "$default_installer"
+}
+
+# --- test 10: passwordless default creation is exact and quiet ------------
+echo "test 10: default creation is exact, non-recursive, and quiet"
+: > "$sudo_log"
+passwordless_output="$(SUDO_REQUIRE_PASSWORD=0 run_default_installer)"
+[[ -d "$default_prefix/bin" && -x "$default_prefix/bin/glu" ]] \
+  || fail 'default-prefix harness did not install glu'
+[[ "$(stat -f '%u' "$default_prefix")" == "$(id -u)" ]] \
+  || fail 'created default prefix has the wrong owner'
+[[ "$(stat -f '%OLp' "$default_prefix")" == '755' ]] \
+  || fail 'created default prefix has the wrong mode'
+grep -q -- "-n /bin/mkdir -m 0755 $default_prefix" "$sudo_log" \
+  || fail "default prefix was not created exactly: $(cat "$sudo_log")"
+grep -q -- "-n /usr/sbin/chown $(id -u):$(id -g) $default_prefix" "$sudo_log" \
+  || fail "default prefix ownership was not assigned exactly: $(cat "$sudo_log")"
+if grep -Eq 'chown .*-[A-Za-z]*R|chown -R' "$sudo_log"; then
+  fail "recursive ownership change detected: $(cat "$sudo_log")"
+fi
+[[ "$passwordless_output" != *'Administrator approval is needed'* ]] \
+  || fail 'passwordless sudo displayed password-explanation text'
+echo "ok: passwordless default creation was exact and quiet"
+
+# --- test 11: piped installer authenticates through its terminal ----------
+echo "test 11: piped installer authenticates through /dev/tty"
+interactive_installer="$WORK/interactive-install.sh"
+interactive_prefix="$WORK/interactive-prefix"
+python3 - "$INSTALLER" "$interactive_installer" "$interactive_prefix" <<'PY'
+from pathlib import Path
+import sys
+source, destination, prefix = map(Path, sys.argv[1:])
+text = source.read_text().replace("/opt/glustore", str(prefix))
+text = text.replace("/usr/bin/sudo", str(destination.parent / "sudo-path" / "sudo"))
+destination.write_text(text)
+PY
+chmod +x "$interactive_installer"
+cat > "$WORK/pty-installer.py" <<'PY'
+import os
+import pty
+import select
+import signal
+import sys
+import time
+
+installer = sys.argv[1]
+pid, master = pty.fork()
+if pid == 0:
+    os.execv(
+        "/bin/bash",
+        ["/bin/bash", "-c", 'cat "$1" | /bin/bash', "installer-pty", installer],
+    )
+
+sent = False
+seen = b""
+deadline = time.monotonic() + 30
+status = None
+while status is None:
+    if time.monotonic() >= deadline:
+        os.kill(pid, signal.SIGKILL)
+        _, status = os.waitpid(pid, 0)
+        break
+    if select.select([master], [], [], 0.1)[0]:
+        try:
+            data = os.read(master, 1024)
+        except OSError:
+            data = b""
+        if data:
+            os.write(sys.stdout.fileno(), data)
+            seen += data
+            if b"fake sudo password:" in seen and not sent:
+                os.write(master, b"test-password\n")
+                sent = True
+    ended, child_status = os.waitpid(pid, os.WNOHANG)
+    if ended:
+        status = child_status
+
+os.close(master)
+sys.exit(os.waitstatus_to_exitcode(status))
+PY
+: > "$sudo_log"
+if ! env -u GLU_PREFIX \
+  PATH="$sudo_path:$ORIGINAL_PATH" \
+  SUDO_LOG="$sudo_log" \
+  SUDO_REQUIRE_PASSWORD=1 \
+  GLU_BASE_URL="file://$FIXTURE/releases" \
+  GLU_BINARY="$SAFE_BIN" \
+  HOME="$HOME_DIR" \
+  TMPDIR="$TMPDIR" \
+  python3 "$WORK/pty-installer.py" "$interactive_installer" >"$WORK/interactive-out"; then
+  fail "piped interactive install failed: $(cat "$WORK/interactive-out")"
+fi
+[[ -x "$interactive_prefix/bin/glu" ]] || fail 'piped interactive install did not complete'
+grep -q 'Administrator approval is needed once' "$WORK/interactive-out" \
+  || fail 'interactive install did not explain why administrator approval was needed'
+grep -q 'Package installations themselves do not run as root' "$WORK/interactive-out" \
+  || fail 'interactive install did not explain the privilege boundary'
+grep -q -- '-v -p Administrator password for glu setup' "$sudo_log" \
+  || fail "interactive install did not validate sudo through the terminal: $(cat "$sudo_log")"
+echo "ok: piped installer authenticated through its terminal"
+
+# --- test 12: an installer already running through sudo does not prompt ----
+echo "test 12: root invocation preserves the invoking account"
+if /usr/bin/sudo -n true 2>/dev/null; then
+  root_installer="$WORK/root-install.sh"
+  root_prefix="$WORK/root-prefix"
+  python3 - "$INSTALLER" "$root_installer" "$root_prefix" <<'PY'
+from pathlib import Path
+import sys
+source, destination, prefix = map(Path, sys.argv[1:])
+destination.write_text(source.read_text().replace("/opt/glustore", str(prefix)))
+PY
+  chmod +x "$root_installer"
+  root_output="$(/usr/bin/sudo -n /usr/bin/env -u GLU_PREFIX \
+    GLU_BASE_URL="file://$FIXTURE/releases" \
+    GLU_BINARY="$SAFE_BIN" \
+    TMPDIR="$TMPDIR" \
+    /bin/bash "$root_installer")"
+  [[ -x "$root_prefix/bin/glu" ]] || fail 'sudo-invoked installer did not complete'
+  [[ "$(stat -f '%u' "$root_prefix")" == "$(id -u)" ]] \
+    || fail 'sudo-invoked installer did not preserve the invoking account as owner'
+  [[ "$root_output" != *'Administrator approval is needed'* ]] \
+    || fail 'sudo-invoked installer displayed password-explanation text'
+
+  # These captures are intentionally opened by the test user, not by sudo.
+  # shellcheck disable=SC2024
+  if /usr/bin/sudo -n /usr/bin/env -u SUDO_USER -u GLU_PREFIX \
+    GLU_BASE_URL="file://$FIXTURE/releases" GLU_BINARY="$SAFE_BIN" \
+    /bin/bash "$root_installer" >"$WORK/direct-root-out" 2>"$WORK/direct-root-err"; then
+    fail 'direct root invocation without an owning account was accepted'
+  fi
+  grep -q 'Do not run the installer from a direct root shell' "$WORK/direct-root-err" \
+    || fail "unexpected direct-root failure: $(cat "$WORK/direct-root-err")"
+  echo "ok: sudo invocation preserved the invoking account without prompting"
+else
+  echo "ok: skipped root-path execution (passwordless sudo unavailable)"
+fi
 
 echo
 echo "all installer tests passed"
