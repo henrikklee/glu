@@ -3301,17 +3301,28 @@ pub(crate) fn print_info(info: &InfoResponse, installed: Option<&InstalledPackag
             &installed_summary(installed.map(|package| package.version.as_str()))
         )
     );
+    let has_dependencies = info.dependencies.total > 0;
     println!(
-        "{:<16} {}  ·  {} with dependencies",
-        "Download size",
-        fmt_size(info.download_bytes),
-        fmt_size(info.download_bytes_with_dependencies)
+        "{}",
+        info_row(
+            "Download size",
+            &size_summary(
+                info.download_bytes,
+                info.download_bytes_with_dependencies,
+                has_dependencies,
+            )
+        )
     );
     println!(
-        "{:<16} {}  ·  {} with dependencies",
-        "Installed size",
-        fmt_size(info.installed_bytes),
-        fmt_size(info.installed_bytes_with_dependencies)
+        "{}",
+        info_row(
+            "Installed size",
+            &size_summary(
+                info.installed_bytes,
+                info.installed_bytes_with_dependencies,
+                has_dependencies,
+            )
+        )
     );
     println!(
         "{}",
@@ -3372,6 +3383,22 @@ fn dependency_summary(dependencies: &glu_core::InfoDependencies) -> String {
     }
 }
 
+fn size_summary(
+    bytes: Option<u64>,
+    bytes_with_dependencies: Option<u64>,
+    has_dependencies: bool,
+) -> String {
+    let size = fmt_size(bytes);
+    if has_dependencies {
+        format!(
+            "{size}  ·  {} with dependencies",
+            fmt_size(bytes_with_dependencies)
+        )
+    } else {
+        size
+    }
+}
+
 fn fmt_size(bytes: Option<u64>) -> String {
     bytes
         .map(glu_client::format::human_bytes)
@@ -3423,6 +3450,18 @@ mod tests {
                 total: 5,
             }),
             "5 total (2 direct)"
+        );
+    }
+
+    #[test]
+    fn info_sizes_omit_dependency_totals_when_there_are_no_dependencies() {
+        assert_eq!(
+            size_summary(Some(3_900_000), Some(3_900_000), false),
+            "3.9 MB"
+        );
+        assert_eq!(
+            size_summary(Some(3_900_000), Some(7_800_000), true),
+            "3.9 MB  ·  7.8 MB with dependencies"
         );
     }
 
