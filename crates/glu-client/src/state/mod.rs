@@ -1,3 +1,4 @@
+pub(crate) mod atomic_write;
 mod declaration;
 pub mod installed;
 pub mod op_lock;

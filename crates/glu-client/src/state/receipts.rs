@@ -152,17 +152,6 @@ pub(super) fn read_receipt_file(path: &Path) -> Result<GluInstallReceipt> {
     serde_json::from_slice(&bytes).with_context(|| format!("decoding {}", path.display()))
 }
 
-pub(super) fn write_receipt_file(path: &Path, receipt: &GluInstallReceipt) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(receipt).context("encoding install receipt")?;
-    let tmp = path.with_extension("json.tmp");
-    if let Some(parent) = tmp.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    fs::write(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

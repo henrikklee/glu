@@ -1,7 +1,8 @@
+use crate::state::atomic_write;
 use anyhow::{Context, Result};
 use glu_core::Prefix;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::{ffi::OsStr, path::PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct WrittenTrace {
@@ -28,29 +29,20 @@ pub fn write_install_trace(
         short_trace_id(plan_name)
     ));
     let bytes = serde_json::to_vec_pretty(trace).context("encoding trace JSON")?;
-    let tmp = path.with_extension("json.tmp");
     let mut final_bytes = bytes;
     final_bytes.push(b'\n');
-    std::fs::write(&tmp, final_bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path)
-        .with_context(|| format!("moving {} to {}", tmp.display(), path.display()))?;
+    let trace_directory = atomic_write::open_directory(&dir)?;
+    let trace_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("trace path has no file name: {}", path.display()))?;
+    atomic_write::replace_file(&trace_directory, &dir, trace_name, &final_bytes)?;
 
     let last_path = dir.join("last.json");
-    let _ = std::fs::remove_file(&last_path);
-    #[cfg(unix)]
-    {
-        let target = path
-            .file_name()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| path.clone());
-        std::os::unix::fs::symlink(&target, &last_path)
-            .with_context(|| format!("symlink {} -> {}", last_path.display(), target.display()))?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::copy(&path, &last_path)
-            .with_context(|| format!("copying {} to {}", path.display(), last_path.display()))?;
-    }
+    let target = path
+        .file_name()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| path.clone());
+    atomic_write::replace_symlink(&trace_directory, &dir, OsStr::new("last.json"), &target)?;
 
     Ok(WrittenTrace { path, last_path })
 }
@@ -91,7 +83,7 @@ fn sanitize_plan_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::short_trace_id;
+    use super::*;
 
     #[test]
     fn short_id_is_six_lowercase_hex() {
@@ -104,5 +96,40 @@ mod tests {
     #[test]
     fn short_ids_differ_across_names() {
         assert_ne!(short_trace_id("node"), short_trace_id("vips"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn trace_and_last_link_are_replaced_without_predictable_temps() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let prefix = Prefix(temp.path().to_path_buf());
+        let dir = trace_dir(&prefix);
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::write(&outside, b"sentinel").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("last.json.tmp")).unwrap();
+
+        let written =
+            write_install_trace(&prefix, "node", &serde_json::json!({"schema": "test"})).unwrap();
+
+        assert_eq!(std::fs::read(outside).unwrap(), b"sentinel");
+        assert_eq!(
+            std::fs::metadata(&written.path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_link(&written.last_path).unwrap(),
+            written.path.file_name().unwrap()
+        );
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            assert!(!name.contains("glu-tmp"), "atomic write left temp: {name}");
+        }
     }
 }

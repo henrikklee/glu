@@ -1,4 +1,5 @@
 use crate::state::{
+    atomic_write,
     declaration::Declaration,
     installed::InstalledState,
     receipts::{self, GluInstallReceipt, ReceiptStatus},
@@ -10,6 +11,7 @@ use glu_core::{
 };
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
 };
@@ -51,7 +53,9 @@ impl InstalledStateStore {
 
     /// Atomically replaces `<prefix>/glu.json` with `declaration`.
     pub fn write_declaration(&self, declaration: &Declaration) -> Result<()> {
-        declaration.write(&self.prefix)
+        let path = Declaration::path(&self.prefix);
+        let bytes = serde_json::to_vec_pretty(declaration).context("encoding declaration")?;
+        atomic_write::replace_file_at_path(&path, &bytes)
     }
 
     /// Removes `<prefix>/glu.json` when present.
@@ -119,7 +123,20 @@ impl InstalledStateStore {
     /// Associated form for callers that already have the keg path and do not
     /// otherwise need the prefix.
     pub fn write_receipt_at_keg(keg_path: &Path, receipt: &GluInstallReceipt) -> Result<()> {
-        receipts::write_receipt_file(&Self::receipt_path(keg_path), receipt)
+        let bytes = serde_json::to_vec_pretty(receipt).context("encoding install receipt")?;
+        let keg = atomic_write::open_directory(keg_path)?;
+        let metadata = atomic_write::open_or_create_child_directory(
+            &keg,
+            keg_path,
+            OsStr::new(".glu"),
+            0o700,
+        )?;
+        atomic_write::replace_file(
+            &metadata,
+            &keg_path.join(".glu"),
+            OsStr::new("receipt.json"),
+            &bytes,
+        )
     }
 
     /// Loads declaration and installed receipt records into an in-memory query
@@ -453,17 +470,54 @@ mod tests {
     }
 
     #[test]
-    fn atomic_receipt_write_leaves_no_temp() {
+    #[cfg(unix)]
+    fn atomic_receipt_write_ignores_predictable_symlink_and_leaves_no_temp() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = tempfile::TempDir::new().unwrap();
         let prefix = Prefix(dir.path().join("prefix"));
         write_good_receipt(&prefix, "good", "1.0");
         let keg = prefix.0.join("Cellar/good/1.0");
-        for entry in std::fs::read_dir(&keg).unwrap() {
+        let receipt = InstalledStateStore::read_receipt_at_keg(&keg).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, b"sentinel").unwrap();
+        let predictable = keg.join(".glu/receipt.json.tmp");
+        std::os::unix::fs::symlink(&outside, &predictable).unwrap();
+
+        InstalledStateStore::write_receipt_at_keg(&keg, &receipt).unwrap();
+
+        assert_eq!(std::fs::read(outside).unwrap(), b"sentinel");
+        assert!(predictable.is_symlink());
+        assert_eq!(
+            std::fs::metadata(keg.join(".glu/receipt.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        for entry in std::fs::read_dir(keg.join(".glu")).unwrap() {
             let name = entry.unwrap().file_name().to_string_lossy().to_string();
-            assert!(
-                !name.ends_with(".json.tmp"),
-                "atomic write left temp: {name}"
-            );
+            assert!(!name.contains("glu-tmp"), "atomic write left temp: {name}");
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn receipt_write_rejects_symlinked_metadata_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let prefix = Prefix(dir.path().join("prefix"));
+        write_good_receipt(&prefix, "good", "1.0");
+        let keg = prefix.0.join("Cellar/good/1.0");
+        let receipt = InstalledStateStore::read_receipt_at_keg(&keg).unwrap();
+        std::fs::remove_dir_all(keg.join(".glu")).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, keg.join(".glu")).unwrap();
+
+        let error = InstalledStateStore::write_receipt_at_keg(&keg, &receipt).unwrap_err();
+
+        assert!(error.to_string().contains("opening state directory"));
+        assert!(std::fs::read_dir(outside).unwrap().next().is_none());
     }
 }

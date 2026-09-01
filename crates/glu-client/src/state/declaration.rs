@@ -67,16 +67,6 @@ impl Declaration {
         self.dependencies.contains_key(name)
     }
 
-    /// Writes the declaration atomically (temp + rename).
-    pub(super) fn write(&self, prefix: &Prefix) -> Result<()> {
-        let path = Self::path(prefix);
-        let tmp = path.with_extension("json.tmp");
-        let bytes = serde_json::to_vec_pretty(self)?;
-        fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-        fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
-        Ok(())
-    }
-
     pub(super) fn path(prefix: &Prefix) -> PathBuf {
         prefix.0.join(DECLARATION_FILE_NAME)
     }
@@ -85,6 +75,7 @@ impl Declaration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::store::InstalledStateStore;
     use tempfile::TempDir;
 
     #[test]
@@ -98,7 +89,9 @@ mod tests {
         declaration
             .dependencies
             .insert(PackageName("ffmpeg".to_string()), "7.1".to_string());
-        declaration.write(&prefix).unwrap();
+        InstalledStateStore::new(prefix.clone())
+            .write_declaration(&declaration)
+            .unwrap();
 
         let loaded = Declaration::load(&prefix).unwrap().unwrap();
         assert_eq!(loaded.schema, "glu.declaration.v1");
@@ -107,6 +100,40 @@ mod tests {
         assert_eq!(
             loaded.dependencies.get(&PackageName("vips".to_string())),
             Some(&"8.19.0".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_does_not_follow_predictable_temp_or_destination_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let prefix = Prefix(dir.path().to_path_buf());
+        let outside_temp = dir.path().join("outside-temp");
+        let outside_destination = dir.path().join("outside-destination");
+        std::fs::write(&outside_temp, b"temp sentinel").unwrap();
+        std::fs::write(&outside_destination, b"destination sentinel").unwrap();
+        std::os::unix::fs::symlink(&outside_temp, dir.path().join("glu.json.tmp")).unwrap();
+        std::os::unix::fs::symlink(&outside_destination, dir.path().join("glu.json")).unwrap();
+
+        InstalledStateStore::new(prefix)
+            .write_declaration(&Declaration::default())
+            .unwrap();
+
+        assert_eq!(std::fs::read(outside_temp).unwrap(), b"temp sentinel");
+        assert_eq!(
+            std::fs::read(outside_destination).unwrap(),
+            b"destination sentinel"
+        );
+        assert!(!dir.path().join("glu.json").is_symlink());
+        assert_eq!(
+            std::fs::metadata(dir.path().join("glu.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
         );
     }
 
@@ -125,7 +152,9 @@ mod tests {
         declaration
             .deactivated
             .insert(PackageName("openssl".to_string()), true);
-        declaration.write(&prefix).unwrap();
+        InstalledStateStore::new(prefix.clone())
+            .write_declaration(&declaration)
+            .unwrap();
 
         let loaded = Declaration::load(&prefix).unwrap().unwrap();
         assert_eq!(
@@ -142,7 +171,9 @@ mod tests {
         declaration
             .dependencies
             .insert(PackageName("foo".to_string()), "1.0".to_string());
-        declaration.write(&prefix).unwrap();
+        InstalledStateStore::new(prefix.clone())
+            .write_declaration(&declaration)
+            .unwrap();
 
         let loaded = Declaration::load(&prefix).unwrap().unwrap_or_default();
         assert!(loaded.contains(&PackageName("foo".to_string())));
