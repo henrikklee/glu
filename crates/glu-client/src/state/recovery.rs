@@ -1,5 +1,8 @@
 use crate::link::unlink::remove_keg;
-use crate::state::{receipts::ReceiptStatus, store::InstalledStateStore};
+use crate::state::{
+    receipts::{GluInstallReceipt, ReceiptStatus},
+    store::{validate_receipt_set_path_components, InstalledStateStore},
+};
 use anyhow::{Context, Result};
 use glu_core::{PackageName, Prefix};
 use std::fs;
@@ -58,6 +61,7 @@ fn find_incomplete_installations(
     }
 
     let mut incomplete = Vec::new();
+    let mut complete: Vec<GluInstallReceipt> = Vec::new();
     for package_dir in
         fs::read_dir(&cellar).with_context(|| format!("reading {}", cellar.display()))?
     {
@@ -95,8 +99,12 @@ fn find_incomplete_installations(
                     path.display()
                 )
             })?;
+            complete.push(receipt);
         }
     }
+    validate_receipt_set_path_components(&complete).context(
+        "cannot safely modify packages because installed metadata has conflicting filesystem names",
+    )?;
     Ok(incomplete)
 }
 
@@ -236,6 +244,31 @@ mod tests {
         assert_eq!(cleanup.removed_incomplete_kegs, 1);
         assert!(!installed.exists());
         assert_eq!(fs::read(outside.join("keep")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn conflicting_complete_metadata_stops_cleanup_before_any_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let prefix = Prefix(tmp.path().to_path_buf());
+        write_receipt(&prefix, "first", "1.0", ReceiptStatus::Complete);
+        write_receipt(&prefix, "second", "1.0", ReceiptStatus::Complete);
+        for (name, opt_name) in [("first", "shared-opt"), ("second", "SHARED-OPT")] {
+            let keg = prefix.0.join("Cellar").join(name).join("1.0");
+            let path = InstalledStateStore::receipt_path_for_keg(&keg);
+            let mut receipt: GluInstallReceipt =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            receipt.links.opt_names = vec![PackageName(opt_name.to_string())];
+            fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        }
+        let staging = prefix.0.join("var/glu/staging/new-package");
+        fs::create_dir_all(&staging).unwrap();
+
+        let error = format!("{:#}", cleanup_interrupted(&prefix).unwrap_err());
+
+        assert!(error.contains("conflicting filesystem names"));
+        assert!(staging.exists());
+        assert!(prefix.0.join("Cellar/first/1.0").exists());
+        assert!(prefix.0.join("Cellar/second/1.0").exists());
     }
 
     #[test]

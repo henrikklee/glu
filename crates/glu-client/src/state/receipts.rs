@@ -1,4 +1,5 @@
-use anyhow::{Context, Result};
+use crate::path_component::{is_safe_path_component, PathComponentCollisionTracker};
+use anyhow::{bail, Context, Result};
 use glu_core::{
     ArtifactId, Exposure, InstalledPackage, KegVersion, MinimumVersion, PackageId, PackageKey,
     PackageLinkMetadata, PackageName, PackageSelector,
@@ -150,7 +151,39 @@ pub(super) fn read_receipt_file(path: &Path) -> Result<GluInstallReceipt> {
         );
     }
 
-    serde_json::from_slice(&bytes).with_context(|| format!("decoding {}", path.display()))
+    let receipt: GluInstallReceipt =
+        serde_json::from_slice(&bytes).with_context(|| format!("decoding {}", path.display()))?;
+    validate_receipt_path_components(&receipt)
+        .with_context(|| format!("validating {}", path.display()))?;
+    Ok(receipt)
+}
+
+/// Validates every receipt field that can become a package-owned filesystem
+/// component. This runs both after decoding persisted metadata and before the
+/// state store writes metadata constructed by library callers.
+pub(super) fn validate_receipt_path_components(receipt: &GluInstallReceipt) -> Result<()> {
+    for (label, value) in [
+        ("package version", receipt.package.version.as_str()),
+        ("installed version", receipt.package.keg_version.0.as_str()),
+    ] {
+        if !is_safe_path_component(value) {
+            bail!("{label} {value:?} is not a supported package path component");
+        }
+    }
+
+    let owner = &receipt.package.package_key.0;
+    let mut path_names = PathComponentCollisionTracker::default();
+    path_names.insert(&receipt.package.name.0, owner, "package name")?;
+    for alias in &receipt.package.aliases {
+        path_names.insert(&alias.0, owner, "package alias")?;
+    }
+    for oldname in &receipt.package.oldnames {
+        path_names.insert(&oldname.0, owner, "package old name")?;
+    }
+    for opt_name in &receipt.links.opt_names {
+        path_names.insert(&opt_name.0, owner, "package stable link name")?;
+    }
+    Ok(())
 }
 
 /// Binds persisted identity and paths to the directory that physically owns
@@ -321,6 +354,79 @@ mod tests {
         let error = read_receipt_file(&path).unwrap_err().to_string();
         assert!(error.contains("unsupported package metadata schema glu.install-receipt.v0"));
         assert!(error.contains("update glu"));
+    }
+
+    #[test]
+    fn receipt_reader_rejects_unsafe_and_colliding_path_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipt.json");
+        let base = serde_json::json!({
+            "schema": "glu.install-receipt.v1",
+            "status": "complete",
+            "package": {
+                "id": "pkg:test/foo@1.0",
+                "package_key": "package:foo",
+                "name": "foo",
+                "aliases": [],
+                "oldnames": [],
+                "version": "1.0",
+                "revision": 0,
+                "keg_version": "1.0"
+            },
+            "artifact": {
+                "id": "art:test/foo@1.0",
+                "sha256": "abc",
+                "bottle_tag": "arm64_test",
+                "cellar": "/opt/glustore/Cellar"
+            },
+            "paths": {
+                "keg": "/tmp/Cellar/foo/1.0",
+                "opt": "/tmp/opt/foo"
+            },
+            "links": { "opt_names": [] },
+            "install": {
+                "exposure": {"mode": "global"},
+                "linked": true,
+                "link_overwrite": [],
+                "deps": [],
+                "dependency_requirements": {}
+            }
+        });
+
+        for (pointer, value, expected) in [
+            (
+                "/package/aliases",
+                serde_json::json!(["../escape"]),
+                "package alias",
+            ),
+            (
+                "/links/opt_names",
+                serde_json::json!(["line\nbreak"]),
+                "package stable link name",
+            ),
+            (
+                "/package/version",
+                serde_json::json!("1:2"),
+                "package version",
+            ),
+            (
+                "/package/keg_version",
+                serde_json::json!("café"),
+                "installed version",
+            ),
+        ] {
+            let mut receipt = base.clone();
+            *receipt.pointer_mut(pointer).unwrap() = value;
+            std::fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+            let error = format!("{:#}", read_receipt_file(&path).unwrap_err());
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+
+        let mut colliding = base;
+        colliding["links"]["opt_names"] = serde_json::json!(["FOO"]);
+        std::fs::write(&path, serde_json::to_vec(&colliding).unwrap()).unwrap();
+        let error = format!("{:#}", read_receipt_file(&path).unwrap_err());
+        assert!(error.contains("filesystem-equivalent"));
     }
 
     #[test]

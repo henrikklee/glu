@@ -142,9 +142,11 @@ fn validation_rejects_missing_required_fields() {
 
 #[test]
 fn validation_rejects_unsafe_bootstrap_pypy_abi_version() {
-    let steps = vec![json!({"type": "bootstrap_pypy", "abi_version": "3.10/../../.."})];
-    let err = validate_structured_postinstall_steps("fixture", &steps).unwrap_err();
-    assert!(err.to_string().contains("unsafe abi_version"));
+    for abi_version in ["3.10/../../..", "3:10", "3.10\n", "３.１０"] {
+        let steps = vec![json!({"type": "bootstrap_pypy", "abi_version": abi_version})];
+        let err = validate_structured_postinstall_steps("fixture", &steps).unwrap_err();
+        assert!(err.to_string().contains("unsafe abi_version"));
+    }
 }
 
 #[test]

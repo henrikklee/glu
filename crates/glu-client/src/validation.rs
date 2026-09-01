@@ -1,5 +1,5 @@
 use crate::{
-    path_component::is_safe_path_component,
+    path_component::{is_safe_path_component, PathComponentCollisionTracker},
     postinstall::structured::validate_structured_postinstall_steps,
 };
 use anyhow::{bail, Result};
@@ -50,6 +50,7 @@ pub fn validate_client_support(manifest: &InstallManifest, prefix: &Prefix) -> R
 /// prefix (see `commit_prepared_keg`'s Cellar guard and receipt confinement in
 /// `state/installed.rs`).
 fn validate_manifest_path_components(manifest: &InstallManifest) -> Result<()> {
+    let mut path_names = PathComponentCollisionTracker::default();
     for (package_id, package) in &manifest.packages {
         for (label, value) in [
             ("name", &package.name.0),
@@ -57,13 +58,24 @@ fn validate_manifest_path_components(manifest: &InstallManifest) -> Result<()> {
             ("keg_version", &package.keg_version.0),
         ] {
             if !is_safe_path_component(value) {
-                bail!("{} has unsafe package {label} {:?}", package_id.0, value);
+                bail!(
+                    "package {:?} has unsupported {label} {:?}",
+                    package_id.0,
+                    value
+                );
             }
         }
-        for alias in package.aliases.iter().chain(package.oldnames.iter()) {
-            if !is_safe_path_component(&alias.0) {
-                bail!("{} has unsafe alias {:?}", package_id.0, alias.0);
-            }
+
+        let owner = &package.package_key.0;
+        path_names.insert(&package.name.0, owner, "package name")?;
+        for alias in &package.aliases {
+            path_names.insert(&alias.0, owner, "package alias")?;
+        }
+        for oldname in &package.oldnames {
+            path_names.insert(&oldname.0, owner, "package old name")?;
+        }
+        for opt_name in &package.install.opt_names {
+            path_names.insert(&opt_name.0, owner, "package stable link name")?;
         }
     }
     Ok(())
@@ -101,8 +113,8 @@ fn validate_cellar(cellar: &str) -> Result<()> {
 mod tests {
     use super::*;
     use glu_core::{
-        ArtifactId, KegVersion, PackageId, PackageInstallMetadata, PackageName, ResolveRequestEcho,
-        ResolvedArtifact, ResolvedPackage, Target,
+        ArtifactId, KegVersion, PackageId, PackageInstallMetadata, PackageName, PackageSelector,
+        ResolveRequestEcho, ResolvedArtifact, ResolvedPackage, Target,
     };
     use std::collections::BTreeMap;
 
@@ -162,12 +174,61 @@ mod tests {
     fn manifest_version_must_be_safe_path_component() {
         let manifest = manifest_with_version("3.12/../../..");
         let err = validate_manifest_path_components(&manifest).unwrap_err();
-        assert!(err.to_string().contains("unsafe package version"));
+        assert!(err.to_string().contains("unsupported version"));
     }
 
     #[test]
     fn manifest_version_accepts_real_homebrew_shape() {
         let manifest = manifest_with_version("1.2.3_1");
+        validate_manifest_path_components(&manifest).unwrap();
+    }
+
+    #[test]
+    fn manifest_rejects_unsafe_opt_names() {
+        let mut manifest = manifest_with_version("1.2.3");
+        manifest
+            .packages
+            .values_mut()
+            .next()
+            .unwrap()
+            .install
+            .opt_names = vec![PackageName("../escape".to_string())];
+
+        let error = validate_manifest_path_components(&manifest)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("package stable link name"));
+        assert!(error.contains("../escape"));
+    }
+
+    #[test]
+    fn manifest_rejects_case_equivalent_path_names() {
+        let mut manifest = manifest_with_version("1.2.3");
+        manifest
+            .packages
+            .values_mut()
+            .next()
+            .unwrap()
+            .install
+            .opt_names = vec![PackageName("PKG".to_string())];
+
+        let error = validate_manifest_path_components(&manifest)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("filesystem-equivalent"));
+        assert!(error.contains("pkg"));
+        assert!(error.contains("PKG"));
+    }
+
+    #[test]
+    fn manifest_allows_an_alias_repeated_as_its_packages_opt_name() {
+        let mut manifest = manifest_with_version("1.2.3");
+        let package = manifest.packages.values_mut().next().unwrap();
+        package.aliases = vec![PackageSelector("pkg-alias".to_string())];
+        package.install.opt_names = vec![PackageName("pkg-alias".to_string())];
+
         validate_manifest_path_components(&manifest).unwrap();
     }
 

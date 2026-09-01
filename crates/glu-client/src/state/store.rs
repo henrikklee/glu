@@ -1,8 +1,11 @@
-use crate::state::{
-    atomic_write,
-    declaration::Declaration,
-    installed::InstalledState,
-    receipts::{self, GluInstallReceipt, ReceiptStatus},
+use crate::{
+    path_component::PathComponentCollisionTracker,
+    state::{
+        atomic_write,
+        declaration::Declaration,
+        installed::InstalledState,
+        receipts::{self, GluInstallReceipt, ReceiptStatus},
+    },
 };
 use anyhow::{bail, Context, Result};
 use glu_core::{
@@ -149,6 +152,8 @@ impl InstalledStateStore {
     /// Associated form for callers that already have the keg path and do not
     /// otherwise need the prefix.
     pub fn write_receipt_at_keg(keg_path: &Path, receipt: &GluInstallReceipt) -> Result<()> {
+        receipts::validate_receipt_path_components(receipt)
+            .context("validating install receipt")?;
         let bytes = serde_json::to_vec_pretty(receipt).context("encoding install receipt")?;
         let keg = atomic_write::open_directory(keg_path)?;
         let metadata = atomic_write::open_or_create_child_directory(
@@ -381,8 +386,39 @@ impl InstalledStateStore {
             }
         }
 
+        if let Err(error) = validate_receipt_set_path_components(&receipts) {
+            if policy == ReceiptLoadPolicy::Tolerant {
+                warnings.push(format!(
+                    "glu: warning: ignored installed package metadata because its filesystem names conflict: {error:#}"
+                ));
+                receipts.clear();
+            } else {
+                return Err(error).context(
+                    "cannot safely modify packages because installed metadata has conflicting filesystem names",
+                );
+            }
+        }
+
         Ok(receipts)
     }
+}
+
+pub(crate) fn validate_receipt_set_path_components(receipts: &[GluInstallReceipt]) -> Result<()> {
+    let mut path_names = PathComponentCollisionTracker::default();
+    for receipt in receipts {
+        let owner = &receipt.package.package_key.0;
+        path_names.insert(&receipt.package.name.0, owner, "installed package name")?;
+        for alias in &receipt.package.aliases {
+            path_names.insert(&alias.0, owner, "installed package alias")?;
+        }
+        for oldname in &receipt.package.oldnames {
+            path_names.insert(&oldname.0, owner, "installed package old name")?;
+        }
+        for opt_name in &receipt.links.opt_names {
+            path_names.insert(&opt_name.0, owner, "installed package stable link name")?;
+        }
+    }
+    Ok(())
 }
 
 fn error_is_not_found(error: &anyhow::Error) -> bool {
@@ -477,6 +513,41 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_equivalent_receipt_names_fail_closed_for_mutations() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let prefix = Prefix(dir.path().join("prefix"));
+        write_good_receipt(&prefix, "first", "1.0");
+        write_good_receipt(&prefix, "second", "1.0");
+
+        for (name, opt_name) in [("first", "shared-opt"), ("second", "SHARED-OPT")] {
+            let keg = prefix.0.join("Cellar").join(name).join("1.0");
+            let path = InstalledStateStore::receipt_path_for_keg(&keg);
+            let mut receipt: GluInstallReceipt =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            receipt.links.opt_names = vec![PackageName(opt_name.to_string())];
+            std::fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        }
+
+        let store = InstalledStateStore::new(prefix);
+        let mut warnings = Vec::new();
+        let state = store
+            .load_installed_state_with_warnings(&Declaration::default(), &mut warnings)
+            .unwrap();
+        assert!(state.names().is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("filesystem names conflict"));
+
+        let error = format!(
+            "{:#}",
+            store
+                .load_installed_state_with_declaration_strict(&Declaration::default())
+                .unwrap_err()
+        );
+        assert!(error.contains("conflicting filesystem names"));
+        assert!(error.contains("filesystem-equivalent"));
+    }
+
+    #[test]
     fn receipt_claiming_another_installation_is_never_loaded() {
         let dir = tempfile::TempDir::new().unwrap();
         let prefix = Prefix(dir.path().join("prefix"));
@@ -518,6 +589,25 @@ mod tests {
         receipt.package.keg_version = KegVersion("2.0".to_string());
         std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
         assert!(InstalledStateStore::read_receipt_at_keg(&installed).is_err());
+    }
+
+    #[test]
+    fn invalid_receipt_is_rejected_before_replacing_valid_metadata() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let prefix = Prefix(dir.path().join("prefix"));
+        write_good_receipt(&prefix, "demo", "1.0");
+        let keg = prefix.0.join("Cellar/demo/1.0");
+        let path = InstalledStateStore::receipt_path_for_keg(&keg);
+        let original = std::fs::read(&path).unwrap();
+        let mut receipt: GluInstallReceipt = serde_json::from_slice(&original).unwrap();
+        receipt.links.opt_names = vec![PackageName("../escape".to_string())];
+
+        let error = InstalledStateStore::write_receipt_at_keg(&keg, &receipt)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("validating install receipt"));
+        assert_eq!(std::fs::read(path).unwrap(), original);
     }
 
     #[test]
