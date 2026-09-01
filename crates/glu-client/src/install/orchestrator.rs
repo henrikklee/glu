@@ -659,7 +659,10 @@ fn rename_existing_keg(input: RenameExistingKegInput<'_>) -> Result<()> {
     let store = InstalledStateStore::new(prefix.clone());
 
     let mut receipt = if old_keg.exists() {
-        let receipt = store.read_receipt_for_keg(old_keg)?;
+        let mut receipt = store.read_receipt_for_keg(old_keg)?;
+        if receipt.status != ReceiptStatus::Complete {
+            bail!("cannot rename an incomplete installation of {}", old_name.0);
+        }
         validate_rename_receipt(&receipt, old_name, old_version, old_revision)?;
         unlink_keg(prefix, old_name, old_keg)?;
         if new_keg.exists() {
@@ -673,6 +676,11 @@ fn rename_existing_keg(input: RenameExistingKegInput<'_>) -> Result<()> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
+        // The directory move and metadata rewrite cannot be one filesystem
+        // operation. Mark the old record incomplete first so interruption on
+        // either side of the rename follows normal cleanup-and-retry recovery.
+        receipt.status = ReceiptStatus::Incomplete;
+        store.write_receipt_for_keg(old_keg, &receipt)?;
         std::fs::rename(old_keg, &new_keg)
             .with_context(|| format!("moving {} to {}", old_keg.display(), new_keg.display()))?;
         if let Some(old_rack) = old_keg.parent() {
@@ -680,7 +688,15 @@ fn rename_existing_keg(input: RenameExistingKegInput<'_>) -> Result<()> {
         }
         receipt
     } else if new_keg.exists() {
-        store.read_receipt_for_keg(&new_keg)?
+        let receipt = InstalledStateStore::read_unbound_receipt_at_keg(&new_keg)?;
+        if receipt.status != ReceiptStatus::Incomplete {
+            bail!(
+                "cannot resume renaming {}; target package metadata is not incomplete",
+                old_name.0
+            );
+        }
+        validate_rename_receipt(&receipt, old_name, old_version, old_revision)?;
+        receipt
     } else {
         bail!(
             "cannot rename {}; neither source {} nor target {} exists",
@@ -691,6 +707,7 @@ fn rename_existing_keg(input: RenameExistingKegInput<'_>) -> Result<()> {
     };
 
     validate_rename_receipt_name(&receipt, old_name, &package.name)?;
+    receipt.status = ReceiptStatus::Complete;
     receipt.package.id = derived_package_id_for_keg(package_id, &package.name, old_keg_version);
     receipt.package.package_key = package.package_key.clone();
     receipt.package.name = package.name.clone();
@@ -723,9 +740,6 @@ fn validate_rename_receipt(
     old_version: &str,
     old_revision: u32,
 ) -> Result<()> {
-    if receipt.status != ReceiptStatus::Complete {
-        bail!("cannot rename incomplete receipt for {}", old_name.0);
-    }
     if receipt.package.name != *old_name {
         bail!(
             "cannot rename {}; source receipt belongs to {}",
@@ -751,9 +765,6 @@ fn validate_rename_receipt_name(
     old_name: &PackageName,
     new_name: &PackageName,
 ) -> Result<()> {
-    if receipt.status != ReceiptStatus::Complete {
-        bail!("cannot rename incomplete receipt for {}", old_name.0);
-    }
     if receipt.package.name != *old_name && receipt.package.name != *new_name {
         bail!(
             "cannot rename {}; receipt belongs to {}",
@@ -977,7 +988,7 @@ mod tests {
         std::fs::create_dir_all(new_keg.join(".glu")).unwrap();
         let receipt = GluInstallReceipt {
             schema: "glu.install-receipt.v1".to_string(),
-            status: ReceiptStatus::Complete,
+            status: ReceiptStatus::Incomplete,
             package: ReceiptPackage {
                 id: PackageId("pkg:homebrew/core/foo@1.0".to_string()),
                 package_key: glu_core::PackageKey("package:foo".to_string()),

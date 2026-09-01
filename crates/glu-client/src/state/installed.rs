@@ -1140,10 +1140,10 @@ mod tests {
     fn list_sorts_by_name_then_version_descending() {
         let dir = tempfile::tempdir().unwrap();
         let prefix = dir.path().to_path_buf();
-        write_receipt(&prefix, "zlib", "1.3.0", false, false);
+        write_receipt(&prefix, "Zlib", "1.3.0", false, false);
         write_receipt(&prefix, "node", "24.0.0", false, false);
         write_receipt(&prefix, "node", "26.7.0", true, false);
-        write_receipt(&prefix, "Node", "20.0.0", false, false);
+        write_receipt(&prefix, "nOdejs", "20.0.0", false, false);
 
         let state = InstalledStateStore::new(Prefix(prefix))
             .load_installed_state()
@@ -1152,8 +1152,8 @@ mod tests {
         let names: Vec<&str> = list.iter().map(|p| p.name.0.as_str()).collect();
         let versions: Vec<&str> = list.iter().map(|p| p.version.as_str()).collect();
 
-        // Case-insensitive name sort, all kegs listed, newest first per name.
-        assert_eq!(names, vec!["node", "node", "Node", "zlib"]);
+        // Case-insensitive name sort, all installations listed, newest first per name.
+        assert_eq!(names, vec!["node", "node", "nOdejs", "Zlib"]);
         assert_eq!(versions, vec!["26.7.0", "24.0.0", "20.0.0", "1.3.0"]);
     }
 

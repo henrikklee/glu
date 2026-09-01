@@ -35,6 +35,12 @@ pub struct InstalledArtifact {
     pub sha256: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiptLoadPolicy {
+    Tolerant,
+    Strict,
+}
+
 impl InstalledStateStore {
     pub fn new(prefix: Prefix) -> Self {
         Self { prefix }
@@ -84,7 +90,7 @@ impl InstalledStateStore {
         Self::receipt_path(keg_path)
     }
 
-    /// Reads the receipt stored inside one keg.
+    /// Reads and validates the metadata stored inside one installed package.
     pub fn read_receipt_for_keg(&self, keg_path: &Path) -> Result<GluInstallReceipt> {
         Self::read_receipt_at_keg(keg_path)
     }
@@ -113,9 +119,29 @@ impl InstalledStateStore {
         self.write_receipt_for_keg(keg_path, &receipt)
     }
 
-    /// Reads the receipt stored inside one keg. Associated form for callers
-    /// that already have the keg path and do not otherwise need the prefix.
+    /// Reads package metadata and binds it to its physical installation path.
+    /// Associated form for callers that already have that path.
     pub fn read_receipt_at_keg(keg_path: &Path) -> Result<GluInstallReceipt> {
+        let mut receipt = Self::read_unbound_receipt_at_keg(keg_path)?;
+        Self::validate_receipt_at_keg(&receipt, keg_path)?;
+        // Equivalent aliases such as macOS `/var` and `/private/var` are
+        // accepted by identity, but downstream filesystem authority always
+        // comes from the caller's physically discovered path.
+        receipt.paths.keg = keg_path.to_path_buf();
+        Ok(receipt)
+    }
+
+    pub(crate) fn validate_receipt_at_keg(
+        receipt: &GluInstallReceipt,
+        keg_path: &Path,
+    ) -> Result<()> {
+        receipts::validate_receipt_location(receipt, keg_path)
+    }
+
+    /// Reads schema-checked metadata before binding it to a final path. This is
+    /// limited to staged/incomplete transition handling; installed-state reads
+    /// must use `read_receipt_at_keg`.
+    pub(crate) fn read_unbound_receipt_at_keg(keg_path: &Path) -> Result<GluInstallReceipt> {
         receipts::read_receipt_file(&Self::receipt_path(keg_path))
     }
 
@@ -139,16 +165,15 @@ impl InstalledStateStore {
         )
     }
 
-    /// Loads declaration and installed receipt records into an in-memory query
-    /// snapshot.
+    /// Loads declaration and installed package records for a read-only query.
+    /// Invalid package metadata is omitted with a warning.
     pub fn load_installed_state(&self) -> Result<InstalledState> {
         let declaration = self.load_declaration()?;
         self.load_installed_state_with_declaration(&declaration)
     }
 
-    /// Loads installed receipt records into an in-memory query snapshot using
-    /// an already-loaded declaration. This avoids redundant `glu.json` reads
-    /// when a command needs both records.
+    /// Loads installed package records into a read-only snapshot using an
+    /// already-loaded declaration.
     pub(crate) fn load_installed_state_with_declaration(
         &self,
         declaration: &Declaration,
@@ -156,13 +181,35 @@ impl InstalledStateStore {
         self.load_installed_state_with_warnings(declaration, &mut Vec::new())
     }
 
+    /// Loads state for a mutation. Unlike read-only queries, no malformed,
+    /// unsupported, or location-mismatched package metadata may be ignored.
+    pub(crate) fn load_installed_state_with_declaration_strict(
+        &self,
+        declaration: &Declaration,
+    ) -> Result<InstalledState> {
+        self.load_installed_state_with_policy(
+            declaration,
+            &mut Vec::new(),
+            ReceiptLoadPolicy::Strict,
+        )
+    }
+
     pub(crate) fn load_installed_state_with_warnings(
         &self,
         declaration: &Declaration,
         warnings: &mut Vec<String>,
     ) -> Result<InstalledState> {
+        self.load_installed_state_with_policy(declaration, warnings, ReceiptLoadPolicy::Tolerant)
+    }
+
+    fn load_installed_state_with_policy(
+        &self,
+        declaration: &Declaration,
+        warnings: &mut Vec<String>,
+        policy: ReceiptLoadPolicy,
+    ) -> Result<InstalledState> {
         InstalledState::from_loaded_packages(
-            self.load_installed_packages(warnings)?,
+            self.load_installed_packages(warnings, policy)?,
             self.prefix.clone(),
             declaration.names(),
             declaration.deactivated_names(),
@@ -174,7 +221,7 @@ impl InstalledStateStore {
     /// are ignored just as they are for the installed-state snapshot.
     pub fn load_installed_artifacts(&self) -> Result<Vec<InstalledArtifact>> {
         Ok(self
-            .load_complete_receipts(&mut Vec::new())?
+            .load_complete_receipts(&mut Vec::new(), ReceiptLoadPolicy::Tolerant)?
             .into_iter()
             .map(|receipt| InstalledArtifact {
                 name: receipt.package.name,
@@ -184,8 +231,12 @@ impl InstalledStateStore {
             .collect())
     }
 
-    fn load_installed_packages(&self, warnings: &mut Vec<String>) -> Result<Vec<InstalledPackage>> {
-        let receipts = self.load_complete_receipts(warnings)?;
+    fn load_installed_packages(
+        &self,
+        warnings: &mut Vec<String>,
+        policy: ReceiptLoadPolicy,
+    ) -> Result<Vec<InstalledPackage>> {
+        let receipts = self.load_complete_receipts(warnings, policy)?;
         let mut packages: Vec<InstalledPackage> = receipts
             .iter()
             .map(GluInstallReceipt::installed_package)
@@ -260,13 +311,32 @@ impl InstalledStateStore {
         Ok(packages)
     }
 
-    /// Reads every complete keg receipt under `prefix/Cellar`. Missing Cellar
-    /// is an empty state. Malformed receipts are skipped so one damaged keg
-    /// does not brick read-only commands.
-    fn load_complete_receipts(&self, warnings: &mut Vec<String>) -> Result<Vec<GluInstallReceipt>> {
+    /// Reads every complete package record under `prefix/Cellar`. Missing
+    /// storage is empty state. Read-only queries warn and skip invalid records;
+    /// mutation loads fail before trusting any partial snapshot.
+    fn load_complete_receipts(
+        &self,
+        warnings: &mut Vec<String>,
+        policy: ReceiptLoadPolicy,
+    ) -> Result<Vec<GluInstallReceipt>> {
         let cellar = self.prefix.0.join("Cellar");
-        if !cellar.exists() {
-            return Ok(Vec::new());
+        let cellar_metadata = match fs::symlink_metadata(&cellar) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", cellar.display()));
+            }
+        };
+        if !cellar_metadata.is_dir() {
+            let message = format!(
+                "package storage {} is not a real directory",
+                cellar.display()
+            );
+            if policy == ReceiptLoadPolicy::Tolerant {
+                warnings.push(format!("glu: warning: {message}"));
+                return Ok(Vec::new());
+            }
+            anyhow::bail!("cannot safely modify packages because {message}");
         }
 
         let mut receipts = Vec::new();
@@ -284,41 +354,30 @@ impl InstalledStateStore {
                     continue;
                 }
 
-                let receipt_path = Self::receipt_path(&keg.path());
-                if !receipt_path.exists() {
-                    continue;
-                }
-
-                let Ok(bytes) = fs::read(&receipt_path) else {
-                    continue;
-                };
-                // A malformed/truncated receipt (e.g. an interrupted write, or
-                // manual tampering) must not brick every command. Skip this keg
-                // rather than erroring the whole load — read-only queries keep
-                // working, and the keg is treated as absent.
-                let receipt: GluInstallReceipt = match serde_json::from_slice(&bytes) {
+                let keg_path = keg.path();
+                let receipt_path = Self::receipt_path(&keg_path);
+                let receipt = match Self::read_receipt_at_keg(&keg_path) {
                     Ok(receipt) => receipt,
-                    Err(_) => {
+                    Err(error) if error_is_not_found(&error) => continue,
+                    Err(error) if policy == ReceiptLoadPolicy::Tolerant => {
                         warnings.push(format!(
-                            "glu: warning: skipped unreadable install receipt {}",
+                            "glu: warning: ignored invalid package metadata at {}: {error:#}",
                             receipt_path.display()
                         ));
                         continue;
                     }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "cannot safely modify packages because metadata at {} is invalid",
+                                receipt_path.display()
+                            )
+                        });
+                    }
                 };
-                if receipt.status != ReceiptStatus::Complete {
-                    continue;
+                if receipt.status == ReceiptStatus::Complete {
+                    receipts.push(receipt);
                 }
-
-                // A receipt's stored keg path is what later removal and unlink
-                // operate on. Ignore any receipt whose path
-                // escapes the Cellar so it can never drive a `remove_dir_all`
-                // outside the prefix. Skipping keeps one bad receipt from
-                // bricking every command.
-                if !keg_path_inside_cellar(&self.prefix, &receipt.paths.keg) {
-                    continue;
-                }
-                receipts.push(receipt);
             }
         }
 
@@ -326,26 +385,11 @@ impl InstalledStateStore {
     }
 }
 
-/// Whether a stored receipt keg path lives directly under
-/// `Cellar/<name>/<ver>` (at least two components below the Cellar rack root)
-/// with no `..`/`.` traversal. `starts_with` alone is not enough, since
-/// `Cellar/../etc` lexically escapes.
-fn keg_path_inside_cellar(prefix: &Prefix, path: &Path) -> bool {
-    let cellar = prefix.0.join("Cellar");
-    path.starts_with(&cellar)
-        && path
-            .strip_prefix(&cellar)
-            .map(|rel| rel.components().count() >= 2)
-            .unwrap_or(false)
-        && !has_traversal(path)
-}
-
-fn has_traversal(path: &Path) -> bool {
-    path.components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::ParentDir | std::path::Component::CurDir
-        )
+fn error_is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
     })
 }
 
@@ -357,37 +401,6 @@ mod tests {
         ReceiptStatus,
     };
     use glu_core::{ArtifactId, KegVersion, PackageId, PackageName};
-
-    #[test]
-    fn keg_path_inside_cellar_accepts_normal_kegs() {
-        let prefix = Prefix(PathBuf::from("/opt/glustore"));
-        assert!(keg_path_inside_cellar(
-            &prefix,
-            Path::new("/opt/glustore/Cellar/vips/8.19.0")
-        ));
-        assert!(keg_path_inside_cellar(
-            &prefix,
-            Path::new("/opt/glustore/Cellar/openssl@3/3.0.13_1")
-        ));
-    }
-
-    #[test]
-    fn keg_path_inside_cellar_rejects_escapes() {
-        let prefix = Prefix(PathBuf::from("/opt/glustore"));
-        assert!(!keg_path_inside_cellar(
-            &prefix,
-            Path::new("/opt/glustore/var/glu")
-        ));
-        assert!(!keg_path_inside_cellar(&prefix, Path::new("/etc/passwd")));
-        assert!(!keg_path_inside_cellar(
-            &prefix,
-            Path::new("/opt/glustore/Cellar/vips")
-        ));
-        assert!(!keg_path_inside_cellar(
-            &prefix,
-            Path::new("/opt/glustore/Cellar/../etc")
-        ));
-    }
 
     fn write_good_receipt(prefix: &Prefix, name: &str, version: &str) {
         let keg = prefix.0.join("Cellar").join(name).join(version);
@@ -435,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_receipt_is_skipped_not_fatal() {
+    fn malformed_receipt_is_warned_for_queries_and_rejected_for_mutation() {
         let dir = tempfile::TempDir::new().unwrap();
         let prefix = Prefix(dir.path().join("prefix"));
         write_good_receipt(&prefix, "good", "1.0");
@@ -447,10 +460,64 @@ mod tests {
         )
         .unwrap();
 
-        let state = InstalledStateStore::new(prefix)
-            .load_installed_state()
+        let store = InstalledStateStore::new(prefix);
+        let mut warnings = Vec::new();
+        let state = store
+            .load_installed_state_with_warnings(&Declaration::default(), &mut warnings)
             .unwrap();
         assert_eq!(state.names(), vec![PackageName("good".to_string())]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("invalid package metadata"));
+
+        let error = store
+            .load_installed_state_with_declaration_strict(&Declaration::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot safely modify packages"));
+    }
+
+    #[test]
+    fn receipt_claiming_another_installation_is_never_loaded() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let prefix = Prefix(dir.path().join("prefix"));
+        write_good_receipt(&prefix, "first", "1.0");
+        write_good_receipt(&prefix, "second", "2.0");
+        let first = prefix.0.join("Cellar/first/1.0");
+        let receipt_path = InstalledStateStore::receipt_path_for_keg(&first);
+        let mut receipt: GluInstallReceipt =
+            serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+        receipt.paths.keg = prefix.0.join("Cellar/second/2.0");
+        std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+
+        let store = InstalledStateStore::new(prefix);
+        let state = store.load_installed_state().unwrap();
+        assert_eq!(state.names(), vec![PackageName("second".to_string())]);
+
+        let error = store
+            .load_installed_state_with_declaration_strict(&Declaration::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot safely modify packages"));
+    }
+
+    #[test]
+    fn receipt_identity_must_match_physical_directory_names() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let prefix = Prefix(dir.path().join("prefix"));
+        write_good_receipt(&prefix, "demo", "1.0");
+        let installed = prefix.0.join("Cellar/demo/1.0");
+        let receipt_path = InstalledStateStore::receipt_path_for_keg(&installed);
+        let original = std::fs::read(&receipt_path).unwrap();
+        let mut receipt: GluInstallReceipt = serde_json::from_slice(&original).unwrap();
+
+        receipt.package.name = PackageName("other".to_string());
+        std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        assert!(InstalledStateStore::read_receipt_at_keg(&installed).is_err());
+
+        receipt = serde_json::from_slice(&original).unwrap();
+        receipt.package.keg_version = KegVersion("2.0".to_string());
+        std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        assert!(InstalledStateStore::read_receipt_at_keg(&installed).is_err());
     }
 
     #[test]

@@ -23,6 +23,10 @@ pub fn commit_prepared_keg(
     // already rejected separator/traversal characters in name/keg_version;
     // this is the structural Cellar guard on top.
     let cellar = prefix.0.join("Cellar");
+    ensure_real_directory_if_exists(&cellar, "package storage")?;
+    if let Some(package_dir) = prepared.final_keg_path.parent() {
+        ensure_real_directory_if_exists(package_dir, "package directory")?;
+    }
     if !prepared.final_keg_path.starts_with(&cellar)
         || prepared
             .final_keg_path
@@ -37,9 +41,9 @@ pub fn commit_prepared_keg(
     }
 
     if prepared.final_keg_path.exists() {
-        if replace_existing {
-            replace_existing_keg(&prepared.final_keg_path)?;
-        } else {
+        let reuse_existing = !replace_existing
+            && existing_install_matches(&prepared.final_keg_path, prepared, package)?;
+        if reuse_existing {
             let _ = fs::remove_dir_all(&prepared.staging_keg_path);
             return project_active_and_install_etc_var(
                 prefix,
@@ -48,6 +52,10 @@ pub fn commit_prepared_keg(
                 active,
             );
         }
+        // The staged package has already been verified. An existing directory
+        // without matching complete metadata is stale internal state, not an
+        // installation that may be adopted without verification.
+        replace_existing_keg(&prepared.final_keg_path)?;
     }
 
     let cellar_rack = prepared.final_keg_path.parent().ok_or_else(|| {
@@ -190,6 +198,51 @@ fn write_receipt_at(
     InstalledStateStore::write_receipt_at_keg(keg_path, &receipt)
 }
 
+fn ensure_real_directory_if_exists(path: &Path, label: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => anyhow::bail!("{label} {} is not a real directory", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+fn existing_install_matches(
+    path: &Path,
+    prepared: &PreparedKeg,
+    package: &ResolvedPackage,
+) -> Result<bool> {
+    let receipt = match InstalledStateStore::read_receipt_at_keg(path) {
+        Ok(receipt) => receipt,
+        Err(error) if error_is_not_found(&error) => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot safely reuse the existing package at {} because its metadata is invalid",
+                    path.display()
+                )
+            });
+        }
+    };
+
+    Ok(receipt.status == ReceiptStatus::Complete
+        && receipt.package.id == prepared.package_id
+        && receipt.package.package_key == package.package_key
+        && receipt.package.name == package.name
+        && receipt.package.version == package.version
+        && receipt.package.revision == package.revision
+        && receipt.package.keg_version == package.keg_version
+        && receipt.artifact.id == package.artifact)
+}
+
+fn error_is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
 fn logical_dir_size(path: &Path) -> Result<u64> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("reading metadata for {}", path.display()))?;
@@ -328,26 +381,51 @@ mod tests {
     }
 
     #[test]
-    fn commit_prepared_keg_same_version_existing_keg_does_not_relink() {
+    fn commit_prepared_keg_replaces_unreceipted_existing_directory() {
         let tmp = TempDir::new().unwrap();
         let prefix = Prefix(tmp.path().to_path_buf());
         let pkg = package("vips", "1.0");
 
         let keg_path = prefix.0.join("Cellar/vips/1.0");
         touch(&keg_path.join("bin/vips"));
+        fs::write(keg_path.join("bin/vips"), b"unverified").unwrap();
         link_keg(&prefix, &PackageLinkMetadata::from(&pkg), &keg_path).unwrap();
 
         let staging = tmp.path().join("staging/vips-1.0-retry");
         touch(&staging.join("bin/vips"));
+        fs::write(staging.join("bin/vips"), b"verified").unwrap();
         let prep = prepared(&prefix, "vips", "1.0", &staging);
 
         commit_prepared_keg(&prefix, &prep, &pkg, false, true).unwrap();
 
+        assert_eq!(fs::read(keg_path.join("bin/vips")).unwrap(), b"verified");
         assert_eq!(
             prefix.0.join("bin/vips").canonicalize().unwrap(),
             keg_path.join("bin/vips").canonicalize().unwrap()
         );
         assert!(!staging.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_refuses_a_symlinked_package_directory() {
+        let tmp = TempDir::new().unwrap();
+        let prefix = Prefix(tmp.path().join("prefix"));
+        let external = tmp.path().join("external");
+        touch(&external.join("1.0/bin/vips"));
+        fs::create_dir_all(prefix.0.join("Cellar")).unwrap();
+        std::os::unix::fs::symlink(&external, prefix.0.join("Cellar/vips")).unwrap();
+        let staging = tmp.path().join("staging/vips-1.0");
+        touch(&staging.join("bin/vips"));
+        let prep = prepared(&prefix, "vips", "1.0", &staging);
+
+        let error = commit_prepared_keg(&prefix, &prep, &package("vips", "1.0"), false, true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("package directory"));
+        assert_eq!(fs::read(external.join("1.0/bin/vips")).unwrap(), b"fixture");
+        assert!(staging.exists());
     }
 
     #[test]
@@ -475,7 +553,8 @@ mod tests {
 
         write_prepared_receipt(&prep, &pkg, &pkg.artifact.clone(), &artifact, false).unwrap();
 
-        let receipt = InstalledStateStore::read_receipt_at_keg(&prep.staging_keg_path).unwrap();
+        let receipt =
+            InstalledStateStore::read_unbound_receipt_at_keg(&prep.staging_keg_path).unwrap();
         assert_eq!(receipt.status, ReceiptStatus::Incomplete);
         assert_eq!(receipt.sizes.download_bytes, Some(1));
         assert_eq!(receipt.sizes.installed_bytes, Some(7));

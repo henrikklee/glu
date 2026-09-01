@@ -10,8 +10,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Package-local receipt path, relative to one package/keg directory.
+/// Package-local receipt path, relative to one installed package directory.
 pub(super) const RECEIPT_RELATIVE_PATH: &str = ".glu/receipt.json";
+const RECEIPT_SCHEMA: &str = "glu.install-receipt.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GluInstallReceipt {
@@ -141,15 +142,73 @@ pub(super) fn read_receipt_file(path: &Path) -> Result<GluInstallReceipt> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let receipt_schema: ReceiptSchema =
         serde_json::from_slice(&bytes).with_context(|| format!("decoding {}", path.display()))?;
-    if receipt_schema.schema != "glu.install-receipt.v1" {
+    if receipt_schema.schema != RECEIPT_SCHEMA {
         anyhow::bail!(
-            "unsupported install receipt schema {} in {}; reinstall this prefix with the current glu client",
+            "unsupported package metadata schema {} in {}; update glu before modifying this installation",
             receipt_schema.schema,
             path.display()
         );
     }
 
     serde_json::from_slice(&bytes).with_context(|| format!("decoding {}", path.display()))
+}
+
+/// Binds persisted identity and paths to the directory that physically owns
+/// the receipt. Callers must use the scanned path for filesystem operations;
+/// receipt-controlled paths are never authority.
+pub(super) fn validate_receipt_location(
+    receipt: &GluInstallReceipt,
+    installed_path: &Path,
+) -> Result<()> {
+    if receipt.paths.keg != installed_path
+        && !paths_resolve_to_same_directory(&receipt.paths.keg, installed_path)
+    {
+        anyhow::bail!(
+            "package metadata at {} claims installation path {}",
+            installed_path.display(),
+            receipt.paths.keg.display()
+        );
+    }
+
+    let physical_name = installed_path
+        .parent()
+        .and_then(Path::file_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid installed package path {}",
+                installed_path.display()
+            )
+        })?;
+    if physical_name != receipt.package.name.0.as_str() {
+        anyhow::bail!(
+            "package metadata at {} names package {}",
+            installed_path.display(),
+            receipt.package.name.0
+        );
+    }
+
+    let physical_version = installed_path.file_name().ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid installed package path {}",
+            installed_path.display()
+        )
+    })?;
+    if physical_version != receipt.package.keg_version.0.as_str() {
+        anyhow::bail!(
+            "package metadata at {} names installed version {}",
+            installed_path.display(),
+            receipt.package.keg_version.0
+        );
+    }
+
+    Ok(())
+}
+
+fn paths_resolve_to_same_directory(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -228,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn receipt_reader_rejects_unsupported_schema_with_reinstall_guidance() {
+    fn receipt_reader_rejects_unsupported_schema_with_update_guidance() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("receipt.json");
         std::fs::write(
@@ -260,8 +319,8 @@ mod tests {
         .unwrap();
 
         let error = read_receipt_file(&path).unwrap_err().to_string();
-        assert!(error.contains("unsupported install receipt schema glu.install-receipt.v0"));
-        assert!(error.contains("reinstall this prefix"));
+        assert!(error.contains("unsupported package metadata schema glu.install-receipt.v0"));
+        assert!(error.contains("update glu"));
     }
 
     #[test]

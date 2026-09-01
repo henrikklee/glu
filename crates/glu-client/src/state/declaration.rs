@@ -8,8 +8,10 @@ use std::path::PathBuf;
 /// The declaration file name at the prefix root (`/opt/glustore/glu.json`).
 pub const DECLARATION_FILE_NAME: &str = "glu.json";
 
+const DECLARATION_SCHEMA: &str = "glu.declaration.v1";
+
 fn default_schema() -> String {
-    "glu.declaration.v1".to_string()
+    DECLARATION_SCHEMA.to_string()
 }
 
 /// The declaration: which packages the user wants, each with the version
@@ -21,7 +23,6 @@ fn default_schema() -> String {
 /// The declaration is the source of declared package membership.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Declaration {
-    #[serde(default = "default_schema")]
     pub schema: String,
     #[serde(default)]
     pub dependencies: BTreeMap<PackageName, String>,
@@ -49,6 +50,13 @@ impl Declaration {
         let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         let declaration: Declaration = serde_json::from_slice(&bytes)
             .with_context(|| format!("decoding {}", path.display()))?;
+        if declaration.schema != DECLARATION_SCHEMA {
+            anyhow::bail!(
+                "unsupported package declaration schema {} in {}; update glu before modifying this declaration",
+                declaration.schema,
+                path.display()
+            );
+        }
         Ok(Some(declaration))
     }
 
@@ -142,6 +150,20 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let prefix = Prefix(dir.path().to_path_buf());
         assert!(Declaration::load(&prefix).unwrap().is_none());
+    }
+
+    #[test]
+    fn load_rejects_missing_or_unsupported_schema() {
+        for json in [
+            r#"{"dependencies":{},"deactivated":{}}"#,
+            r#"{"schema":"glu.declaration.v2","dependencies":{},"deactivated":{}}"#,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let prefix = Prefix(dir.path().to_path_buf());
+            fs::write(Declaration::path(&prefix), json).unwrap();
+
+            assert!(Declaration::load(&prefix).is_err());
+        }
     }
 
     #[test]

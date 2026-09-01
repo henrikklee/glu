@@ -27,7 +27,15 @@ impl StateSnapshot {
 
     pub fn load_for_mutation(prefix: &Prefix) -> Result<Self> {
         recovery::cleanup_interrupted(prefix)?;
-        Self::load(prefix)
+        record_test_load();
+        let store = InstalledStateStore::new(prefix.clone());
+        let declaration = store.load_declaration()?;
+        let installed = store.load_installed_state_with_declaration_strict(&declaration)?;
+        Ok(Self {
+            declaration,
+            installed,
+            warnings: Vec::new(),
+        })
     }
 }
 
