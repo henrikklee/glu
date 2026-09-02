@@ -405,10 +405,7 @@ fn extract_patch_tar_gz_parallel(
             let writer_wait_start = Instant::now();
             let memory = writer_pool.reserve_bytes(entry_size);
             timings.writer_wait += writer_wait_start.elapsed();
-            let mut data = Vec::with_capacity((entry_size as usize).min(MAX_ENTRY_PREALLOC));
-            entry
-                .read_to_end(&mut data)
-                .with_context(|| format!("read entry {}", rel_path.display()))?;
+            let mut data = read_entry_bytes(&mut entry, entry_size, &rel_path)?;
             let mode = entry.header().mode().ok();
 
             let mut macho = false;
@@ -798,11 +795,22 @@ fn reject_reserved_metadata_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Upper bound for the eager preallocation of a tar entry's buffer (S8). The
-/// header's claimed size is attacker/mirror-controlled; a lying huge value
-/// must not trigger a giant allocation. `read_to_end` still grows the buffer
-/// if a file is legitimately larger, so capping only constrains the reserve.
-const MAX_ENTRY_PREALLOC: usize = 1 << 30; // 1 GiB
+/// Match the `tar` crate's own `EntryFields::read_all` preallocation policy:
+/// use the claimed size as a hint for ordinary files, but let large files grow
+/// only as their bytes are actually read. This is not an entry-size limit.
+const MAX_ENTRY_PREALLOC: u64 = 128 * 1024;
+
+fn read_entry_bytes(reader: &mut impl Read, entry_size: u64, path: &Path) -> Result<Vec<u8>> {
+    let capacity = usize::try_from(entry_size.min(MAX_ENTRY_PREALLOC))
+        .context("entry preallocation does not fit this platform")?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(capacity)
+        .with_context(|| format!("reserving entry {}", path.display()))?;
+    reader
+        .read_to_end(&mut data)
+        .with_context(|| format!("read entry {}", path.display()))?;
+    Ok(data)
+}
 
 /// Normalize a tar hardlink target relative to the archive root. Internal `..`
 /// components are accepted, but they may never escape that root.
@@ -843,6 +851,26 @@ mod tests {
             None,
             "/usr/bin/perl5.34",
         )
+    }
+
+    #[test]
+    fn huge_claim_only_controls_small_initial_reservation() {
+        let data =
+            read_entry_bytes(&mut std::io::empty(), u64::MAX, Path::new("huge-entry")).unwrap();
+
+        assert!(data.is_empty());
+        assert!(data.capacity() <= MAX_ENTRY_PREALLOC as usize);
+    }
+
+    #[test]
+    fn entry_reader_preserves_valid_bytes_beyond_preallocation_hint() {
+        let expected = vec![0x5a; MAX_ENTRY_PREALLOC as usize * 2 + 17];
+        let mut reader = &expected[..];
+
+        let actual =
+            read_entry_bytes(&mut reader, expected.len() as u64, Path::new("valid-entry")).unwrap();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

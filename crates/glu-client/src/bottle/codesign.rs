@@ -5,6 +5,7 @@ use super::{
 use anyhow::{bail, Context, Result};
 use apple_codesign::{MachOSigner, SettingsScope, SigningSettings};
 use std::{
+    borrow::Cow,
     collections::BTreeSet,
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
@@ -116,29 +117,82 @@ fn signing_identifier_for_path(path: &Path) -> Result<Option<String>> {
     let stem = stem.to_string_lossy().to_string();
     let mut header = [0u8; 32];
     let mut file = File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("reading metadata for {}", path.display()))?
+        .len();
     if file.read_exact(&mut header).is_err() {
         return Ok(Some(stem));
     }
     let Some(layout) = macho::header_layout(&header) else {
         return Ok(Some(stem));
     };
-    let mut region = vec![0u8; layout.header_size + layout.sizeofcmds];
+    let Some(region_len) = layout.header_size.checked_add(layout.sizeofcmds) else {
+        return Ok(Some(stem));
+    };
+    if u64::try_from(region_len)
+        .ok()
+        .is_none_or(|region_len| region_len > file_len)
+    {
+        return Ok(Some(stem));
+    }
+    let mut region = zeroed_buffer(region_len)
+        .with_context(|| format!("reserving Mach-O header for {}", path.display()))?;
     if file.seek(SeekFrom::Start(0)).is_err() || file.read_exact(&mut region).is_err() {
         return Ok(Some(stem));
     }
-    let info_plist = macho::section_range(&region, layout, b"__TEXT", b"__info_plist").and_then(
-        |(offset, size)| {
-            if let Some(in_region) = region.get(offset..offset + size) {
-                return Some(in_region.to_vec());
+
+    let info_plist = match macho::section_range(&region, layout, b"__TEXT", b"__info_plist") {
+        Some((offset, size)) => {
+            let Some(end) = offset.checked_add(size) else {
+                return Ok(Some(
+                    macho::signing_identifier(&region, &stem, None).unwrap_or(stem),
+                ));
+            };
+            if let Some(in_region) = region.get(offset..end) {
+                Some(Cow::Borrowed(in_region))
+            } else {
+                read_file_range(&mut file, file_len, offset, size, path)?.map(Cow::Owned)
             }
-            let mut buf = vec![0u8; size];
-            (file.seek(SeekFrom::Start(offset as u64)).is_ok() && file.read_exact(&mut buf).is_ok())
-                .then_some(buf)
-        },
-    );
+        }
+        None => None,
+    };
     Ok(Some(
         macho::signing_identifier(&region, &stem, info_plist.as_deref()).unwrap_or(stem),
     ))
+}
+
+fn zeroed_buffer(len: usize) -> Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(len)
+        .context("requested byte range does not fit in memory")?;
+    buffer.resize(len, 0);
+    Ok(buffer)
+}
+
+fn read_file_range(
+    file: &mut File,
+    file_len: u64,
+    offset: usize,
+    size: usize,
+    path: &Path,
+) -> Result<Option<Vec<u8>>> {
+    let Some(end) = offset.checked_add(size) else {
+        return Ok(None);
+    };
+    let (Ok(offset), Ok(end)) = (u64::try_from(offset), u64::try_from(end)) else {
+        return Ok(None);
+    };
+    if end > file_len {
+        return Ok(None);
+    }
+    let mut buffer = zeroed_buffer(size)
+        .with_context(|| format!("reserving Mach-O section from {}", path.display()))?;
+    Ok(
+        (file.seek(SeekFrom::Start(offset)).is_ok() && file.read_exact(&mut buffer).is_ok())
+            .then_some(buffer),
+    )
 }
 
 fn adhoc_signed_macho_data_from(path: &Path, macho_data: &[u8]) -> Result<Vec<u8>> {
@@ -214,6 +268,74 @@ pub(crate) fn sign_path_adhoc_assume_writable(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_declared_load_commands_fall_back_before_allocation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tool");
+        let mut header = [0u8; 32];
+        header[..4].copy_from_slice(&0xcffa_edfe_u32.to_be_bytes());
+        header[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        fs::write(&path, header).unwrap();
+
+        assert_eq!(
+            signing_identifier_for_path(&path).unwrap(),
+            Some("tool".to_string())
+        );
+    }
+
+    #[test]
+    fn oversized_declared_info_plist_falls_back_before_allocation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tool");
+        let mut macho = vec![0u8; 32 + 72 + 80];
+        macho[..4].copy_from_slice(&0xcffa_edfe_u32.to_be_bytes());
+        macho[16..20].copy_from_slice(&1u32.to_le_bytes());
+        macho[20..24].copy_from_slice(&(152u32).to_le_bytes());
+        let command = 32;
+        macho[command..command + 4].copy_from_slice(&0x19u32.to_le_bytes());
+        macho[command + 4..command + 8].copy_from_slice(&152u32.to_le_bytes());
+        macho[command + 8..command + 24].copy_from_slice(b"__TEXT\0\0\0\0\0\0\0\0\0\0");
+        macho[command + 64..command + 68].copy_from_slice(&1u32.to_le_bytes());
+        let section = command + 72;
+        macho[section..section + 16].copy_from_slice(b"__info_plist\0\0\0\0");
+        macho[section + 32..section + 36].copy_from_slice(&u32::MAX.to_le_bytes());
+        macho[section + 40..section + 44].copy_from_slice(&u32::MAX.to_le_bytes());
+        fs::write(&path, macho).unwrap();
+
+        let identifier = signing_identifier_for_path(&path).unwrap().unwrap();
+        assert!(identifier.starts_with("tool-"), "identifier: {identifier}");
+    }
+
+    #[test]
+    fn out_of_file_and_overflowing_ranges_are_ignored_before_allocation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tool");
+        fs::write(&path, b"small file").unwrap();
+        let mut file = File::open(&path).unwrap();
+        let file_len = file.metadata().unwrap().len();
+
+        assert!(read_file_range(&mut file, file_len, 0, usize::MAX, &path)
+            .unwrap()
+            .is_none());
+        assert!(read_file_range(&mut file, file_len, usize::MAX, 1, &path)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn valid_file_range_is_read_exactly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tool");
+        fs::write(&path, b"prefix-plist-suffix").unwrap();
+        let mut file = File::open(&path).unwrap();
+        let file_len = file.metadata().unwrap().len();
+
+        assert_eq!(
+            read_file_range(&mut file, file_len, 7, 5, &path).unwrap(),
+            Some(b"plist".to_vec())
+        );
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

@@ -8,6 +8,8 @@ This document explains the client's security and correctness posture. It does no
 
 `glu` trusts Homebrew as the upstream package source and trusts the official `glu` registry to supply package metadata, dependency edges, artifact URLs, checksums, install metadata, and structured postinstall facts.
 
+This is not a malicious-package containment boundary. Package contents are executable code, supported postinstall steps may invoke package tools, and installed tools later run with the user's privileges. A compromise of the trusted package source is therefore equivalent to arbitrary code execution. The client does not impose artifact-size, expansion-ratio, output, or execution-time policies that diverge from Homebrew merely to limit what trusted package code could already do. It still uses checked ranges and fallible allocations so accidental malformed metadata fails normally instead of aborting the process.
+
 The client verifies the local work it performs:
 
 - registry transport policy;
