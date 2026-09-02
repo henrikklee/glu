@@ -30,18 +30,21 @@ fail() {
 mkdir -p "$PREFIX/bin"
 cp "$DEV_BIN" "$PREFIX/bin/glu"
 
-# --- fake next release: a `glu` binary at tarball root reporting 0.2.0 ----
-mkdir -p "$DIST/dist/download/v0.2.0"
-cat > "$WORK/glu" <<'EOF'
-#!/usr/bin/env bash
-if [[ "$1" == "--version" ]]; then
-  echo "glu 0.2.0"
-  exit 0
-fi
-echo "fake-glu $*" >> "${GLU_MARKER:?}"
+# --- fake next release: a real ARM64 Mach-O reporting 0.2.0 -------------
+mkdir -p "$DIST/dist/download/v0.2.0" "$WORK/release"
+cat > "$WORK/fake-glu.rs" <<'EOF'
+fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!("glu 0.2.0");
+    }
+}
 EOF
-chmod +x "$WORK/glu"
-tar -C "$WORK" -czf "$DIST/dist/download/v0.2.0/$ASSET" glu
+rustc -O "$WORK/fake-glu.rs" -o "$WORK/release/glu"
+for release_file in LICENSE-BSD-2-Clause LICENSE-MIT THIRD_PARTY_LICENSES.html THIRD_PARTY_NOTICES.md; do
+  cp "$release_file" "$WORK/release/$release_file"
+done
+COPYFILE_DISABLE=1 tar -C "$WORK/release" -czf "$DIST/dist/download/v0.2.0/$ASSET" \
+  LICENSE-BSD-2-Clause LICENSE-MIT THIRD_PARTY_LICENSES.html THIRD_PARTY_NOTICES.md glu
 shasum -a 256 "$DIST/dist/download/v0.2.0/$ASSET" | awk '{print $1}' > "$DIST/dist/download/v0.2.0/$ASSET.sha256"
 
 # --- mock server: /v1/outdated (registry) + /dist/... (distribution) ------

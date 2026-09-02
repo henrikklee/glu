@@ -28,6 +28,7 @@ pub(crate) fn hex_lower(bytes: &[u8]) -> String {
 }
 
 /// SHA-256 digest of `bytes`, returned in the canonical lowercase hex format.
+#[cfg(test)]
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex_lower(digest::digest(&digest::SHA256, bytes).as_ref())
 }
