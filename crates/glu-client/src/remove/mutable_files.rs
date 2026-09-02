@@ -83,7 +83,10 @@ pub fn plan_mutable_file_cleanup(
         let bottle = package.keg_path.join(".bottle");
         for (subdir, area) in [("etc", MutableFileArea::Etc), ("var", MutableFileArea::Var)] {
             let root = bottle.join(subdir);
-            if root.is_dir() {
+            if fs::symlink_metadata(&root)
+                .map(|metadata| metadata.file_type().is_dir())
+                .unwrap_or(false)
+            {
                 collect_mutable_file_claims(
                     prefix,
                     package,
@@ -157,13 +160,12 @@ fn collect_mutable_file_claims(
         let entry = entry?;
         let source = entry.path();
         let file_type = entry.file_type()?;
-        if file_type.is_dir()
-            || (file_type.is_symlink()
-                && source
-                    .metadata()
-                    .map(|metadata| metadata.is_dir())
-                    .unwrap_or(false))
-        {
+        let is_directory_symlink = file_type.is_symlink()
+            && source
+                .metadata()
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false);
+        if file_type.is_dir() || is_directory_symlink {
             let relative = source.strip_prefix(bottle).map_err(|_| {
                 anyhow::anyhow!("mutable package path escaped .bottle: {}", source.display())
             })?;
@@ -171,15 +173,19 @@ fn collect_mutable_file_claims(
                 .entry(prefix.0.join(relative))
                 .or_default()
                 .insert(package.id.clone());
-            collect_mutable_file_claims(
-                prefix,
-                package,
-                bottle,
-                &source,
-                area,
-                claims,
-                directory_claims,
-            )?;
+            if file_type.is_dir() {
+                collect_mutable_file_claims(
+                    prefix,
+                    package,
+                    bottle,
+                    &source,
+                    area,
+                    claims,
+                    directory_claims,
+                )?;
+            }
+            // Installation materializes a directory symlink's mapping but,
+            // like Ruby's lstat-based `Find.find`, does not walk through it.
             continue;
         }
         let relative = source.strip_prefix(bottle).map_err(|_| {

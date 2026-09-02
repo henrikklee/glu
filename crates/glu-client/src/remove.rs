@@ -1205,6 +1205,35 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn cleanup_inventory_never_enters_a_package_directory_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let prefix = Prefix(tmp.path().to_path_buf());
+        write_fixture_receipt(&prefix, "one", "1.0", 0, true, vec![]);
+        let source_parent = prefix.0.join("Cellar/one/1.0/.bottle/etc");
+        fs::create_dir_all(&source_parent).unwrap();
+        fs::write(external.path().join("private.conf"), b"same bytes\n").unwrap();
+        symlink(external.path(), source_parent.join("linked")).unwrap();
+        let live = prefix.0.join("etc/linked/private.conf");
+        fs::create_dir_all(live.parent().unwrap()).unwrap();
+        fs::write(&live, b"same bytes\n").unwrap();
+
+        let plan = plan_removal(&prefix, vec!["one".to_string()]).unwrap();
+        assert!(plan.mutable_files.unchanged.is_empty());
+        assert!(plan.mutable_files.modified.is_empty());
+        execute_removal_with_config(&prefix, &plan, true).unwrap();
+
+        assert_eq!(fs::read(&live).unwrap(), b"same bytes\n");
+        assert_eq!(
+            fs::read(external.path().join("private.conf")).unwrap(),
+            b"same bytes\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn cleanup_never_traverses_a_symlinked_mutable_directory() {
         use std::os::unix::fs::symlink;
 

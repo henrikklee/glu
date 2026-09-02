@@ -153,6 +153,6 @@ To stop needing a dependency, remove or update the package that depends on it. T
 
 Configuration defaults copied into prefix configuration areas are real files. They are not symlinks back into kegs.
 
-Unlinking a package does not touch those files. Removal inventories the exact defaults under every installed package's `.bottle/etc` and `.bottle/var` trees before deleting anything. A file is removed automatically when it is unchanged and no retained package claims its destination. Modified, shared, ambiguous, and untracked files are preserved by default.
+Unlinking a package does not touch those files. Removal inventories the exact defaults under every installed package's `.bottle/etc` and `.bottle/var` trees before deleting anything. Installation and removal use Homebrew's lstat-based walk: a directory symlink can map to a real destination directory, but neither operation traverses its target. A file is removed automatically when it is unchanged and no retained package claims its destination. Modified, shared, ambiguous, and untracked files are preserved by default.
 
 Interactive removal offers a separate, default-no confirmation for attributable modified files. `--remove-config` opts into that cleanup explicitly; non-interactive use also requires `--yes`. Unknown files beneath a mapped directory are never inferred to belong to the package, and directories are pruned only when empty.

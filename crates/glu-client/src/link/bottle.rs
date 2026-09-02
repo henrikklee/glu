@@ -31,10 +31,22 @@ pub fn install_etc_var(prefix: &Prefix, package: &ResolvedPackage, keg: &Path) -
     let mut count = 0;
     for sub in ["etc", "var"] {
         let root = bottle.join(sub);
-        if !root.is_dir() {
+        let Ok(file_type) = fs::symlink_metadata(&root).map(|metadata| metadata.file_type()) else {
             continue;
+        };
+        if file_type.is_dir() {
+            walk_bottle_dir(prefix, package, keg, &bottle, &root, &mut count)?;
+        } else if file_type.is_symlink()
+            && root
+                .metadata()
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false)
+        {
+            // `Find.find` yields a symlink root but uses lstat and does not
+            // descend. `cp_path_sub` then materializes its directory mapping.
+            fs::create_dir_all(prefix.0.join(sub))
+                .with_context(|| format!("creating {sub} directory"))?;
         }
-        walk_bottle_dir(prefix, package, keg, &bottle, &root, &mut count)?;
     }
     Ok(count)
 }
@@ -56,15 +68,23 @@ fn walk_bottle_dir(
         let entry = entry?;
         let src = entry.path();
         let rel = src.strip_prefix(bottle).unwrap_or(&src).to_path_buf();
-        // `entry.file_type()` is lstat-like; descend into symlinked dirs too,
-        // mirroring Ruby's `Find.find` which follows directory symlinks.
+        // Ruby's `Find.find` uses lstat: a directory symlink is yielded but
+        // never traversed. `cp_path_sub` still sees its target as a directory,
+        // so Homebrew materializes the mapped directory and moves on.
         let dst = prefix.0.join(&rel);
-        if entry.file_type()?.is_dir()
-            || (entry.file_type()?.is_symlink()
-                && src.metadata().map(|m| m.is_dir()).unwrap_or(false))
-        {
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
             fs::create_dir_all(&dst).with_context(|| format!("creating {}", dst.display()))?;
             walk_bottle_dir(prefix, package, keg, bottle, &src, count)?;
+            continue;
+        }
+        if file_type.is_symlink()
+            && src
+                .metadata()
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false)
+        {
+            fs::create_dir_all(&dst).with_context(|| format!("creating {}", dst.display()))?;
             continue;
         }
         append_default_if_different(package, keg, &src, &dst, &rel)?;
@@ -542,6 +562,55 @@ mod tests {
             fs::read(old_keg.join(".bottle/etc/foo.conf")).unwrap(),
             b"user-edited-era"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_symlink_is_materialized_without_traversing_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let prefix = Prefix(tmp.path().to_path_buf());
+        let pkg = package("one");
+        let one_keg = keg(&prefix, "one", "1.0");
+        let source_parent = one_keg.join(".bottle/etc");
+        fs::create_dir_all(&source_parent).unwrap();
+        write(&external.path().join("private.conf"), b"do not copy");
+        symlink(external.path(), source_parent.join("linked")).unwrap();
+
+        let count = install_etc_var(&prefix, &pkg, &one_keg).unwrap();
+
+        assert_eq!(count, 0);
+        let destination = prefix.0.join("etc/linked");
+        assert!(destination.is_dir());
+        assert!(!destination.is_symlink());
+        assert!(!destination.join("private.conf").exists());
+        assert_eq!(
+            fs::read(external.path().join("private.conf")).unwrap(),
+            b"do not copy"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_etc_root_is_materialized_without_traversal() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let prefix = Prefix(tmp.path().to_path_buf());
+        let pkg = package("one");
+        let one_keg = keg(&prefix, "one", "1.0");
+        fs::create_dir_all(one_keg.join(".bottle")).unwrap();
+        write(&external.path().join("private.conf"), b"do not copy");
+        symlink(external.path(), one_keg.join(".bottle/etc")).unwrap();
+
+        let count = install_etc_var(&prefix, &pkg, &one_keg).unwrap();
+
+        assert_eq!(count, 0);
+        assert!(prefix.0.join("etc").is_dir());
+        assert!(!prefix.0.join("etc/private.conf").exists());
     }
 
     #[test]
