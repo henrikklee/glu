@@ -3,11 +3,12 @@ use crate::error::{
 };
 use anyhow::{Context, Result};
 use glu_core::{
-    InfoResponse, InstallManifest, OutdatedResponse, PackageSelector, ResolveRequest, SlimManifest,
-    Target, UsesResponse,
+    InfoResponse, InstallManifest, OutdatedResponse, PackageSelection, PackageSelector,
+    ResolveRequest, ResolveRequestEcho, SlimManifest, Target, UsesResponse,
 };
 use reqwest::header::HeaderMap;
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use url::Url;
 
 const HEADER_LATEST_GLU_VERSION: &str = "x-glu-latest-version";
@@ -195,6 +196,181 @@ fn latest_glu_version_header(headers: &HeaderMap) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn invalid_registry_response(operation: &str, detail: impl Into<String>) -> anyhow::Error {
+    RegistryFailure {
+        code: RuntimeErrorCode::RegistryError,
+        message: format!(
+            "registry returned an invalid {operation} response: {}",
+            detail.into()
+        ),
+        name: None,
+        target: None,
+        reason: None,
+        requested_by: None,
+        suggestions: Vec::new(),
+        operation: operation.to_string(),
+        status: None,
+    }
+    .into()
+}
+
+fn validate_resolve_response(
+    schema: &str,
+    echo: &ResolveRequestEcho,
+    roots: &[PackageSelection],
+    request: &ResolveRequest,
+    slim: bool,
+) -> Result<()> {
+    if schema != "glu.resolve.v1" {
+        return Err(invalid_registry_response(
+            "resolve",
+            format!("unsupported schema '{schema}'"),
+        ));
+    }
+    if request.names != echo.name {
+        return Err(invalid_registry_response(
+            "resolve",
+            "request names do not match",
+        ));
+    }
+    if echo.target != request.target {
+        return Err(invalid_registry_response(
+            "resolve",
+            "request target does not match",
+        ));
+    }
+    if echo.slim != slim {
+        return Err(invalid_registry_response(
+            "resolve",
+            "response variant does not match the request",
+        ));
+    }
+    if !request
+        .names
+        .iter()
+        .eq(roots.iter().map(|root| &root.requested_as))
+    {
+        return Err(invalid_registry_response(
+            "resolve",
+            "resolved roots do not match the requested names",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_uses_response(
+    response: &UsesResponse,
+    name: &PackageSelector,
+    target: &Target,
+    direct: bool,
+) -> Result<()> {
+    if response.schema != "glu.uses.v1" {
+        return Err(invalid_registry_response(
+            "uses",
+            format!("unsupported schema '{}'", response.schema),
+        ));
+    }
+    if response.request.name != *name
+        || response.request.target != *target
+        || response.request.direct != direct
+    {
+        return Err(invalid_registry_response(
+            "uses",
+            "request echo does not match",
+        ));
+    }
+    if response.roots.len() != 1 || response.roots[0].requested_as != *name {
+        return Err(invalid_registry_response(
+            "uses",
+            "resolved root does not match the requested name",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_outdated_response(
+    response: &OutdatedResponse,
+    names: &[PackageSelector],
+) -> Result<()> {
+    if response.schema != "glu.outdated.v1" {
+        return Err(invalid_registry_response(
+            "outdated",
+            format!("unsupported schema '{}'", response.schema),
+        ));
+    }
+    let requested: BTreeSet<&str> = names.iter().map(|name| name.0.as_str()).collect();
+    let mut returned = BTreeSet::new();
+    for package in &response.packages {
+        if !requested.contains(package.requested_as.0.as_str()) {
+            return Err(invalid_registry_response(
+                "outdated",
+                format!("unexpected package '{}'", package.requested_as.0),
+            ));
+        }
+        if !returned.insert(package.requested_as.0.as_str()) {
+            return Err(invalid_registry_response(
+                "outdated",
+                format!("duplicate package '{}'", package.requested_as.0),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_info_response(
+    response: &InfoResponse,
+    name: &PackageSelector,
+    target: &Target,
+) -> Result<()> {
+    if response.schema != "glu.info.v1" {
+        return Err(invalid_registry_response(
+            "info",
+            format!("unsupported schema '{}'", response.schema),
+        ));
+    }
+    if response.requested_as != *name {
+        return Err(invalid_registry_response(
+            "info",
+            "requested name does not match",
+        ));
+    }
+    if !bottle_tag_is_compatible(&response.bottle, target) {
+        return Err(invalid_registry_response(
+            "info",
+            format!(
+                "bottle tag '{}' is incompatible with target '{}'",
+                response.bottle, target.0
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_macos_bottle_tag(value: &str) -> Option<(&str, usize)> {
+    const RELEASES: &[&str] = &[
+        "big_sur", "monterey", "ventura", "sonoma", "sequoia", "tahoe",
+    ];
+    RELEASES.iter().enumerate().find_map(|(release, name)| {
+        value
+            .strip_suffix(name)
+            .and_then(|arch| arch.strip_suffix('_'))
+            .filter(|arch| !arch.is_empty())
+            .map(|arch| (arch, release))
+    })
+}
+
+pub(crate) fn bottle_tag_is_compatible(tag: &str, target: &Target) -> bool {
+    if tag == "all" || tag == target.0 {
+        return true;
+    }
+
+    matches!(
+        (parse_macos_bottle_tag(tag), parse_macos_bottle_tag(&target.0)),
+        (Some((tag_arch, tag_release)), Some((target_arch, target_release)))
+            if tag_arch == target_arch && tag_release < target_release
+    )
+}
+
 impl HttpResolveClient {
     pub fn new(base_url: &str) -> Result<Self> {
         let base_url = Url::parse(base_url).context("invalid registry base URL")?;
@@ -240,13 +416,22 @@ impl HttpResolveClient {
             return Err(registry_error(response, "resolve").await);
         }
 
-        response.json::<InstallManifest>().await.map_err(|source| {
-            RegistryDecodeFailure {
-                operation: "resolve".to_string(),
-                source,
-            }
-            .into()
-        })
+        let manifest =
+            response
+                .json::<InstallManifest>()
+                .await
+                .map_err(|source| RegistryDecodeFailure {
+                    operation: "resolve".to_string(),
+                    source,
+                })?;
+        validate_resolve_response(
+            &manifest.schema,
+            &manifest.request,
+            &manifest.roots,
+            request,
+            false,
+        )?;
+        Ok(manifest)
     }
 
     /// `?slim=true` resolve: the same graph with minimal package records,
@@ -281,13 +466,22 @@ impl HttpResolveClient {
             return Err(registry_error(response, "resolve").await);
         }
 
-        response.json::<SlimManifest>().await.map_err(|source| {
-            RegistryDecodeFailure {
-                operation: "resolve".to_string(),
-                source,
-            }
-            .into()
-        })
+        let manifest =
+            response
+                .json::<SlimManifest>()
+                .await
+                .map_err(|source| RegistryDecodeFailure {
+                    operation: "resolve".to_string(),
+                    source,
+                })?;
+        validate_resolve_response(
+            &manifest.schema,
+            &manifest.request,
+            &manifest.roots,
+            request,
+            true,
+        )?;
+        Ok(manifest)
     }
 
     /// `GET /v1/uses`: every registry package that (transitively) depends on
@@ -334,6 +528,7 @@ impl HttpResolveClient {
                     operation: "uses".to_string(),
                     source,
                 })?;
+        validate_uses_response(&response, name, target, direct)?;
         Ok(response)
     }
 
@@ -409,6 +604,7 @@ impl HttpResolveClient {
                 operation: "outdated".to_string(),
                 source,
             })?;
+        validate_outdated_response(&response, names)?;
 
         Ok((response, latest_glu_version))
     }
@@ -439,13 +635,16 @@ impl HttpResolveClient {
             return Err(registry_error(response, "info").await);
         }
 
-        response.json::<InfoResponse>().await.map_err(|source| {
-            RegistryDecodeFailure {
-                operation: "info".to_string(),
-                source,
-            }
-            .into()
-        })
+        let response =
+            response
+                .json::<InfoResponse>()
+                .await
+                .map_err(|source| RegistryDecodeFailure {
+                    operation: "info".to_string(),
+                    source,
+                })?;
+        validate_info_response(&response, name, target)?;
+        Ok(response)
     }
 }
 
@@ -482,6 +681,75 @@ mod tests {
 
         headers.insert(HEADER_LATEST_GLU_VERSION, "  ".parse().unwrap());
         assert_eq!(latest_glu_version_header(&headers), None);
+    }
+
+    #[test]
+    fn resolve_response_must_echo_the_exact_request_and_roots() {
+        let request = ResolveRequest {
+            names: vec![
+                PackageSelector("vips".to_string()),
+                PackageSelector("vips".to_string()),
+                PackageSelector("zlib".to_string()),
+            ],
+            target: Target("arm64_sequoia".to_string()),
+        };
+        let echo = ResolveRequestEcho {
+            name: request.names.clone(),
+            target: request.target.clone(),
+            slim: false,
+        };
+        let roots = echo
+            .name
+            .iter()
+            .map(|name| PackageSelection {
+                requested_as: name.clone(),
+                package_key: glu_core::PackageKey(format!("package:{}", name.0)),
+                package: glu_core::PackageId(format!("pkg:test/{}@1", name.0)),
+            })
+            .collect::<Vec<_>>();
+
+        validate_resolve_response("glu.resolve.v1", &echo, &roots, &request, false).unwrap();
+
+        let mut unrelated = roots;
+        unrelated[0].requested_as = PackageSelector("other".to_string());
+        assert!(
+            validate_resolve_response("glu.resolve.v1", &echo, &unrelated, &request, false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bottle_tag_compatibility_allows_exact_all_and_older_macos() {
+        let target = Target("arm64_sequoia".to_string());
+        assert!(bottle_tag_is_compatible("arm64_sequoia", &target));
+        assert!(bottle_tag_is_compatible("all", &target));
+        assert!(bottle_tag_is_compatible("arm64_sonoma", &target));
+        assert!(!bottle_tag_is_compatible("arm64_tahoe", &target));
+        assert!(!bottle_tag_is_compatible("x86_64_sonoma", &target));
+    }
+
+    #[test]
+    fn outdated_response_rejects_wrong_schema_and_unrequested_packages() {
+        let names = [PackageSelector("vips".to_string())];
+        let mut response = OutdatedResponse {
+            schema: "wrong".to_string(),
+            packages: Vec::new(),
+        };
+        assert!(validate_outdated_response(&response, &names).is_err());
+
+        response.schema = "glu.outdated.v1".to_string();
+        response.packages.push(glu_core::OutdatedPackage {
+            requested_as: PackageSelector("other".to_string()),
+            package_key: glu_core::PackageKey("package:other".to_string()),
+            name: glu_core::PackageName("other".to_string()),
+            update: None,
+            latest: glu_core::VersionRevision {
+                package: glu_core::PackageId("pkg:test/other@1".to_string()),
+                version: "1".to_string(),
+                revision: 0,
+            },
+        });
+        assert!(validate_outdated_response(&response, &names).is_err());
     }
 
     #[test]

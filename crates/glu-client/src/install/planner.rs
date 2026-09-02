@@ -639,11 +639,22 @@ pub fn validate_manifest(manifest: &InstallManifest) -> Result<()> {
     }
 
     for (id, package) in &manifest.packages {
-        if !manifest.artifacts.contains_key(&package.artifact) {
+        let Some(artifact) = manifest.artifacts.get(&package.artifact) else {
             bail!(
                 "package {} references missing artifact {}",
                 id.0,
                 package.artifact.0
+            );
+        };
+        if !crate::registry::resolve_client::bottle_tag_is_compatible(
+            &artifact.bottle_tag,
+            &manifest.request.target,
+        ) {
+            bail!(
+                "package {} references bottle tag {} incompatible with target {}",
+                id.0,
+                artifact.bottle_tag,
+                manifest.request.target.0
             );
         }
         for dep in &package.deps {
@@ -809,6 +820,17 @@ mod tests {
             packages: package_map,
             artifacts,
         }
+    }
+
+    #[test]
+    fn manifest_rejects_a_bottle_incompatible_with_the_requested_target() {
+        let mut manifest = manifest(vec!["vips"], vec![("vips", vec![])]);
+        manifest.artifacts.values_mut().next().unwrap().bottle_tag = "arm64_tahoe".to_string();
+
+        assert!(validate_manifest(&manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible with target arm64_sequoia"));
     }
 
     fn id(name: &str) -> PackageId {
