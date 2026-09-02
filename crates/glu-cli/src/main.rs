@@ -1089,7 +1089,7 @@ mod tests {
         let interrupted = anyhow::Error::new(glu_client::error::InterruptedError {
             operation: "install",
             message: "interrupted (Ctrl+C)",
-            trace_path: std::path::PathBuf::from("/tmp/trace.json"),
+            trace_path: Some(std::path::PathBuf::from("/tmp/trace.json")),
         });
         let failure = CliFailure::Runtime(interrupted);
 
@@ -1206,7 +1206,7 @@ mod tests {
                     skipped: Vec::new(),
                     suggested_commands: Vec::new(),
                     trace_id: None,
-                    trace_path: std::path::PathBuf::from("/tmp/trace.json"),
+                    trace_path: Some(std::path::PathBuf::from("/tmp/trace.json")),
                 },
             )),
         ];
@@ -1250,7 +1250,7 @@ mod tests {
                 }],
                 skipped: Vec::new(),
                 partial: Vec::new(),
-                trace_path: std::path::PathBuf::from("/tmp/trace.json"),
+                trace_path: Some(std::path::PathBuf::from("/tmp/trace.json")),
                 trace_id: Some("abc123".to_string()),
                 suggested_commands: vec!["glu trace view abc123".to_string()],
             },

@@ -1445,7 +1445,7 @@ pub(crate) struct PartialInstallDetails {
     pub(crate) skipped: Vec<PartialInstallPackageDetails>,
     pub(crate) suggested_commands: Vec<String>,
     pub(crate) trace_id: Option<String>,
-    pub(crate) trace_path: std::path::PathBuf,
+    pub(crate) trace_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]

@@ -66,8 +66,10 @@ fn print_partial_install_failure(error: &glu_client::install::PartialInstallFail
             eprintln!("  {}", keg.path.display());
         }
     }
-    eprintln!();
-    eprintln!("Trace: {}", report.trace_path.display());
+    if let Some(trace_path) = &report.trace_path {
+        eprintln!();
+        eprintln!("Trace: {}", trace_path.display());
+    }
     if !report.suggested_commands.is_empty() {
         eprintln!();
         eprintln!("Next steps:");

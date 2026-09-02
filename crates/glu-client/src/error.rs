@@ -38,13 +38,24 @@ impl RuntimeErrorCode {
     }
 }
 
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("{message}\nTrace: {}", trace_path.display())]
+#[derive(Debug, Clone)]
 pub struct InterruptedError {
     pub operation: &'static str,
     pub message: &'static str,
-    pub trace_path: std::path::PathBuf,
+    pub trace_path: Option<std::path::PathBuf>,
 }
+
+impl std::fmt::Display for InterruptedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message)?;
+        if let Some(trace_path) = &self.trace_path {
+            write!(formatter, "\nTrace: {}", trace_path.display())?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for InterruptedError {}
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]

@@ -2,7 +2,9 @@
 use crate::events::SilentExecutionEvents;
 use crate::{
     dependency_query::{dependency_forest_from_manifest, DependencyTreeNode},
-    events::{ExecutionEvents, NodeCompletionStatus, ProgressEvent, ProgressFinishStatus},
+    events::{
+        ExecutionEvents, NodeCompletionStatus, OutputStream, ProgressEvent, ProgressFinishStatus,
+    },
     install::{
         orchestrator::{execute_install_plan, ExecuteInstallPlanInput},
         scheduler::{ExecutionContext, InstallResult},
@@ -127,7 +129,7 @@ pub struct PartialInstallReport {
     pub failed: Vec<PartialInstallPackage>,
     pub skipped: Vec<PartialInstallPackage>,
     pub partial: Vec<PartialKeg>,
-    pub trace_path: PathBuf,
+    pub trace_path: Option<PathBuf>,
     pub trace_id: Option<String>,
     pub suggested_commands: Vec<String>,
 }
@@ -1479,13 +1481,22 @@ async fn execute_workset(
     }
 
     let trace = result.execution.trace_dict(&plan_name);
-    let written_trace = write_install_trace(&client.config().prefix, &plan_name, &trace)?;
+    let trace_path = match write_install_trace(&client.config().prefix, &plan_name, &trace) {
+        Ok(written_trace) => Some(written_trace.path),
+        Err(error) => {
+            events.notice(
+                OutputStream::Stderr,
+                &format!("glu: warning: could not write install trace: {error:#}"),
+            );
+            None
+        }
+    };
 
     if interrupted {
         return Err(crate::error::InterruptedError {
             operation: "install",
             message: "interrupted (Ctrl+C)",
-            trace_path: written_trace.path,
+            trace_path,
         }
         .into());
     }
@@ -1496,7 +1507,7 @@ async fn execute_workset(
             &workset,
             &result.execution,
             error,
-            written_trace.path,
+            trace_path,
         )
         .into());
     }
@@ -1508,7 +1519,7 @@ async fn execute_workset(
     let timing_breakdown = timing_breakdown_struct(summary);
 
     Ok(WorksetExecutionSummary {
-        trace_path: Some(written_trace.path),
+        trace_path,
         elapsed_seconds: summary.total.as_secs_f64(),
         timing_breakdown,
         timing_description,
@@ -1522,7 +1533,7 @@ fn partial_install_failure(
     workset: &planner::InstallWorkSet,
     execution: &InstallResult,
     error: &str,
-    trace_path: PathBuf,
+    trace_path: Option<PathBuf>,
 ) -> PartialInstallFailure {
     let registry_ok_nodes = execution
         .events
@@ -1584,7 +1595,7 @@ fn partial_install_failure(
     }
 
     let partial = partial_kegs(manifest, workset, execution, &installed_ids);
-    let trace_id = trace_id_from_path(&trace_path);
+    let trace_id = trace_path.as_deref().and_then(trace_id_from_path);
     let failed_phase = execution
         .failure
         .as_ref()
@@ -1612,7 +1623,7 @@ fn partial_install_failure(
     suggested_commands.push("glu autoremove".to_string());
     if let Some(trace_id) = trace_id.as_deref() {
         suggested_commands.push(format!("glu trace view {trace_id}"));
-    } else {
+    } else if let Some(trace_path) = trace_path.as_deref() {
         suggested_commands.push(format!("glu trace view {}", trace_path.display()));
     }
 
@@ -2067,6 +2078,9 @@ mod interrupted_install_tests {
                     ProgressEvent::InstallFinished { status: ProgressFinishStatus::Done }
                 )
         ));
+        assert!(!recorded
+            .iter()
+            .any(|event| matches!(event, RecordedExecutionEvent::Notice { .. })));
 
         let bar_keg = prefix.0.join("Cellar/bar/1.0");
         let app_keg = prefix.0.join("Cellar/app/1.0");
@@ -2087,6 +2101,138 @@ mod interrupted_install_tests {
             prefix.0.join("opt/foo").canonicalize().unwrap(),
             bar_keg.canonicalize().unwrap()
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn trace_write_failure_does_not_prevent_install_declaration_commit() {
+        let _serial = FAULT_TEST_LOCK.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let prefix = Prefix(tmp.path().join("prefix"));
+        let manifest = manifest_with_dep(&prefix);
+        let client = client(prefix.clone());
+        let state = StateSnapshot::load_for_mutation(&prefix).unwrap().installed;
+        let workset =
+            planner::compute_workset(&manifest, &state, planner::WorksetMode::Install).unwrap();
+        let mut declaration_after = Declaration::default();
+        declaration_after
+            .dependencies
+            .insert(PackageName("app".to_string()), "1.0".to_string());
+        let plan = InstallPlan {
+            requested: vec![PackageSelector("app".to_string())],
+            would_install: Vec::new(),
+            satisfied: Vec::new(),
+            promoted: Vec::new(),
+            renamed: Vec::new(),
+            would_remove: Vec::new(),
+            requires_confirmation: false,
+            would_download_bytes: Some(0),
+            manifest,
+            workset,
+            declaration_after,
+            deactivated_after: BTreeSet::new(),
+            declared_before: BTreeSet::new(),
+            command_start: std::time::Instant::now(),
+        };
+        block_trace_writes(&prefix);
+        let events = Arc::new(RecordingExecutionEvents::default());
+
+        let summary = execute_install(
+            &client,
+            plan,
+            InstallOptions {
+                yes: true,
+                ..Default::default()
+            },
+            events.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert!(summary.execution.trace_path.is_none());
+        let declaration = InstalledStateStore::new(prefix.clone())
+            .load_declaration()
+            .unwrap();
+        assert_eq!(
+            declaration
+                .dependencies
+                .get(&PackageName("app".to_string()))
+                .map(String::as_str),
+            Some("1.0")
+        );
+        assert_eq!(
+            receipt_status(&prefix.0.join("Cellar/app/1.0")),
+            Some(ReceiptStatus::Complete)
+        );
+        let warnings = events
+            .events()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    RecordedExecutionEvent::Notice {
+                        stream: OutputStream::Stderr,
+                        message,
+                    } if message.contains("could not write install trace")
+                )
+            })
+            .count();
+        assert_eq!(warnings, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn trace_write_failure_does_not_mask_partial_install_failure() {
+        let _serial = FAULT_TEST_LOCK.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let prefix = Prefix(tmp.path().join("prefix"));
+        let manifest = manifest_with_dep(&prefix);
+        let client = client(prefix.clone());
+        let state = StateSnapshot::load_for_mutation(&prefix).unwrap().installed;
+        let workset =
+            planner::compute_workset(&manifest, &state, planner::WorksetMode::Install).unwrap();
+        block_trace_writes(&prefix);
+        let events = Arc::new(RecordingExecutionEvents::default());
+        let _fault = fault::fail_after_commit_for("app");
+
+        let error = execute_workset(
+            &client,
+            manifest,
+            workset,
+            InstallOptions {
+                yes: true,
+                ..Default::default()
+            },
+            BTreeSet::new(),
+            std::time::Instant::now(),
+            events.clone(),
+        )
+        .await
+        .unwrap_err();
+
+        let partial = error.downcast_ref::<PartialInstallFailure>().unwrap();
+        assert!(partial
+            .message
+            .contains("injected failure after committing app"));
+        assert!(partial.report.trace_path.is_none());
+        assert!(partial.report.trace_id.is_none());
+        assert!(partial
+            .report
+            .suggested_commands
+            .iter()
+            .all(|command| !command.starts_with("glu trace view ")));
+        let warnings = events
+            .events()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    RecordedExecutionEvent::Notice {
+                        stream: OutputStream::Stderr,
+                        message,
+                    } if message.contains("could not write install trace")
+                )
+            })
+            .count();
+        assert_eq!(warnings, 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2336,7 +2482,11 @@ mod interrupted_install_tests {
         assert_eq!(partial.report.partial[0].name, "app");
         assert!(partial.report.partial[0].path.ends_with("Cellar/app/1.0"));
         assert_eq!(partial.report.failed_phase.as_deref(), Some("keg_link"));
-        assert!(partial.report.trace_path.exists());
+        assert!(partial
+            .report
+            .trace_path
+            .as_ref()
+            .is_some_and(|path| path.exists()));
         assert!(partial.report.trace_id.is_some());
         assert!(partial
             .report
@@ -2710,6 +2860,12 @@ mod interrupted_install_tests {
             .unwrap();
         let encoder = tar.into_inner().unwrap();
         encoder.finish().unwrap()
+    }
+
+    fn block_trace_writes(prefix: &Prefix) {
+        let glu_var = prefix.0.join("var/glu");
+        std::fs::create_dir_all(&glu_var).unwrap();
+        std::fs::write(glu_var.join("traces"), b"not a directory").unwrap();
     }
 
     fn receipt_status(keg: &std::path::Path) -> Option<ReceiptStatus> {
