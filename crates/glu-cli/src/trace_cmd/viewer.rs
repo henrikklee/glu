@@ -1,4 +1,5 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use std::io::Write;
 
 /// Parse the wall-clock timestamp embedded in a trace filename
 /// (`trace-YYYYMMDD-HHMMSS-<plan>-<id>.json`) into a displayable local time
@@ -29,12 +30,13 @@ fn trace_started_display(source: &std::path::Path) -> Option<String> {
 }
 
 /// Write the rendered HTML for a trace to a temp path and return it.
-/// Unix-only: the source trace is read, `render_html` is applied, and the
-/// result is written to `$TMPDIR/glu-trace-<name>-<id>.html`.
+/// Unix-only: the source trace is read, structurally validated, rendered, and
+/// atomically moved from an exclusive private temporary file to the viewer path.
 pub(super) fn render_trace_viewer(source: &std::path::Path) -> Result<std::path::PathBuf> {
     let text = std::fs::read_to_string(source).context("reading trace")?;
     let mut trace: serde_json::Value =
         serde_json::from_str(&text).context("trace is not valid JSON")?;
+    validate_trace_shape(&trace)?;
     // The trace JSON carries only relative times; the run's wall-clock moment
     // lives in the filename (`trace-YYYYMMDD-HHMMSS-...`). Surface it as a
     // display-only `started_at` so the viewer can show it without schema
@@ -49,11 +51,39 @@ pub(super) fn render_trace_viewer(source: &std::path::Path) -> Result<std::path:
     let plan = trace["plan"].as_str().unwrap_or("trace").to_string();
     let html = glu_client::trace::render::render_html(&trace, &format!("glu trace: {plan}"));
 
-    let mut out_dir = std::env::temp_dir();
-    let file_name = format!("glu-{name}.html");
-    out_dir.push(file_name);
-    std::fs::write(&out_dir, html).context("writing trace HTML")?;
-    Ok(out_dir)
+    let mut output_path = std::env::temp_dir();
+    output_path.push(format!("glu-{name}.html"));
+
+    let mut staging = tempfile::Builder::new()
+        .prefix(".glu-trace-viewer-")
+        .suffix(".html.tmp")
+        .tempfile_in(std::env::temp_dir())
+        .context("creating private trace viewer temporary file")?;
+    staging
+        .write_all(html.as_bytes())
+        .context("writing trace HTML")?;
+    staging
+        .persist(&output_path)
+        .with_context(|| format!("moving trace viewer to {}", output_path.display()))?;
+    Ok(output_path)
+}
+
+fn validate_trace_shape(trace: &serde_json::Value) -> Result<()> {
+    let Some(trace) = trace.as_object() else {
+        bail!("trace must be a JSON object");
+    };
+    if !trace.get("plan").is_some_and(serde_json::Value::is_string) {
+        bail!("trace field `plan` must be a string");
+    }
+    for field in ["nodes", "edges", "events"] {
+        let Some(entries) = trace.get(field).and_then(serde_json::Value::as_array) else {
+            bail!("trace field `{field}` must be an array");
+        };
+        if entries.iter().any(|entry| !entry.is_object()) {
+            bail!("trace field `{field}` must contain only objects");
+        }
+    }
+    Ok(())
 }
 
 /// Best-effort `open` on the rendered HTML. Browser-launch failure is part of
@@ -101,9 +131,8 @@ mod tests {
 
     #[test]
     fn render_trace_viewer_injects_filename_timestamp() {
-        let dir = std::env::temp_dir().join(format!("glu-render-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("trace-20250817-213059-node-a1b2c3.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace-20250817-213059-node-a1b2c3.json");
         std::fs::write(
             &path,
             r#"{"plan":"node","nodes":[],"edges":[],"events":[]}"#,
@@ -117,6 +146,48 @@ mod tests {
         assert!(html.contains(r#"id="tabs""#));
         assert!(html.contains("role=\"tablist\""));
         let _ = std::fs::remove_file(&html_path);
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trace_shape_requires_the_viewer_collections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid.json");
+        std::fs::write(&path, r#"{"plan":"node","nodes":{}}"#).unwrap();
+        let error = render_trace_viewer(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("trace field `nodes` must be an array"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn viewer_replaces_a_prepositioned_symlink_without_following_it() {
+        use std::os::unix::{fs::symlink, fs::PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let stem = format!("symlink-safety-{}", std::process::id());
+        let source = dir.path().join(format!("{stem}.json"));
+        std::fs::write(
+            &source,
+            r#"{"plan":"node","nodes":[],"edges":[],"events":[]}"#,
+        )
+        .unwrap();
+
+        let output = std::env::temp_dir().join(format!("glu-{stem}.html"));
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"do not replace").unwrap();
+        let _ = std::fs::remove_file(&output);
+        symlink(&victim, &output).unwrap();
+
+        let rendered = render_trace_viewer(&source).unwrap();
+        assert_eq!(rendered, output);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not replace");
+        assert!(!std::fs::symlink_metadata(&rendered)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::metadata(&rendered).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_file(rendered);
     }
 }

@@ -12,10 +12,34 @@
 //! segments (`extract`/`writer_wait`/`text_relocate`/`fixed_prefix_relocate`/
 //! `macho_patch`/`codesign`), never rendered as separate bars.
 //!
-//! Rendering is local-first: the HTML is written to a temp path and opened by
-//! the CLI; trace data is never uploaded. The only runtime external is the
-//! `dagre` layout library loaded from unpkg (network is not required to view;
-//! the graph view degrades with a hint when it fails to load).
+//! Rendering is local-only: the HTML is written to a temp path and opened by
+//! the CLI; trace data is never uploaded. The `dagre` layout library is stored
+//! gzip-compressed in the binary and expanded into the self-contained viewer
+//! when it is rendered, so viewing a trace performs no network requests.
+
+use flate2::read::GzDecoder;
+use ring::rand::{SecureRandom, SystemRandom};
+use std::{io::Read, sync::OnceLock};
+
+const DAGRE_GZIP: &[u8] = include_bytes!("../../assets/dagre-0.8.5.min.js.gz");
+
+fn dagre_js() -> &'static str {
+    static DAGRE_JS: OnceLock<String> = OnceLock::new();
+    DAGRE_JS.get_or_init(|| {
+        let mut source = String::new();
+        GzDecoder::new(DAGRE_GZIP)
+            .read_to_string(&mut source)
+            .expect("embedded dagre asset must be valid gzip-compressed UTF-8");
+        assert!(
+            !source
+                .as_bytes()
+                .windows(b"</script".len())
+                .any(|window| window.eq_ignore_ascii_case(b"</script")),
+            "embedded dagre asset must not close its script element"
+        );
+        source
+    })
+}
 
 /// Render a trace `Value` into a standalone HTML document.
 ///
@@ -32,10 +56,27 @@ pub fn render_html(trace: &serde_json::Value, title: &str) -> String {
         .join("<\\/");
     let mut page_title = String::new();
     let _ = write!(page_title, "{title}");
+    let nonce = csp_nonce();
 
     HTML_TEMPLATE
         .replace("__TITLE__", &html_attr(&page_title))
+        .replace("__CSP_NONCE__", &nonce)
+        .replace("__DAGRE_JS__", dagre_js())
         .replace("__TRACE_JSON__", &safe_trace_json)
+}
+
+fn csp_nonce() -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut bytes = [0_u8; 16];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .expect("system randomness must be available for trace viewer CSP");
+    let mut nonce = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        nonce.push(HEX[(byte >> 4) as usize] as char);
+        nonce.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    nonce
 }
 
 /// Escape for an HTML attribute/text-context placeholder (the page `<title>`
@@ -55,16 +96,19 @@ fn html_attr(s: &str) -> String {
     out
 }
 
-/// Static single-file viewer template. Two placeholders:
+/// Static single-file viewer template. Four placeholders:
 ///   __TITLE__       -> injected, HTML-attr escaped
+///   __CSP_NONCE__   -> fresh random nonce for the two executable scripts
+///   __DAGRE_JS__    -> trusted vendored Dagre source
 ///   __TRACE_JSON__  -> the trace, with `</` escaped to `<\\/`
 const HTML_TEMPLATE: &str = r##"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-__CSP_NONCE__'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'" />
 <title>__TITLE__</title>
-<script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
+<script nonce="__CSP_NONCE__">__DAGRE_JS__</script>
 <style>
 :root {
   color-scheme: dark;
@@ -352,7 +396,7 @@ footer { color: var(--muted); padding: 0 18px 18px; }
 <footer>Tip: each row is one concurrency lane (pool + slot). Hover a bar for its lifecycle; segmented bars break prepare into extract/relocate/machO/codesign. Zoom with ctrl+wheel or pinch; when zoomed, pan the time window by dragging, with ←/→, or with trackpad / shift+wheel.</footer>
 <div id="tooltip" role="tooltip"></div>
 <script id="trace-data" type="application/json">__TRACE_JSON__</script>
-<script>
+<script nonce="__CSP_NONCE__">
 const trace = JSON.parse(document.getElementById('trace-data').textContent);
 const nodes = trace.nodes || [];
 const edges = trace.edges || [];
@@ -444,7 +488,17 @@ function summarize() {
   if (trace.started_at) pills.push(['started', trace.started_at]);
   pills.push(['packages', packageCount], ['nodes', nodes.length], ['edges', edges.length], ['events', events.length],
     ['lanes', lanes.size], ['duration', fmt(max - min)]);
-  document.getElementById('summary').innerHTML = pills.map(([k,v]) => `<span class="pill">${k}: <strong>${v}</strong></span>`).join('');
+  const summary = document.getElementById('summary');
+  summary.replaceChildren();
+  for (const [key, value] of pills) {
+    const pill = document.createElement('span');
+    pill.className = 'pill';
+    pill.append(document.createTextNode(`${key}: `));
+    const strong = document.createElement('strong');
+    strong.textContent = String(value);
+    pill.append(strong);
+    summary.append(pill);
+  }
 }
 
 // Subphase segment colours (the six `bottle_prepare` steps). Falls back to a
@@ -865,7 +919,7 @@ function renderGraph() {
   const svg = document.getElementById('graphSvg');
   if (!nodes.length) { svg.outerHTML = '<div class="empty">No graph nodes.</div>'; return; }
   if (!window.dagre) {
-    document.getElementById('graphHint').textContent = 'dagre failed to load; check network access for unpkg.com';
+    document.getElementById('graphHint').textContent = 'embedded dagre layout failed to load';
     return;
   }
 
@@ -1160,6 +1214,44 @@ mod tests {
         let trace = json!({ "plan": "vips", "nodes": [], "edges": [], "events": [] });
         let html = render_html(&trace, "glu trace: trace-vips.json");
         assert!(html.contains("glu trace"));
+    }
+
+    #[test]
+    fn viewer_is_self_contained_and_blocks_network_access() {
+        let trace = json!({ "plan": "vips", "nodes": [], "edges": [], "events": [] });
+        let html = render_html(&trace, "glu trace: vips");
+        assert!(!html.contains("<script src="));
+        assert!(!html.contains("unpkg.com"));
+        assert!(!html.contains("__DAGRE_JS__"));
+        assert!(html.contains("dagre.graphlib.Graph"));
+        assert!(html.contains("connect-src 'none'"));
+        assert!(!html.contains("script-src 'unsafe-inline'"));
+        assert!(!html.contains("__CSP_NONCE__"));
+
+        let nonce_start = html.find("script-src 'nonce-").unwrap() + "script-src 'nonce-".len();
+        let nonce = &html[nonce_start..nonce_start + 32];
+        assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(html.matches(nonce).count(), 3);
+
+        let second = render_html(&trace, "glu trace: vips");
+        assert!(
+            !second.contains(nonce),
+            "each viewer gets a fresh CSP nonce"
+        );
+    }
+
+    #[test]
+    fn summary_uses_text_nodes_for_trace_values() {
+        let trace = json!({
+            "plan": "vips",
+            "started_at": "<img src=x onerror=alert(1)>",
+            "nodes": [],
+            "edges": [],
+            "events": [],
+        });
+        let html = render_html(&trace, "glu trace: vips");
+        assert!(html.contains("strong.textContent = String(value)"));
+        assert!(!html.contains("summary').innerHTML"));
     }
 
     #[test]
