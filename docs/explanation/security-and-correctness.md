@@ -94,7 +94,9 @@ Destination classification is the local complexity boundary. The rest of the ins
 
 Postinstall is structured, validated, and run through a sandboxed worker model on macOS.
 
-The worker environment strips sensitive keys and dynamic-loader variables, clears `HOMEBREW_PATH`, and runs under a generated sandbox profile. The profile grants expected write access for package, prefix, temp, cache, and setup paths while protecting sensitive locations.
+The worker uses a temporary `HOME`, puts system tools before retained caller `PATH` entries, clears `HOMEBREW_PATH`, and removes dynamic-loader variables plus environment keys whose names match Homebrew's credential-related denylist. This is not a complete environment allowlist: values in variables such as `*_SECRET`, database URLs, or proxy configuration can remain available when their names do not match that denylist.
+
+The generated profile denies writes by default, then permits package, prefix, temporary, cache, setup, and narrowly required developer-tool locations. Its read restrictions are best effort. When compatibility requires readable paths in the real home directory, the profile denies a maintained list of sensitive paths rather than the whole home. Network access follows registry metadata and retains Homebrew's allow-by-default behavior when that fact is unavailable. The sandbox therefore constrains expected installation side effects; it does not promise confidentiality from trusted package code.
 
 Unsupported manual Ruby postinstall behavior is refused. The client does not execute arbitrary upstream Ruby as an escape hatch.
 

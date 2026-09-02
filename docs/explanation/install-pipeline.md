@@ -107,7 +107,9 @@ Package-local postinstall runs during commit, after package files are visible an
 
 Postinstall is structured. The client validates supported step types before execution and refuses unsupported manual Ruby postinstall behavior.
 
-Execution happens through a sandboxed worker model on macOS. The worker receives a sanitized environment and a generated sandbox profile that grants expected package, prefix, temp, cache, and setup access while protecting sensitive locations.
+Execution happens through a sandboxed worker model on macOS. The generated profile denies writes by default, then permits the package, prefix, temporary, cache, and setup locations required for compatibility. The worker uses a temporary `HOME`, a system-first `PATH`, and Homebrew-compatible filtering of credential-like and dynamic-loader environment keys.
+
+This is a write-confinement and correctness boundary, not a confidentiality boundary for malicious package code. Compatibility exceptions can leave non-enumerated home paths readable, environment filtering is not a complete secret allowlist, caller `PATH` entries remain available after system paths, and network access follows package metadata with Homebrew's allow-by-default fallback.
 
 ## 9. Coalesce global caches
 
