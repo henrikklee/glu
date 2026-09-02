@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use glu_core::{KegVersion, PackageName, Prefix, ResolvedArtifact};
+use ring::rand::{SecureRandom, SystemRandom};
 use std::{
     collections::BTreeMap,
     fs,
@@ -86,10 +87,16 @@ impl ArtifactCache {
 
     /// In-progress artifact path. Single-stream and multipart downloads both
     /// write here first; incomplete/range-written bytes never live in `sha256/`.
-    pub fn temp_path_for_sha256(&self, sha256: &str) -> PathBuf {
-        self.root
-            .join("tmp")
-            .join(format!("{sha256}.{}.tmp", std::process::id()))
+    pub fn temp_path_for_sha256(&self, sha256: &str) -> Result<PathBuf> {
+        let mut random = [0_u8; 16];
+        SystemRandom::new()
+            .fill(&mut random)
+            .map_err(|_| anyhow::anyhow!("generating artifact staging name"))?;
+        Ok(self.root.join("tmp").join(format!(
+            "{sha256}.{}.{}.tmp",
+            std::process::id(),
+            crate::hash::hex_lower(&random)
+        )))
     }
 
     pub async fn ensure_dirs(&self) -> Result<()> {
@@ -106,7 +113,7 @@ impl ArtifactCache {
         self.path_for_sha256(&artifact.sha256)
     }
 
-    pub fn temp_path_for_artifact(&self, artifact: &ResolvedArtifact) -> PathBuf {
+    pub fn temp_path_for_artifact(&self, artifact: &ResolvedArtifact) -> Result<PathBuf> {
         self.temp_path_for_sha256(&artifact.sha256)
     }
 
@@ -258,6 +265,21 @@ mod tests {
 
     fn cache(prefix: &std::path::Path) -> ArtifactCache {
         ArtifactCache::new(&Prefix(prefix.to_path_buf()))
+    }
+
+    #[test]
+    fn staging_paths_are_random_per_transfer_and_keep_the_digest_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = cache(temp.path());
+        let digest = "a".repeat(64);
+        let first = cache.temp_path_for_sha256(&digest).unwrap();
+        let second = cache.temp_path_for_sha256(&digest).unwrap();
+        assert_ne!(first, second);
+        for path in [first, second] {
+            let name = path.file_name().unwrap().to_string_lossy();
+            assert!(name.starts_with(&format!("{digest}.{}.", std::process::id())));
+            assert!(name.ends_with(".tmp"));
+        }
     }
 
     #[test]

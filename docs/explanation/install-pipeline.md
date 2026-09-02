@@ -55,7 +55,7 @@ Already satisfied packages do not get download or prepare nodes. They still part
 
 ## 5. Download and verify
 
-Each artifact remains one DAG node. For a known-size artifact, the transfer runtime may divide the byte range into segments and schedule their HTTP attempts through one install-wide request coordinator. This keeps ordinary request concurrency bounded independently of the number of active artifact nodes.
+Each selected package artifact reference remains one DAG download node. For a known-size artifact, the transfer runtime may divide the byte range into segments and schedule their HTTP attempts through one install-wide request coordinator. This keeps ordinary request concurrency bounded independently of the number of active download nodes. If references share a digest, their independent random staging files safely converge on the same verified cache entry.
 
 Download priority comes from known downstream tail cost. The scheduler propagates a small catalog of measured prepare and postinstall costs backward through the DAG. Downloads that release a known expensive tail receive request capacity first; operations without an explicit hint contribute zero cost.
 
@@ -63,7 +63,7 @@ Retryable transport failures, interrupted bodies, early EOF, HTTP 408, HTTP 429,
 
 Shared health telemetry distinguishes a broad interruption from one pathological connection. A localized straggler can receive a bounded emergency hedge for its remaining suffix; one ambiguous final stream can receive a diagnostic attempt. The original request stays available as a fallback, hedge bytes remain isolated, and speculative traffic never inflates logical progress.
 
-Only the complete artifact SHA-256 supplied by the registry is a trust boundary. The client verifies the complete result before atomic cache admission. Cached artifacts are verified again during prepare; a corrupt cache hit is deleted, redownloaded, and retried once.
+Only the complete artifact SHA-256 supplied by the registry is a trust boundary. The client creates a private random staging file exclusively, retains its descriptor through writes, verification, and synchronization, checks that the staging pathname still identifies that inode, and only then atomically admits it to the cache. Cached artifacts are verified again during prepare; a corrupt cache hit is deleted, redownloaded, and retried once.
 
 ## 6. Prepare
 

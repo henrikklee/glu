@@ -116,7 +116,7 @@ Downloads and prepare work can overlap because they do not make packages visible
 
 Prepare has two shared resource services beneath its DAG pool. Signing workers own CPU-heavy Mach-O parsing and hashing. A separate writer pool owns physical extraction and sparse signature writes, with one concurrency limit and byte budget across all concurrently prepared packages. This prevents package-local signing work from creating an unbounded second set of APFS writers.
 
-The scheduler operates at two levels. The DAG keeps one node per artifact, while the transfer runtime can divide a known-size artifact into segments and run retries or emergency hedges beneath that node. Segments and attempts are runtime details; they do not expand the execution plan or weaken the artifact-level digest boundary.
+The scheduler operates at two levels. The DAG keeps one download node per selected package artifact reference, while the transfer runtime can divide a known-size artifact into segments and run retries or emergency hedges beneath that node. Segments and attempts are runtime details; they do not expand the execution plan or weaken the artifact-level digest boundary. Independent references to the same digest use separate random staging files and safely converge on the same verified cache entry.
 
 At the DAG level, download order is based on known downstream tail cost. A small, version-controlled catalog assigns costs only to operations that maintainers have measured and reviewed. Those costs propagate backward through the graph, so a download that unlocks expensive prepare or postinstall work can run before one whose remaining branch is cheap. Unlisted operations contribute zero rather than receiving speculative estimates.
 

@@ -358,6 +358,113 @@ async fn healthy_single_stream_completes_without_speculation() {
     assert_eq!(report.segments[0].hedges, 0);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn cache_admission_rejects_a_post_transfer_path_replacement() {
+    use std::os::unix::fs::symlink;
+
+    let data = Arc::new(vec![27_u8; 50_000]);
+    let server = test_server({
+        let data = Arc::clone(&data);
+        move |request, stream| {
+            assert_eq!(request.range, None);
+            write_response(stream, "200 OK", data.len(), None, &data);
+        }
+    });
+    let manager = test_manager(TransferPolicy::default());
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("artifact.tmp");
+    let report = manager
+        .download_with_header_to_path(
+            &server.url,
+            &path,
+            &sha256(&data),
+            Some(data.len() as u64),
+            None,
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap();
+
+    let replacement = temp.path().join("replacement");
+    std::fs::write(&replacement, &*data).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    symlink(&replacement, &path).unwrap();
+    let error = report.validate_staging_path(&path).await.unwrap_err();
+    assert!(format!("{error:#}").contains("staging path identity changed"));
+}
+
+#[cfg(unix)]
+async fn assert_path_replacement_cannot_redirect_writes(expected_size: Option<u64>) {
+    use std::os::unix::fs::symlink;
+
+    let data = Arc::new(vec![29_u8; 50_000]);
+    let request_seen = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let server = test_server({
+        let data = Arc::clone(&data);
+        let request_seen = Arc::clone(&request_seen);
+        let release = Arc::clone(&release);
+        move |request, stream| {
+            assert_eq!(request.range, None);
+            request_seen.store(true, Ordering::Release);
+            while !release.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            write_response(stream, "200 OK", data.len(), None, &data);
+        }
+    });
+    let manager = test_manager(TransferPolicy::default());
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("artifact.tmp");
+    let victim = temp.path().join("victim");
+    let original_victim = b"victim remains unchanged";
+    std::fs::write(&victim, original_victim).unwrap();
+    let url = server.url.clone();
+    let digest = sha256(&data);
+    let download_path = path.clone();
+    let task = tokio::spawn(async move {
+        manager
+            .download_with_header_to_path(
+                &url,
+                &download_path,
+                &digest,
+                expected_size,
+                None,
+                Arc::new(|_| {}),
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !request_seen.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("server saw the request");
+    std::fs::remove_file(&path).unwrap();
+    symlink(&victim, &path).unwrap();
+    release.store(true, Ordering::Release);
+
+    let report = task.await.unwrap().unwrap();
+    let error = report.validate_staging_path(&path).await.unwrap_err();
+    assert!(format!("{error:#}").contains("staging path identity changed"));
+    assert_eq!(std::fs::read(victim).unwrap(), original_victim);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn known_size_download_retains_its_original_inode() {
+    assert_path_replacement_cannot_redirect_writes(Some(50_000)).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unknown_size_download_retains_its_original_inode() {
+    assert_path_replacement_cannot_redirect_writes(None).await;
+}
+
 #[tokio::test]
 async fn healthy_multipart_completes_without_speculation() {
     let data = Arc::new(vec![23_u8; 300_000]);
@@ -401,6 +508,54 @@ async fn healthy_multipart_completes_without_speculation() {
         .segments
         .iter()
         .all(|segment| segment.attempts == 1 && segment.hedges == 0));
+}
+
+#[tokio::test]
+async fn same_digest_transfers_use_distinct_staging_files_and_converge() {
+    let data = Arc::new(vec![31_u8; 80_000]);
+    let server = test_server({
+        let data = Arc::clone(&data);
+        move |request, stream| {
+            assert_eq!(request.range, None);
+            write_response(stream, "200 OK", data.len(), None, &data);
+        }
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let prefix = glu_core::Prefix(temp.path().to_path_buf());
+    let cache = crate::download::cache::ArtifactCache::new(&prefix);
+    cache.ensure_dirs().await.unwrap();
+    let digest = sha256(&data);
+    let first_path = cache.temp_path_for_sha256(&digest).unwrap();
+    let second_path = cache.temp_path_for_sha256(&digest).unwrap();
+    assert_ne!(first_path, second_path);
+
+    let manager = test_manager(TransferPolicy::default());
+    let first = manager.download_with_header_to_path(
+        &server.url,
+        &first_path,
+        &digest,
+        Some(data.len() as u64),
+        None,
+        Arc::new(|_| {}),
+    );
+    let second = manager.download_with_header_to_path(
+        &server.url,
+        &second_path,
+        &digest,
+        Some(data.len() as u64),
+        None,
+        Arc::new(|_| {}),
+    );
+    let (first, second) = tokio::join!(first, second);
+    let first = first.unwrap();
+    let second = second.unwrap();
+    first.validate_staging_path(&first_path).await.unwrap();
+    second.validate_staging_path(&second_path).await.unwrap();
+
+    let cached = cache.path_for_sha256(&digest);
+    tokio::fs::rename(&first_path, &cached).await.unwrap();
+    tokio::fs::rename(&second_path, &cached).await.unwrap();
+    assert_eq!(tokio::fs::read(&cached).await.unwrap(), *data);
 }
 
 #[tokio::test]

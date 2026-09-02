@@ -1,8 +1,8 @@
 use super::{
     report_progress, validate_content_range, AttemptFailure, AttemptKind, ByteRange, HedgeDecision,
-    SegmentReport, TransferManager,
+    SegmentReport, StagingFile, TransferManager,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use futures_util::StreamExt;
 use reqwest::{header, StatusCode};
 use std::{
@@ -14,15 +14,13 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::{
-    io::{AsyncSeekExt, AsyncWriteExt},
-    task::{AbortHandle, JoinSet},
-};
+use tokio::task::{AbortHandle, JoinSet};
 
 pub(super) struct SegmentJob<F> {
     pub(super) manager: TransferManager,
     pub(super) url: String,
     pub(super) dest: PathBuf,
+    pub(super) staging: StagingFile,
     pub(super) auth_header: Option<(String, String)>,
     pub(super) range: ByteRange,
     pub(super) expected_size: u64,
@@ -41,7 +39,7 @@ struct AttemptTaskResult {
     id: u64,
     kind: AttemptKind,
     hedge_start: Option<u64>,
-    result: std::result::Result<(), AttemptFailure>,
+    result: std::result::Result<Option<StagingFile>, AttemptFailure>,
 }
 
 struct HedgeFileCleanup {
@@ -95,7 +93,7 @@ where
                     AttemptKind::Original | AttemptKind::Resume => {
                         primary = None;
                         match outcome.result {
-                            Ok(()) => {
+                            Ok(None) => {
                                 abort_and_drain(&mut tasks).await;
                                 cleanup_paths(active_hedges.into_values().map(|(_, path)| path)).await;
                                 return Ok(SegmentReport {
@@ -106,6 +104,7 @@ where
                                     resumed: retries > 0,
                                 });
                             }
+                            Ok(Some(_)) => unreachable!("primary attempt returned a hedge file"),
                             Err(error) => {
                                 let retryable = error.retryable();
                                 let retry_after = error.retry_after();
@@ -141,7 +140,7 @@ where
                             continue;
                         };
                         match outcome.result {
-                            Ok(()) => {
+                            Ok(Some(hedge_file)) => {
                                 if let Some((_, handle)) = &primary {
                                     handle.abort();
                                 }
@@ -150,7 +149,7 @@ where
                                 }
                                 abort_and_drain(&mut tasks).await;
                                 let hedge_start = outcome.hedge_start.expect("hedge has a start offset");
-                                commit_hedge(&job, &committed, &hedge_path, hedge_start).await?;
+                                commit_hedge(&job, &committed, &hedge_file, hedge_start).await?;
                                 let mut cleanup = active_hedges.into_values().map(|(_, path)| path).collect::<Vec<_>>();
                                 cleanup.push(hedge_path);
                                 cleanup_paths(cleanup).await;
@@ -162,6 +161,7 @@ where
                                     resumed: retries > 0,
                                 });
                             }
+                            Ok(None) => unreachable!("hedge attempt returned no hedge file"),
                             Err(_) => {
                                 let _ = tokio::fs::remove_file(&hedge_path).await;
                                 if primary.is_none() && active_hedges.is_empty() {
@@ -237,6 +237,7 @@ fn spawn_primary_attempt<F>(
         manager: job.manager.clone(),
         url: job.url.clone(),
         dest: job.dest.clone(),
+        staging: job.staging.clone(),
         auth_header: job.auth_header.clone(),
         range: job.range,
         expected_size: job.expected_size,
@@ -250,7 +251,7 @@ fn spawn_primary_attempt<F>(
         priority: job.priority,
     };
     let handle = tasks.spawn(async move {
-        let result = run_primary_attempt(attempt).await;
+        let result = run_primary_attempt(attempt).await.map(|()| None);
         AttemptTaskResult {
             id,
             kind,
@@ -284,7 +285,7 @@ where
     };
     let hedge_start = job.range.start + received;
     let handle = tasks.spawn(async move {
-        let result = run_hedge_attempt(attempt).await;
+        let result = run_hedge_attempt(attempt).await.map(Some);
         AttemptTaskResult {
             id,
             kind,
@@ -301,6 +302,7 @@ struct PrimaryAttempt<F> {
     manager: TransferManager,
     url: String,
     dest: PathBuf,
+    staging: StagingFile,
     auth_header: Option<(String, String)>,
     range: ByteRange,
     expected_size: u64,
@@ -351,28 +353,22 @@ where
         &attempt.url,
     )?;
 
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .open(&attempt.dest)
-        .await
-        .map_err(|error| AttemptFailure::LocalIo(error.to_string()))?;
-    file.seek(std::io::SeekFrom::Start(request_range.start))
-        .await
-        .map_err(|error| AttemptFailure::LocalIo(error.to_string()))?;
-
     let mut stream = response.bytes_stream();
     let mut received = 0_u64;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| AttemptFailure::Body(error.to_string()))?;
+        let offset = request_range.start + received;
         received += chunk.len() as u64;
         if received > request_range.len() {
             return Err(AttemptFailure::Overlong {
                 expected: request_range.len(),
             });
         }
-        file.write_all(&chunk)
+        let chunk = attempt
+            .staging
+            .write_all_at(&attempt.dest, offset, chunk)
             .await
-            .map_err(|error| AttemptFailure::LocalIo(error.to_string()))?;
+            .map_err(|error| AttemptFailure::LocalIo(format!("{error:#}")))?;
         if let Some(hasher) = &attempt.streaming_hasher {
             hasher
                 .lock()
@@ -402,9 +398,6 @@ where
             received,
         });
     }
-    file.flush()
-        .await
-        .map_err(|error| AttemptFailure::LocalIo(error.to_string()))?;
     health.complete();
     Ok(())
 }
@@ -420,7 +413,9 @@ struct HedgeAttempt {
     expected_size: u64,
 }
 
-async fn run_hedge_attempt(attempt: HedgeAttempt) -> std::result::Result<(), AttemptFailure> {
+async fn run_hedge_attempt(
+    attempt: HedgeAttempt,
+) -> std::result::Result<StagingFile, AttemptFailure> {
     // Emergency attempts intentionally bypass the ordinary semaphore. They are bounded by the
     // segment supervisor and exist only after the health classifier declares an emergency.
     let mut health = attempt.manager.health.register(
@@ -443,25 +438,24 @@ async fn run_hedge_attempt(attempt: HedgeAttempt) -> std::result::Result<(), Att
         &attempt.url,
     )?;
 
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&attempt.path)
+    let staging = StagingFile::create(&attempt.path, None)
         .await
-        .map_err(|error| AttemptFailure::LocalIo(error.to_string()))?;
+        .map_err(|error| AttemptFailure::LocalIo(format!("{error:#}")))?;
     let mut stream = response.bytes_stream();
     let mut received = 0_u64;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| AttemptFailure::Body(error.to_string()))?;
+        let offset = received;
         received += chunk.len() as u64;
         if received > attempt.range.len() {
             return Err(AttemptFailure::Overlong {
                 expected: attempt.range.len(),
             });
         }
-        file.write_all(&chunk)
+        let chunk = staging
+            .write_all_at(&attempt.path, offset, chunk)
             .await
-            .map_err(|error| AttemptFailure::LocalIo(error.to_string()))?;
+            .map_err(|error| AttemptFailure::LocalIo(format!("{error:#}")))?;
         health.progress(chunk.len() as u64);
     }
     if received != attempt.range.len() {
@@ -470,11 +464,8 @@ async fn run_hedge_attempt(attempt: HedgeAttempt) -> std::result::Result<(), Att
             received,
         });
     }
-    file.flush()
-        .await
-        .map_err(|error| AttemptFailure::LocalIo(error.to_string()))?;
     health.complete();
-    Ok(())
+    Ok(staging)
 }
 
 async fn send_attempt_request(
@@ -541,31 +532,15 @@ fn validate_attempt_response(
 async fn commit_hedge<F>(
     job: &SegmentJob<F>,
     committed: &AtomicU64,
-    hedge_path: &Path,
+    hedge_file: &StagingFile,
     hedge_start: u64,
 ) -> Result<()>
 where
     F: Fn(u64),
 {
-    let mut input = tokio::fs::File::open(hedge_path)
-        .await
-        .with_context(|| format!("opening {}", hedge_path.display()))?;
-    let mut output = tokio::fs::OpenOptions::new()
-        .write(true)
-        .open(&job.dest)
-        .await
-        .with_context(|| format!("opening {}", job.dest.display()))?;
-    output
-        .seek(std::io::SeekFrom::Start(hedge_start))
-        .await
-        .with_context(|| format!("seeking {}", job.dest.display()))?;
-    tokio::io::copy(&mut input, &mut output)
-        .await
-        .with_context(|| format!("committing emergency suffix into {}", job.dest.display()))?;
-    output
-        .flush()
-        .await
-        .with_context(|| format!("flushing {}", job.dest.display()))?;
+    hedge_file
+        .copy_to_at(&job.staging, &job.dest, hedge_start)
+        .await?;
 
     let old = committed.swap(job.range.len(), Ordering::AcqRel);
     let newly_committed = job.range.len().saturating_sub(old);

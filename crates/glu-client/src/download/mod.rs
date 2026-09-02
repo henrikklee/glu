@@ -165,8 +165,7 @@ impl ArtifactDownloader {
             });
         }
 
-        let temp = self.cache.temp_path_for_artifact(artifact);
-        let _ = tokio::fs::remove_file(&temp).await;
+        let temp = self.cache.temp_path_for_artifact(artifact)?;
         let _temp_cleanup = TempArtifactCleanup { path: &temp };
 
         let report = match self
@@ -192,6 +191,10 @@ impl ArtifactDownloader {
             return Err(error)
                 .with_context(|| format!("validating transfer report for artifact {}", id.0));
         }
+        report
+            .validate_staging_path(&temp)
+            .await
+            .with_context(|| format!("validating staging file for artifact {}", id.0))?;
         // Cache admission boundary: the temp file reached here only after download-side
         // sha256 verification and sync. After this rename, `sha256/<digest>` means
         // "verified at ingest"; prepare still re-verifies every use before commit.

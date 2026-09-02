@@ -10,6 +10,9 @@ use request::RequestCoordinator;
 use reqwest::{header, StatusCode};
 use session::{cleanup_hedge_files, run_segment, SegmentJob};
 use std::{
+    fs::File,
+    io::{self, ErrorKind},
+    os::unix::fs::{FileExt, MetadataExt},
     path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -17,10 +20,153 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    task::JoinSet,
-};
+use tokio::task::JoinSet;
+
+#[derive(Debug, Clone)]
+struct StagingFile {
+    file: Arc<File>,
+}
+
+impl StagingFile {
+    async fn create(path: &Path, len: Option<u64>) -> Result<Self> {
+        let mut options = tokio::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true).mode(0o600);
+        let file = options
+            .open(path)
+            .await
+            .with_context(|| format!("creating {}", path.display()))?;
+        if let Some(len) = len {
+            file.set_len(len)
+                .await
+                .with_context(|| format!("sizing {}", path.display()))?;
+        }
+        Ok(Self {
+            file: Arc::new(file.into_std().await),
+        })
+    }
+
+    async fn truncate(&self, path: &Path) -> Result<()> {
+        let file = Arc::clone(&self.file);
+        tokio::task::spawn_blocking(move || file.set_len(0))
+            .await
+            .context("staging truncate task failed")?
+            .with_context(|| format!("truncating {}", path.display()))
+    }
+
+    /// Writes at an explicit offset through the retained descriptor. `pwrite`
+    /// has no shared cursor, so multipart segments remain fully concurrent.
+    async fn write_all_at<B>(&self, path: &Path, offset: u64, bytes: B) -> Result<B>
+    where
+        B: AsRef<[u8]> + Send + 'static,
+    {
+        let file = Arc::clone(&self.file);
+        tokio::task::spawn_blocking(move || {
+            positioned_write_all(&file, offset, bytes.as_ref())?;
+            Ok::<_, io::Error>(bytes)
+        })
+        .await
+        .context("positioned staging write task failed")?
+        .with_context(|| format!("writing {}", path.display()))
+    }
+
+    async fn copy_to_at(&self, target: &Self, target_path: &Path, offset: u64) -> Result<u64> {
+        let source = Arc::clone(&self.file);
+        let target = Arc::clone(&target.file);
+        tokio::task::spawn_blocking(move || positioned_copy(&source, &target, offset))
+            .await
+            .context("positioned hedge commit task failed")?
+            .with_context(|| format!("committing emergency suffix into {}", target_path.display()))
+    }
+
+    async fn sha256(&self, path: &Path) -> Result<String> {
+        let file = Arc::clone(&self.file);
+        tokio::task::spawn_blocking(move || sha256_file_descriptor(&file))
+            .await
+            .context("staging hash task failed")?
+            .with_context(|| format!("reading {}", path.display()))
+    }
+
+    async fn sync_all(&self, path: &Path) -> Result<()> {
+        let file = Arc::clone(&self.file);
+        tokio::task::spawn_blocking(move || file.sync_all())
+            .await
+            .context("staging sync task failed")?
+            .with_context(|| format!("syncing {}", path.display()))
+    }
+
+    async fn validate_path_identity(&self, path: &Path) -> Result<()> {
+        let file = Arc::clone(&self.file);
+        let descriptor = tokio::task::spawn_blocking(move || file.metadata())
+            .await
+            .context("staging metadata task failed")?
+            .with_context(|| format!("reading staging descriptor for {}", path.display()))?;
+        let named = tokio::fs::symlink_metadata(path)
+            .await
+            .with_context(|| format!("reading staging path {}", path.display()))?;
+        if !named.file_type().is_file()
+            || descriptor.dev() != named.dev()
+            || descriptor.ino() != named.ino()
+        {
+            bail!(
+                "staging path identity changed during download: {}",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+fn positioned_write_all(file: &File, mut offset: u64, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match file.write_at(bytes, offset) {
+            Ok(0) => return Err(io::Error::from(ErrorKind::WriteZero)),
+            Ok(written) => {
+                offset = offset.checked_add(written as u64).ok_or_else(|| {
+                    io::Error::new(ErrorKind::InvalidInput, "write offset overflow")
+                })?;
+                bytes = &bytes[written..];
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn positioned_copy(source: &File, target: &File, target_offset: u64) -> io::Result<u64> {
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut source_offset = 0_u64;
+    loop {
+        let read = match source.read_at(&mut buffer, source_offset) {
+            Ok(read) => read,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if read == 0 {
+            return Ok(source_offset);
+        }
+        positioned_write_all(target, target_offset + source_offset, &buffer[..read])?;
+        source_offset += read as u64;
+    }
+}
+
+fn sha256_file_descriptor(file: &File) -> io::Result<String> {
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut offset = 0_u64;
+    loop {
+        let read = match file.read_at(&mut buffer, offset) {
+            Ok(read) => read,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if read == 0 {
+            return Ok(crate::hash::hex_lower(hasher.finish().as_ref()));
+        }
+        hasher.update(&buffer[..read]);
+        offset += read as u64;
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TransferManager {
@@ -139,19 +285,10 @@ impl TransferManager {
             bail!("artifact {url} has an invalid expected size of zero");
         }
 
-        // Create the staging artifact exclusively. It is pre-sized so disjoint segment writers
-        // can seek without growing it or exposing partial bytes in the
-        // admitted digest cache.
-        let file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(dest)
-            .await
-            .with_context(|| format!("creating {}", dest.display()))?;
-        file.set_len(expected_size)
-            .await
-            .with_context(|| format!("sizing {}", dest.display()))?;
-        drop(file);
+        // Create the staging artifact exclusively and retain that descriptor through every
+        // segment write, verification pass, and sync. Cursor-free positioned writes preserve
+        // full multipart concurrency without ever reopening the pathname.
+        let staging = StagingFile::create(dest, Some(expected_size)).await?;
 
         let ranges = segment_ranges(expected_size, &self.policy);
         let is_whole_request = ranges.len() == 1;
@@ -172,6 +309,7 @@ impl TransferManager {
                 manager: self.clone(),
                 url: url.to_string(),
                 dest: dest.to_path_buf(),
+                staging: staging.clone(),
                 auth_header: auth_header.clone(),
                 range,
                 expected_size,
@@ -216,19 +354,20 @@ impl TransferManager {
                         .expect("streaming hash context already consumed");
                     crate::hash::hex_lower(context.finish().as_ref())
                 }
-                None => sha256_file(dest).await?,
+                None => staging.sha256(dest).await?,
             }
         } else {
-            sha256_file(dest).await?
+            staging.sha256(dest).await?
         };
         if !actual.eq_ignore_ascii_case(expected_sha256) {
             return Err(Sha256Mismatch::new(url, expected_sha256, actual).into());
         }
-        sync_file(dest).await?;
+        staging.sync_all(dest).await?;
 
         segment_reports.sort_by_key(|report| report.start);
         Ok(TransferReport {
             segments: segment_reports,
+            staging,
         })
     }
 
@@ -244,14 +383,9 @@ impl TransferManager {
     where
         F: Fn(u64) + Send + Sync + 'static,
     {
-        // Unknown-size retries restart the whole response, but retain this exclusively created
-        // descriptor so a pathname replacement cannot turn a retry into a symlink write.
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(dest)
-            .await
-            .with_context(|| format!("creating {}", dest.display()))?;
+        // Unknown-size retries restart the whole response through the same exclusively created
+        // descriptor, which is also retained for verification and synchronization.
+        let staging = StagingFile::create(dest, None).await?;
         let mut retries = 0_u32;
         let mut max_reported = 0_u64;
         loop {
@@ -300,12 +434,7 @@ impl TransferManager {
                 }
             };
 
-            file.set_len(0)
-                .await
-                .with_context(|| format!("truncating {}", dest.display()))?;
-            file.seek(std::io::SeekFrom::Start(0))
-                .await
-                .with_context(|| format!("seeking {}", dest.display()))?;
+            staging.truncate(dest).await?;
             let mut stream = response.bytes_stream();
             let mut received = 0_u64;
             let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
@@ -313,9 +442,7 @@ impl TransferManager {
             while let Some(chunk) = stream.next().await {
                 match chunk {
                     Ok(chunk) => {
-                        file.write_all(&chunk)
-                            .await
-                            .with_context(|| format!("writing {}", dest.display()))?;
+                        let chunk = staging.write_all_at(dest, received, chunk).await?;
                         hasher.update(&chunk);
                         received += chunk.len() as u64;
                         if received > max_reported {
@@ -338,16 +465,11 @@ impl TransferManager {
                 tokio::time::sleep(self.policy.retry_delay(retries)).await;
                 continue;
             }
-            file.flush()
-                .await
-                .with_context(|| format!("flushing {}", dest.display()))?;
-            drop(file);
-
             let actual = crate::hash::hex_lower(hasher.finish().as_ref());
             if !actual.eq_ignore_ascii_case(expected_sha256) {
                 return Err(Sha256Mismatch::new(url, expected_sha256, actual).into());
             }
-            sync_file(dest).await?;
+            staging.sync_all(dest).await?;
             return Ok(TransferReport {
                 segments: vec![SegmentReport {
                     start: 0,
@@ -356,6 +478,7 @@ impl TransferManager {
                     hedges: 0,
                     resumed: retries > 0,
                 }],
+                staging,
             });
         }
     }
@@ -496,9 +619,14 @@ impl AttemptFailure {
 #[derive(Debug, Clone)]
 pub(crate) struct TransferReport {
     segments: Vec<SegmentReport>,
+    staging: StagingFile,
 }
 
 impl TransferReport {
+    pub(crate) async fn validate_staging_path(&self, path: &Path) -> Result<()> {
+        self.staging.validate_path_identity(path).await
+    }
+
     pub(crate) fn validate(&self, expected_size: Option<u64>) -> Result<()> {
         if self.segments.is_empty() {
             bail!("transfer completed without segment reports");
@@ -599,38 +727,6 @@ fn report_progress<F>(
             Err(current) => last = current,
         }
     }
-}
-
-async fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .with_context(|| format!("opening {}", path.display()))?;
-    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
-    let mut buffer = vec![0_u8; 1024 * 1024];
-
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .await
-            .with_context(|| format!("reading {}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-
-    Ok(crate::hash::hex_lower(hasher.finish().as_ref()))
-}
-
-async fn sync_file(path: &Path) -> Result<()> {
-    let file = tokio::fs::OpenOptions::new()
-        .read(true)
-        .open(path)
-        .await
-        .with_context(|| format!("opening {} for sync", path.display()))?;
-    file.sync_all()
-        .await
-        .with_context(|| format!("syncing {}", path.display()))
 }
 
 fn segment_ranges(size: u64, policy: &TransferPolicy) -> Vec<ByteRange> {
