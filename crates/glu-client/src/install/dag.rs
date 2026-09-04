@@ -258,7 +258,10 @@ pub fn make_execution_plan(
                 "version": package.keg_version.0,
             }),
             outputs: json!({ "artifact": package.artifact.0, "tarball": cache_path }),
-            subphases: vec![],
+            subphases: ["wait_first_byte", "body_write", "verify", "sync"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             priority: priorities.get(package_id).copied().unwrap_or(0.0),
         });
         if uncached.contains(package_id) {

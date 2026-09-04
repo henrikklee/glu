@@ -5,7 +5,10 @@ use crate::{
         prepare::{perl_relocation_path, prepare_bottle, PrepareInput, PreparedKeg},
         writer::WriterPool,
     },
-    download::{cache::ArtifactCache, ArtifactDownloader, DownloadProgress, VerifiedArtifact},
+    download::{
+        cache::ArtifactCache, transfer_failure_diagnostics, ArtifactDownloader, DownloadProgress,
+        VerifiedArtifact,
+    },
     events::ExecutionEvents,
     install::{
         dag::ExecutionPlan,
@@ -200,10 +203,19 @@ impl SchedulerInstallOperations {
 
     async fn ghcr_bottle_download(
         &self,
-        package_id: &PackageId,
-        cached: bool,
-        priority: u64,
+        node: &crate::install::dag::ExecNode,
+        ctx: &ExecutionContext,
     ) -> Result<()> {
+        let package_id = node
+            .package_id
+            .as_ref()
+            .context("download node missing package_id")?;
+        let cached = node
+            .inputs
+            .get("cached")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let node_id = node.id.as_str();
         let package = self.manifest.require_package(package_id)?;
         let artifact = self.manifest.require_artifact(&package.artifact)?;
 
@@ -221,24 +233,65 @@ impl SchedulerInstallOperations {
                     path,
                     sha256: artifact.sha256.clone(),
                     reused: true,
+                    transfer_diagnostics: None,
                 },
             );
             return Ok(());
         }
 
-        let node_id = crate::install::dag::NodeKind::GhcrBottleDownload.node_id(&package.name.0);
+        let progress_node_id = node_id.to_string();
         let progress = self.download_progress.clone();
-        let verified = self
+        let timing_start = ctx.now();
+        let verified = match self
             .downloader
             .get_or_download_with_priority(
                 package.artifact.clone(),
                 artifact,
-                priority,
+                node.priority as u64,
                 move |bytes| {
-                    progress.report(&node_id, bytes);
+                    progress.report(&progress_node_id, bytes);
                 },
             )
-            .await?;
+            .await
+        {
+            Ok(verified) => verified,
+            Err(error) => {
+                if let Some(diagnostics) = transfer_failure_diagnostics(&error) {
+                    ctx.put_artifact(
+                        format!("download:{node_id}"),
+                        serde_json::to_value(diagnostics)
+                            .context("serializing failed transfer diagnostics")?,
+                    );
+                }
+                return Err(error);
+            }
+        };
+        if let Some(diagnostics) = &verified.transfer_diagnostics {
+            if let Some([first_body, body_complete, verify_complete, sync_complete]) =
+                diagnostics.subphase_boundaries()
+            {
+                for (phase, start, end) in [
+                    ("wait_first_byte", 0.0, first_body),
+                    ("body_write", first_body, body_complete),
+                    ("verify", body_complete, verify_complete),
+                    ("sync", verify_complete, sync_complete),
+                ] {
+                    ctx.record_subphase(RuntimeSubphase {
+                        node_id,
+                        phase,
+                        start: timing_start + start,
+                        end: timing_start + end,
+                        status: "ok",
+                        pool: node.pool.as_str(),
+                        slot: node.slot,
+                    });
+                }
+            }
+            ctx.put_artifact(
+                format!("download:{node_id}"),
+                serde_json::to_value(diagnostics).context("serializing transfer diagnostics")?,
+            );
+        }
         if verified.reused {
             self.stats.reused.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -800,19 +853,7 @@ impl InstallOperations for SchedulerInstallOperations {
             use crate::install::dag::NodeKind;
             match node.kind {
                 NodeKind::GhcrAuth => self.ghcr_auth().await,
-                NodeKind::GhcrBottleDownload => {
-                    let package_id = node
-                        .package_id
-                        .as_ref()
-                        .context("download node missing package_id")?;
-                    let cached = node
-                        .inputs
-                        .get("cached")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false);
-                    self.ghcr_bottle_download(package_id, cached, node.priority as u64)
-                        .await
-                }
+                NodeKind::GhcrBottleDownload => self.ghcr_bottle_download(node, &ctx).await,
                 NodeKind::BottlePrepare => {
                     let package_id = node
                         .package_id

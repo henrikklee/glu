@@ -1,12 +1,13 @@
 use super::{
-    report_progress, validate_content_range, AttemptFailure, AttemptKind, ByteRange, HedgeDecision,
-    SegmentReport, StagingFile, TransferManager,
+    report_progress, retry_after, validate_content_range, ArtifactActivity, AttemptFailure,
+    AttemptKind, AttemptProgress, ByteRange, SegmentReport, StagingFile, TransferEvent,
+    TransferRuntime, TransferTrace,
 };
-use anyhow::{bail, Result};
+use anyhow::Result;
 use futures_util::StreamExt;
 use reqwest::{header, StatusCode};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -14,10 +15,12 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::task::{AbortHandle, JoinSet};
+use tokio::{sync::OwnedSemaphorePermit, task::JoinSet};
 
 pub(super) struct SegmentJob<F> {
-    pub(super) manager: TransferManager,
+    pub(super) runtime: TransferRuntime,
+    pub(super) activity: ArtifactActivity,
+    pub(super) trace: Arc<TransferTrace>,
     pub(super) url: String,
     pub(super) dest: PathBuf,
     pub(super) staging: StagingFile,
@@ -38,15 +41,37 @@ pub(super) struct SegmentJob<F> {
 struct AttemptTaskResult {
     id: u64,
     kind: AttemptKind,
-    hedge_start: Option<u64>,
-    result: std::result::Result<Option<StagingFile>, AttemptFailure>,
+    result: std::result::Result<AttemptOutput, AttemptFailure>,
 }
 
-struct HedgeFileCleanup {
+#[derive(Debug)]
+enum AttemptOutput {
+    Primary,
+    Emergency {
+        staging: StagingFile,
+        start: u64,
+        path: PathBuf,
+    },
+}
+
+struct ActivePrimary {
+    id: u64,
+    handle: tokio::task::AbortHandle,
+    progress: Arc<AttemptProgress>,
+    range: ByteRange,
+}
+
+struct ActiveEmergency {
+    id: u64,
+    handle: tokio::task::AbortHandle,
+    path: PathBuf,
+}
+
+struct EmergencyFileCleanup {
     paths: BTreeSet<PathBuf>,
 }
 
-impl Drop for HedgeFileCleanup {
+impl Drop for EmergencyFileCleanup {
     fn drop(&mut self) {
         for path in &self.paths {
             let _ = std::fs::remove_file(path);
@@ -59,28 +84,23 @@ where
     F: Fn(u64) + Send + Sync + 'static,
 {
     let committed = Arc::new(AtomicU64::new(0));
-    // Declared before the JoinSet so task handles are dropped and aborted before synchronous
-    // cancellation cleanup unlinks any open hedge files.
-    let mut hedge_cleanup = HedgeFileCleanup {
+    let mut cleanup = EmergencyFileCleanup {
         paths: BTreeSet::new(),
     };
     let mut tasks = JoinSet::new();
-    let mut primary: Option<(u64, AbortHandle)> = None;
-    let mut active_hedges = BTreeMap::<u64, (AbortHandle, PathBuf)>::new();
-    let mut attempts = 0_u32;
-    let mut retries = 0_u32;
-    let mut hedges = 0_u32;
-    let mut last_primary_error: Option<AttemptFailure> = None;
-
-    spawn_primary_attempt(
+    let mut primary = Some(spawn_primary_attempt(
         &job,
         &committed,
-        AttemptKind::Original,
+        AttemptKind::Initial,
         &mut tasks,
-        &mut primary,
-    );
-    attempts += 1;
-    let mut monitor = tokio::time::interval(job.manager.policy.monitor_interval);
+    ));
+    let mut emergency: Option<ActiveEmergency> = None;
+    let mut attempts = 1_u32;
+    let mut retries = 0_u32;
+    let mut emergencies = 0_u32;
+    let mut emergency_used = false;
+    let mut last_primary_error: Option<AttemptFailure> = None;
+    let mut monitor = tokio::time::interval(job.runtime.policy.monitor_interval);
     monitor.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
@@ -88,134 +108,178 @@ where
             biased;
             joined = tasks.join_next(), if !tasks.is_empty() => {
                 let Some(joined) = joined else { continue };
-                let outcome = joined.map_err(|error| anyhow::anyhow!("segment attempt task failed: {error}"))?;
+                let outcome = joined.map_err(|error| anyhow::anyhow!("range attempt task failed: {error}"))?;
                 match outcome.kind {
-                    AttemptKind::Original | AttemptKind::Resume => {
+                    AttemptKind::Initial | AttemptKind::Retry => {
                         primary = None;
                         match outcome.result {
-                            Ok(None) => {
+                            Ok(AttemptOutput::Primary) => {
+                                if let Some(active) = &emergency {
+                                    job.trace.attempt_cancelled(active.id, job.runtime.counts());
+                                    active.handle.abort();
+                                }
                                 abort_and_drain(&mut tasks).await;
-                                cleanup_paths(active_hedges.into_values().map(|(_, path)| path)).await;
+                                if let Some(active) = emergency.take() {
+                                    cleanup.paths.remove(&active.path);
+                                    let _ = tokio::fs::remove_file(active.path).await;
+                                }
+                                job.activity.mark_range_complete();
+                                record_range_completed(&job, outcome.id);
                                 return Ok(SegmentReport {
                                     start: job.range.start,
                                     end: job.range.end,
                                     attempts,
-                                    hedges,
+                                    emergencies,
                                     resumed: retries > 0,
                                 });
                             }
-                            Ok(Some(_)) => unreachable!("primary attempt returned a hedge file"),
+                            Ok(AttemptOutput::Emergency { .. }) => unreachable!("primary returned emergency output"),
                             Err(error) => {
                                 let retryable = error.retryable();
-                                let retry_after = error.retry_after();
                                 last_primary_error = Some(error);
-                                if !retryable && active_hedges.is_empty() {
-                                    abort_and_drain(&mut tasks).await;
-                                    cleanup_paths(active_hedges.into_values().map(|(_, path)| path)).await;
-                                    return Err(segment_failure(&job, attempts, last_primary_error.take().unwrap()));
-                                }
-                                if active_hedges.is_empty() {
-                                    if retries >= job.manager.policy.max_retries || !retryable {
-                                        return Err(segment_failure(&job, attempts, last_primary_error.take().unwrap()));
+                                if emergency.is_none() {
+                                    if retryable && committed.load(Ordering::Acquire) >= job.range.len() {
+                                        job.activity.mark_range_complete();
+                                        record_range_completed(&job, outcome.id);
+                                        return Ok(SegmentReport {
+                                            start: job.range.start,
+                                            end: job.range.end,
+                                            attempts,
+                                            emergencies,
+                                            resumed: retries > 0,
+                                        });
                                     }
-                                    retries += 1;
-                                    tokio::time::sleep(
-                                        retry_after.unwrap_or_else(|| job.manager.policy.retry_delay(retries)),
-                                    )
-                                    .await;
-                                    spawn_primary_attempt(
+                                    if !retryable {
+                                        return Err(range_failure(
+                                            &job,
+                                            attempts,
+                                            last_primary_error.take().expect("primary error exists"),
+                                        ));
+                                    }
+                                    retries = retries.saturating_add(1);
+                                    let delay = last_primary_error
+                                        .as_ref()
+                                        .and_then(AttemptFailure::retry_after)
+                                        .unwrap_or_else(|| job.runtime.policy.retry_delay(retries));
+                                    job.trace.retry_scheduled(outcome.id, delay, job.runtime.counts());
+                                    tokio::time::sleep(delay).await;
+                                    primary = Some(spawn_primary_attempt(
                                         &job,
                                         &committed,
-                                        AttemptKind::Resume,
+                                        AttemptKind::Retry,
                                         &mut tasks,
-                                        &mut primary,
-                                    );
-                                    attempts += 1;
+                                    ));
+                                    attempts = attempts.saturating_add(1);
                                 }
                             }
                         }
                     }
-                    AttemptKind::Diagnostic | AttemptKind::Hedge => {
-                        let Some((_, hedge_path)) = active_hedges.remove(&outcome.id) else {
-                            continue;
-                        };
+                    AttemptKind::Emergency => {
+                        let Some(active) = emergency.take() else { continue };
+                        cleanup.paths.remove(&active.path);
                         match outcome.result {
-                            Ok(Some(hedge_file)) => {
-                                if let Some((_, handle)) = &primary {
-                                    handle.abort();
-                                }
-                                for (handle, _) in active_hedges.values() {
-                                    handle.abort();
+                            Ok(AttemptOutput::Emergency { staging, start, path }) => {
+                                if let Some(active) = &primary {
+                                    job.trace.attempt_cancelled(active.id, job.runtime.counts());
+                                    active.handle.abort();
                                 }
                                 abort_and_drain(&mut tasks).await;
-                                let hedge_start = outcome.hedge_start.expect("hedge has a start offset");
-                                commit_hedge(&job, &committed, &hedge_file, hedge_start).await?;
-                                let mut cleanup = active_hedges.into_values().map(|(_, path)| path).collect::<Vec<_>>();
-                                cleanup.push(hedge_path);
-                                cleanup_paths(cleanup).await;
+                                commit_emergency(&job, &committed, &staging, start).await?;
+                                let mut event = TransferEvent::simple("emergency_won");
+                                event.attempt = Some(outcome.id);
+                                event.range = Some(ByteRange { start, end: job.range.end });
+                                event.ordinary_in_flight = job.runtime.ordinary.active();
+                                event.emergency_in_flight = job.runtime.emergency_active();
+                                job.trace.record(event);
+                                let _ = tokio::fs::remove_file(path).await;
+                                job.activity.mark_range_complete();
+                                record_range_completed(&job, outcome.id);
                                 return Ok(SegmentReport {
                                     start: job.range.start,
                                     end: job.range.end,
                                     attempts,
-                                    hedges,
+                                    emergencies,
                                     resumed: retries > 0,
                                 });
                             }
-                            Ok(None) => unreachable!("hedge attempt returned no hedge file"),
+                            Ok(AttemptOutput::Primary) => unreachable!("emergency returned primary output"),
                             Err(_) => {
-                                let _ = tokio::fs::remove_file(&hedge_path).await;
-                                if primary.is_none() && active_hedges.is_empty() {
-                                    let Some(error) = last_primary_error.take() else {
-                                        bail!("all attempts ended without a segment result");
-                                    };
-                                    if retries >= job.manager.policy.max_retries || !error.retryable() {
-                                        return Err(segment_failure(&job, attempts, error));
+                                let _ = tokio::fs::remove_file(active.path).await;
+                                if primary.is_none() {
+                                    let error = last_primary_error.take().ok_or_else(|| {
+                                        anyhow::anyhow!("all range attempts ended without a result")
+                                    })?;
+                                    if !error.retryable() {
+                                        return Err(range_failure(&job, attempts, error));
                                     }
-                                    let retry_after = error.retry_after();
-                                    retries += 1;
-                                    tokio::time::sleep(
-                                        retry_after.unwrap_or_else(|| job.manager.policy.retry_delay(retries)),
-                                    )
-                                    .await;
-                                    spawn_primary_attempt(
+                                    if committed.load(Ordering::Acquire) >= job.range.len() {
+                                        job.activity.mark_range_complete();
+                                        record_range_completed(&job, outcome.id);
+                                        return Ok(SegmentReport {
+                                            start: job.range.start,
+                                            end: job.range.end,
+                                            attempts,
+                                            emergencies,
+                                            resumed: retries > 0,
+                                        });
+                                    }
+                                    retries = retries.saturating_add(1);
+                                    let delay = error
+                                        .retry_after()
+                                        .unwrap_or_else(|| job.runtime.policy.retry_delay(retries));
+                                    job.trace.retry_scheduled(outcome.id, delay, job.runtime.counts());
+                                    tokio::time::sleep(delay).await;
+                                    primary = Some(spawn_primary_attempt(
                                         &job,
                                         &committed,
-                                        AttemptKind::Resume,
+                                        AttemptKind::Retry,
                                         &mut tasks,
-                                        &mut primary,
-                                    );
-                                    attempts += 1;
+                                    ));
+                                    attempts = attempts.saturating_add(1);
                                 }
                             }
                         }
                     }
                 }
             }
-            _ = monitor.tick(), if primary.is_some() && hedges < job.manager.policy.max_hedges => {
-                let Some((primary_id, _)) = &primary else { continue };
-                let existing_hedge_id = active_hedges.keys().next().copied();
-                let target_id = existing_hedge_id.unwrap_or(*primary_id);
-                let decision = job.manager.health.hedge_decision(target_id, &job.manager.policy);
-                let kind = if existing_hedge_id.is_some() {
-                    (decision == HedgeDecision::Localized).then_some(AttemptKind::Hedge)
-                } else {
-                    decision.attempt_kind()
+            _ = monitor.tick(), if primary.is_some()
+                && emergency.is_none()
+                && !emergency_used
+                && emergencies < job.runtime.policy.emergency_per_range =>
+            {
+                let Some(active) = &primary else { continue };
+                let Some(tail) = job.activity.tail_eligible() else { continue };
+                let Some(health) = active.progress.snapshot(active.range, &job.runtime.policy) else {
+                    continue;
                 };
-                if let Some(kind) = kind {
-                    let received = committed.load(Ordering::Acquire);
-                    if received < job.range.len() {
-                        let (id, handle, path) = spawn_hedge_attempt(
-                            &job,
-                            received,
-                            kind,
-                            &mut tasks,
-                        );
-                        hedge_cleanup.paths.insert(path.clone());
-                        active_hedges.insert(id, (handle, path));
-                        hedges += 1;
-                        attempts += 1;
-                    }
+                let Some(permit) = job.runtime.try_emergency() else { continue };
+                let received = committed.load(Ordering::Acquire);
+                if received >= job.range.len() {
+                    drop(permit);
+                    continue;
                 }
+                let remaining = job.range.remaining_after(received);
+                let id = job.runtime.next_attempt_id();
+                job.trace.emergency_triggered(
+                    id,
+                    remaining,
+                    job.priority,
+                    tail,
+                    health,
+                    job.runtime.counts(),
+                );
+                let active = spawn_emergency_attempt(
+                    &job,
+                    remaining,
+                    id,
+                    permit,
+                    &mut tasks,
+                );
+                cleanup.paths.insert(active.path.clone());
+                emergency = Some(active);
+                emergency_used = true;
+                emergencies += 1;
+                attempts = attempts.saturating_add(1);
             }
         }
     }
@@ -226,22 +290,26 @@ fn spawn_primary_attempt<F>(
     committed: &Arc<AtomicU64>,
     kind: AttemptKind,
     tasks: &mut JoinSet<AttemptTaskResult>,
-    primary: &mut Option<(u64, AbortHandle)>,
-) where
+) -> ActivePrimary
+where
     F: Fn(u64) + Send + Sync + 'static,
 {
-    let id = job.manager.next_attempt_id();
+    let id = job.runtime.next_attempt_id();
+    let already_received = committed.load(Ordering::Acquire);
+    let request_range = job.range.remaining_after(already_received);
+    let progress = Arc::new(AttemptProgress::new(job.runtime.policy.rolling_window));
     let attempt = PrimaryAttempt {
         id,
         kind,
-        manager: job.manager.clone(),
+        runtime: job.runtime.clone(),
+        trace: Arc::clone(&job.trace),
         url: job.url.clone(),
         dest: job.dest.clone(),
         staging: job.staging.clone(),
         auth_header: job.auth_header.clone(),
-        range: job.range,
+        range: request_range,
         expected_size: job.expected_size,
-        whole_request: kind == AttemptKind::Original && job.initial_whole_request,
+        whole_request: kind == AttemptKind::Initial && job.initial_whole_request,
         committed: Arc::clone(committed),
         downloaded: Arc::clone(&job.downloaded),
         last_reported: Arc::clone(&job.last_reported),
@@ -249,57 +317,74 @@ fn spawn_primary_attempt<F>(
         on_progress: Arc::clone(&job.on_progress),
         streaming_hasher: job.streaming_hasher.clone(),
         priority: job.priority,
+        progress: Arc::clone(&progress),
     };
+    job.trace
+        .attempt_queued(id, kind, request_range, job.runtime.counts());
     let handle = tasks.spawn(async move {
-        let result = run_primary_attempt(attempt).await.map(|()| None);
+        let result = run_primary_attempt(attempt).await;
         AttemptTaskResult {
             id,
             kind,
-            hedge_start: None,
-            result,
+            result: result.map(|()| AttemptOutput::Primary),
         }
     });
-    *primary = Some((id, handle));
+    ActivePrimary {
+        id,
+        handle,
+        progress,
+        range: request_range,
+    }
 }
 
-fn spawn_hedge_attempt<F>(
+fn spawn_emergency_attempt<F>(
     job: &SegmentJob<F>,
-    received: u64,
-    kind: AttemptKind,
+    range: ByteRange,
+    id: u64,
+    permit: OwnedSemaphorePermit,
     tasks: &mut JoinSet<AttemptTaskResult>,
-) -> (u64, AbortHandle, PathBuf)
+) -> ActiveEmergency
 where
     F: Fn(u64) + Send + Sync + 'static,
 {
-    let id = job.manager.next_attempt_id();
-    let path = hedge_path(&job.dest, job.segment_index, id);
-    let attempt = HedgeAttempt {
+    let path = emergency_path(&job.dest, job.segment_index, id);
+    let attempt = EmergencyAttempt {
         id,
-        kind,
-        manager: job.manager.clone(),
+        runtime: job.runtime.clone(),
+        trace: Arc::clone(&job.trace),
         url: job.url.clone(),
         path: path.clone(),
         auth_header: job.auth_header.clone(),
-        range: job.range.remaining_after(received),
+        range,
         expected_size: job.expected_size,
+        progress: Arc::new(AttemptProgress::new(job.runtime.policy.rolling_window)),
+        _permit: permit,
     };
-    let hedge_start = job.range.start + received;
+    job.trace
+        .attempt_queued(id, AttemptKind::Emergency, range, job.runtime.counts());
+    let task_path = path.clone();
     let handle = tasks.spawn(async move {
-        let result = run_hedge_attempt(attempt).await.map(Some);
+        let result = run_emergency_attempt(attempt)
+            .await
+            .map(|staging| AttemptOutput::Emergency {
+                staging,
+                start: range.start,
+                path: task_path,
+            });
         AttemptTaskResult {
             id,
-            kind,
-            hedge_start: Some(hedge_start),
+            kind: AttemptKind::Emergency,
             result,
         }
     });
-    (id, handle, path)
+    ActiveEmergency { id, handle, path }
 }
 
 struct PrimaryAttempt<F> {
     id: u64,
     kind: AttemptKind,
-    manager: TransferManager,
+    runtime: TransferRuntime,
+    trace: Arc<TransferTrace>,
     url: String,
     dest: PathBuf,
     staging: StagingFile,
@@ -314,6 +399,7 @@ struct PrimaryAttempt<F> {
     on_progress: Arc<F>,
     streaming_hasher: Option<Arc<Mutex<Option<ring::digest::Context>>>>,
     priority: u64,
+    progress: Arc<AttemptProgress>,
 }
 
 async fn run_primary_attempt<F>(
@@ -322,121 +408,210 @@ async fn run_primary_attempt<F>(
 where
     F: Fn(u64) + Send + Sync + 'static,
 {
+    let queued = Instant::now();
     let _permit = attempt
-        .manager
-        .ordinary_attempts
+        .runtime
+        .ordinary
         .acquire(attempt.priority)
         .await
-        .ok_or(AttemptFailure::CoordinatorClosed)?;
-    let already_received = attempt.committed.load(Ordering::Acquire);
-    if already_received >= attempt.range.len() {
-        return Ok(());
-    }
-    let request_range = attempt.range.remaining_after(already_received);
-    let mut health = attempt.manager.health.register(
+        .ok_or(AttemptFailure::BudgetClosed)?;
+    let mut transport = attempt.runtime.next_ordinary_transport(attempt.range.len());
+    attempt.progress.request_started();
+    attempt.trace.attempt_started(
         attempt.id,
         attempt.kind,
-        request_range,
-        attempt.manager.policy.rolling_window,
+        attempt.range,
+        queued.elapsed(),
+        attempt.runtime.counts(),
+        Some(transport.assignment()),
     );
-    let response = send_attempt_request(
-        attempt.manager.transport.client(),
+    let response = match send_attempt_request(
+        transport.client(),
         &attempt.url,
         attempt.auth_header.as_ref(),
-        (!attempt.whole_request).then_some(request_range),
+        (!attempt.whole_request).then_some(attempt.range),
     )
-    .await?;
-    validate_attempt_response(
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            attempt
+                .trace
+                .attempt_failed(attempt.id, &error, attempt.runtime.counts());
+            return Err(error);
+        }
+    };
+    attempt.trace.response_headers(
+        attempt.id,
+        response.version(),
+        response.status(),
+        super::response_origin(response.url()),
+        attempt.runtime.counts(),
+    );
+    if let Err(error) = validate_attempt_response(
         &response,
-        (!attempt.whole_request).then_some(request_range),
+        (!attempt.whole_request).then_some(attempt.range),
         attempt.expected_size,
         &attempt.url,
-    )?;
+    ) {
+        attempt
+            .trace
+            .attempt_failed(attempt.id, &error, attempt.runtime.counts());
+        return Err(error);
+    }
 
     let mut stream = response.bytes_stream();
     let mut received = 0_u64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| AttemptFailure::Body(error.to_string()))?;
-        let offset = request_range.start + received;
+    let mut pending_write = None;
+    loop {
+        let next = stream.next().await;
+        let chunk = match next {
+            Some(Ok(chunk)) => chunk,
+            Some(Err(source)) => {
+                finish_primary_write(&attempt, pending_write.take()).await?;
+                let error = AttemptFailure::Body(source);
+                attempt
+                    .trace
+                    .attempt_failed(attempt.id, &error, attempt.runtime.counts());
+                return Err(error);
+            }
+            None => break,
+        };
+        let offset = attempt.range.start + received;
         received += chunk.len() as u64;
-        if received > request_range.len() {
-            return Err(AttemptFailure::Overlong {
-                expected: request_range.len(),
-            });
+        if received > attempt.range.len() {
+            finish_primary_write(&attempt, pending_write.take()).await?;
+            let error = AttemptFailure::Overlong {
+                expected: attempt.range.len(),
+            };
+            attempt
+                .trace
+                .attempt_failed(attempt.id, &error, attempt.runtime.counts());
+            return Err(error);
         }
-        let chunk = attempt
-            .staging
-            .write_all_at(&attempt.dest, offset, chunk)
-            .await
-            .map_err(|error| AttemptFailure::LocalIo(format!("{error:#}")))?;
-        if let Some(hasher) = &attempt.streaming_hasher {
-            hasher
-                .lock()
-                .expect("streaming hash lock poisoned")
-                .as_mut()
-                .expect("streaming hash context missing")
-                .update(&chunk);
-        }
-        attempt
-            .committed
-            .fetch_add(chunk.len() as u64, Ordering::Release);
-        health.progress(chunk.len() as u64);
-        let total = attempt
-            .downloaded
-            .fetch_add(chunk.len() as u64, Ordering::Relaxed)
-            + chunk.len() as u64;
-        report_progress(
-            total,
-            &attempt.last_reported,
-            &attempt.last_reported_at,
-            &attempt.on_progress,
+        transport.record_bytes(chunk.len() as u64);
+        record_network_chunk(
+            &attempt.runtime,
+            &attempt.trace,
+            attempt.id,
+            attempt.range,
+            &attempt.progress,
+            chunk.len() as u64,
         );
+        finish_primary_write(&attempt, pending_write.take()).await?;
+        pending_write = Some(attempt.staging.start_write_all_at(offset, chunk));
     }
-    if received != request_range.len() {
-        return Err(AttemptFailure::EarlyEof {
-            expected: request_range.len(),
+    finish_primary_write(&attempt, pending_write.take()).await?;
+    if received != attempt.range.len() {
+        let error = AttemptFailure::EarlyEof {
+            expected: attempt.range.len(),
             received,
-        });
+        };
+        attempt
+            .trace
+            .attempt_failed(attempt.id, &error, attempt.runtime.counts());
+        return Err(error);
     }
-    health.complete();
+    attempt
+        .trace
+        .attempt_completed(attempt.id, received, attempt.runtime.counts());
     Ok(())
 }
 
-struct HedgeAttempt {
+async fn finish_primary_write<F, B>(
+    attempt: &PrimaryAttempt<F>,
+    pending: Option<tokio::task::JoinHandle<std::io::Result<B>>>,
+) -> std::result::Result<(), AttemptFailure>
+where
+    F: Fn(u64) + Send + Sync + 'static,
+    B: AsRef<[u8]> + Send + 'static,
+{
+    let Some(pending) = pending else {
+        return Ok(());
+    };
+    let chunk = StagingFile::finish_write_all_at(&attempt.dest, pending)
+        .await
+        .map_err(|error| AttemptFailure::LocalIo(format!("{error:#}")))?;
+    if let Some(hasher) = &attempt.streaming_hasher {
+        hasher
+            .lock()
+            .expect("streaming hash lock poisoned")
+            .as_mut()
+            .expect("streaming hash context missing")
+            .update(chunk.as_ref());
+    }
+    let len = chunk.as_ref().len() as u64;
+    attempt.committed.fetch_add(len, Ordering::Release);
+    attempt.trace.logical_progress(len);
+    let total = attempt.downloaded.fetch_add(len, Ordering::Relaxed) + len;
+    report_progress(
+        total,
+        &attempt.last_reported,
+        &attempt.last_reported_at,
+        &attempt.on_progress,
+    );
+    Ok(())
+}
+
+struct EmergencyAttempt {
     id: u64,
-    kind: AttemptKind,
-    manager: TransferManager,
+    runtime: TransferRuntime,
+    trace: Arc<TransferTrace>,
     url: String,
     path: PathBuf,
     auth_header: Option<(String, String)>,
     range: ByteRange,
     expected_size: u64,
+    progress: Arc<AttemptProgress>,
+    _permit: OwnedSemaphorePermit,
 }
 
-async fn run_hedge_attempt(
-    attempt: HedgeAttempt,
+async fn run_emergency_attempt(
+    attempt: EmergencyAttempt,
 ) -> std::result::Result<StagingFile, AttemptFailure> {
-    // Emergency attempts intentionally bypass the ordinary semaphore. They are bounded by the
-    // segment supervisor and exist only after the health classifier declares an emergency.
-    let mut health = attempt.manager.health.register(
+    attempt.progress.request_started();
+    attempt.trace.attempt_started(
         attempt.id,
-        attempt.kind,
+        AttemptKind::Emergency,
         attempt.range,
-        attempt.manager.policy.rolling_window,
+        Duration::ZERO,
+        attempt.runtime.counts(),
+        None,
     );
-    let response = send_attempt_request(
-        attempt.manager.transport.client(),
+    let response = match send_attempt_request(
+        &attempt.runtime.emergency_http,
         &attempt.url,
         attempt.auth_header.as_ref(),
         Some(attempt.range),
     )
-    .await?;
-    validate_attempt_response(
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            attempt
+                .trace
+                .attempt_failed(attempt.id, &error, attempt.runtime.counts());
+            return Err(error);
+        }
+    };
+    attempt.trace.response_headers(
+        attempt.id,
+        response.version(),
+        response.status(),
+        super::response_origin(response.url()),
+        attempt.runtime.counts(),
+    );
+    if let Err(error) = validate_attempt_response(
         &response,
         Some(attempt.range),
         attempt.expected_size,
         &attempt.url,
-    )?;
+    ) {
+        attempt
+            .trace
+            .attempt_failed(attempt.id, &error, attempt.runtime.counts());
+        return Err(error);
+    }
 
     let staging = StagingFile::create(&attempt.path, None)
         .await
@@ -444,28 +619,79 @@ async fn run_hedge_attempt(
     let mut stream = response.bytes_stream();
     let mut received = 0_u64;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| AttemptFailure::Body(error.to_string()))?;
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(source) => {
+                let error = AttemptFailure::Body(source);
+                attempt
+                    .trace
+                    .attempt_failed(attempt.id, &error, attempt.runtime.counts());
+                return Err(error);
+            }
+        };
         let offset = received;
         received += chunk.len() as u64;
         if received > attempt.range.len() {
-            return Err(AttemptFailure::Overlong {
+            let error = AttemptFailure::Overlong {
                 expected: attempt.range.len(),
-            });
+            };
+            attempt
+                .trace
+                .attempt_failed(attempt.id, &error, attempt.runtime.counts());
+            return Err(error);
         }
-        let chunk = staging
+        record_network_chunk(
+            &attempt.runtime,
+            &attempt.trace,
+            attempt.id,
+            attempt.range,
+            &attempt.progress,
+            chunk.len() as u64,
+        );
+        staging
             .write_all_at(&attempt.path, offset, chunk)
             .await
             .map_err(|error| AttemptFailure::LocalIo(format!("{error:#}")))?;
-        health.progress(chunk.len() as u64);
     }
     if received != attempt.range.len() {
-        return Err(AttemptFailure::EarlyEof {
+        let error = AttemptFailure::EarlyEof {
             expected: attempt.range.len(),
             received,
-        });
+        };
+        attempt
+            .trace
+            .attempt_failed(attempt.id, &error, attempt.runtime.counts());
+        return Err(error);
     }
-    health.complete();
+    attempt
+        .trace
+        .attempt_completed(attempt.id, received, attempt.runtime.counts());
     Ok(staging)
+}
+
+fn record_network_chunk(
+    runtime: &TransferRuntime,
+    trace: &TransferTrace,
+    attempt_id: u64,
+    range: ByteRange,
+    progress: &AttemptProgress,
+    bytes: u64,
+) {
+    let sample = progress.progress(bytes);
+    trace.wire_bytes.fetch_add(bytes, Ordering::Relaxed);
+    if sample.first || sample.report {
+        let mut event = TransferEvent::simple(if sample.first {
+            "first_body_byte"
+        } else {
+            "attempt_progress"
+        });
+        event.attempt = Some(attempt_id);
+        event.range = Some(range);
+        event.bytes = Some(sample.total);
+        event.ordinary_in_flight = runtime.ordinary.active();
+        event.emergency_in_flight = runtime.emergency_active();
+        trace.record(event);
+    }
 }
 
 async fn send_attempt_request(
@@ -481,10 +707,7 @@ async fn send_attempt_request(
     if let Some(range) = range {
         request = request.header(header::RANGE, range.header_value());
     }
-    request
-        .send()
-        .await
-        .map_err(|error| AttemptFailure::Request(error.to_string()))
+    request.send().await.map_err(AttemptFailure::Request)
 }
 
 fn validate_attempt_response(
@@ -494,22 +717,6 @@ fn validate_attempt_response(
     url: &str,
 ) -> std::result::Result<(), AttemptFailure> {
     let status = response.status();
-    if matches!(
-        status,
-        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
-    ) || status.is_server_error()
-    {
-        let retry_after = response
-            .headers()
-            .get(header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-            .map(Duration::from_secs);
-        return Err(AttemptFailure::RetryableStatus {
-            status,
-            retry_after,
-        });
-    }
     if let Some(range) = range {
         if status != StatusCode::PARTIAL_CONTENT {
             return Err(if status.is_success() {
@@ -518,33 +725,40 @@ fn validate_attempt_response(
                     range.start, range.end
                 ))
             } else {
-                AttemptFailure::HttpStatus(status)
+                AttemptFailure::RetryableStatus {
+                    status,
+                    retry_after: retry_after(response.headers()),
+                }
             });
         }
         validate_content_range(response.headers(), range, expected_size, url)
             .map_err(|error| AttemptFailure::InvalidRange(format!("{error:#}")))?;
     } else if status != StatusCode::OK {
-        return Err(AttemptFailure::HttpStatus(status));
+        return Err(AttemptFailure::RetryableStatus {
+            status,
+            retry_after: retry_after(response.headers()),
+        });
     }
     Ok(())
 }
 
-async fn commit_hedge<F>(
+async fn commit_emergency<F>(
     job: &SegmentJob<F>,
     committed: &AtomicU64,
-    hedge_file: &StagingFile,
-    hedge_start: u64,
+    emergency_file: &StagingFile,
+    emergency_start: u64,
 ) -> Result<()>
 where
     F: Fn(u64),
 {
-    hedge_file
-        .copy_to_at(&job.staging, &job.dest, hedge_start)
+    job.staging.wait_for_pending_writes().await?;
+    emergency_file
+        .copy_to_at(&job.staging, &job.dest, emergency_start)
         .await?;
-
     let old = committed.swap(job.range.len(), Ordering::AcqRel);
     let newly_committed = job.range.len().saturating_sub(old);
     if newly_committed > 0 {
+        job.trace.logical_progress(newly_committed);
         let total = job.downloaded.fetch_add(newly_committed, Ordering::Relaxed) + newly_committed;
         report_progress(
             total,
@@ -556,9 +770,21 @@ where
     Ok(())
 }
 
+fn record_range_completed<F>(job: &SegmentJob<F>, attempt: u64)
+where
+    F: Fn(u64),
+{
+    let mut event = TransferEvent::simple("range_completed");
+    event.attempt = Some(attempt);
+    event.range = Some(job.range);
+    event.ordinary_in_flight = job.runtime.ordinary.active();
+    event.emergency_in_flight = job.runtime.emergency_active();
+    job.trace.record(event);
+}
+
 #[derive(Debug, thiserror::Error)]
-#[error("downloading segment {start}-{end} for {url} failed after {attempts} attempt(s)")]
-struct SegmentTransferFailed {
+#[error("downloading range {start}-{end} for {url} failed after {attempts} attempt(s)")]
+struct RangeTransferFailed {
     start: u64,
     end: u64,
     url: String,
@@ -567,8 +793,8 @@ struct SegmentTransferFailed {
     source: AttemptFailure,
 }
 
-fn segment_failure<F>(job: &SegmentJob<F>, attempts: u32, source: AttemptFailure) -> anyhow::Error {
-    SegmentTransferFailed {
+fn range_failure<F>(job: &SegmentJob<F>, attempts: u32, source: AttemptFailure) -> anyhow::Error {
+    RangeTransferFailed {
         start: job.range.start,
         end: job.range.end,
         url: job.url.clone(),
@@ -583,24 +809,18 @@ async fn abort_and_drain<T: 'static>(tasks: &mut JoinSet<T>) {
     while tasks.join_next().await.is_some() {}
 }
 
-fn hedge_path(dest: &Path, segment_index: usize, attempt_id: u64) -> PathBuf {
+fn emergency_path(dest: &Path, segment_index: usize, attempt_id: u64) -> PathBuf {
     let mut name = dest
         .file_name()
         .map(|name| name.to_os_string())
         .unwrap_or_else(|| "artifact.tmp".into());
     name.push(format!(
-        ".segment-{segment_index}.attempt-{attempt_id}.hedge"
+        ".range-{segment_index}.attempt-{attempt_id}.emergency"
     ));
     dest.with_file_name(name)
 }
 
-async fn cleanup_paths(paths: impl IntoIterator<Item = PathBuf>) {
-    for path in paths {
-        let _ = tokio::fs::remove_file(path).await;
-    }
-}
-
-pub(super) async fn cleanup_hedge_files(dest: &Path) {
+pub(super) async fn cleanup_emergency_files(dest: &Path) {
     let Some(parent) = dest.parent() else {
         return;
     };
@@ -613,7 +833,7 @@ pub(super) async fn cleanup_hedge_files(dest: &Path) {
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with(prefix) && name.ends_with(".hedge") {
+        if name.starts_with(prefix) && name.ends_with(".emergency") {
             let _ = tokio::fs::remove_file(entry.path()).await;
         }
     }

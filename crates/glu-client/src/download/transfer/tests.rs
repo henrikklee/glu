@@ -1,7 +1,7 @@
 use super::{
-    parse_content_range, segment_ranges, should_report, should_use_multipart, AttemptFailure,
-    AttemptHealthRegistry, AttemptKind, ByteRange, HedgeDecision, RequestCoordinator,
-    TransferPolicy, MIB,
+    first_body_byte_latency, parse_content_range, segment_ranges, should_report,
+    should_use_multipart, AttemptFailure, AttemptKind, AttemptProgress, ByteRange, RequestBudget,
+    TransferEvent, TransferFailure, TransferPolicy, MIB,
 };
 use ring::digest;
 use std::{
@@ -31,7 +31,7 @@ fn chunking_starts_above_ten_mib() {
 }
 
 #[test]
-fn segment_ranges_use_target_size_and_cap() {
+fn segment_ranges_stay_fixed_size_for_very_large_artifacts() {
     let ranges = segment_ranges(64 * MIB, &TransferPolicy::default());
     assert_eq!(ranges.len(), 7);
     assert_eq!(ranges.first().unwrap().start, 0);
@@ -39,12 +39,12 @@ fn segment_ranges_use_target_size_and_cap() {
     assert!(ranges.iter().all(|range| range.len() <= 10 * MIB));
     assert_eq!(
         segment_ranges(164 * MIB, &TransferPolicy::default()).len(),
-        16
+        17
     );
-    assert_eq!(
-        segment_ranges(2_240 * MIB, &TransferPolicy::default()).len(),
-        16
-    );
+    let huge = segment_ranges(2_240 * MIB, &TransferPolicy::default());
+    assert_eq!(huge.len(), 224);
+    assert!(huge.iter().all(|range| range.len() <= 10 * MIB));
+    assert_eq!(huge.last().unwrap().end, 2_240 * MIB - 1);
 }
 
 #[test]
@@ -67,6 +67,23 @@ fn segment_ranges_cover_odd_sizes_without_overlap() {
 }
 
 #[test]
+fn first_byte_latency_excludes_request_queue_time() {
+    let mut started = TransferEvent::attempt(
+        "attempt_started",
+        7,
+        AttemptKind::Initial,
+        ByteRange { start: 0, end: 99 },
+    );
+    started.at_seconds = 5.0;
+    started.queue_seconds = Some(4.0);
+    let mut first = TransferEvent::simple("first_body_byte");
+    first.attempt = Some(7);
+    first.at_seconds = 5.25;
+
+    assert_eq!(first_body_byte_latency(&[started, first]), Some(0.25));
+}
+
+#[test]
 fn parses_content_range() {
     assert_eq!(
         parse_content_range("bytes 0-99/163797476"),
@@ -78,7 +95,6 @@ fn parses_content_range() {
 
 #[test]
 fn retry_classification_is_typed() {
-    assert!(AttemptFailure::Request("offline".into()).retryable());
     assert!(AttemptFailure::EarlyEof {
         expected: 10,
         received: 3,
@@ -89,111 +105,69 @@ fn retry_classification_is_typed() {
 }
 
 #[test]
-fn health_classifier_distinguishes_localized_and_global_stalls() {
-    let registry = AttemptHealthRegistry::default();
+fn ordinary_progress_is_not_a_tail_emergency() {
     let policy = TransferPolicy {
-        hedge_warmup: Duration::from_millis(10),
-        stalled_for: Duration::from_millis(30),
+        emergency_warmup: Duration::ZERO,
         pathological_remaining: Duration::from_millis(20),
         rolling_window: Duration::from_secs(1),
         ..TransferPolicy::default()
     };
-    let slow = registry.register(
-        1,
-        AttemptKind::Original,
-        ByteRange {
-            start: 0,
-            end: 999_999,
-        },
-        policy.rolling_window,
-    );
-    let fast = registry.register(
-        2,
-        AttemptKind::Original,
-        ByteRange {
-            start: 0,
-            end: 999_999,
-        },
-        policy.rolling_window,
-    );
-    thread::sleep(Duration::from_millis(12));
-    slow.progress(100);
-    fast.progress(200_000);
-    assert_eq!(
-        registry.hedge_decision(1, &policy),
-        HedgeDecision::Localized
-    );
+    let progress = AttemptProgress::new(policy.rolling_window);
+    progress.request_started();
+    thread::sleep(Duration::from_millis(2));
+    progress.progress(1_000_000);
+    assert!(progress
+        .snapshot(
+            ByteRange {
+                start: 0,
+                end: 9_999_999,
+            },
+            &policy,
+        )
+        .is_none());
+}
 
-    thread::sleep(Duration::from_millis(35));
-    assert_eq!(registry.hedge_decision(1, &policy), HedgeDecision::None);
-    drop(fast);
-    assert_eq!(registry.hedge_decision(1, &policy), HedgeDecision::None);
-    thread::sleep(Duration::from_millis(35));
-    assert_eq!(
-        registry.hedge_decision(1, &policy),
-        HedgeDecision::Ambiguous
-    );
+#[test]
+fn no_progress_is_tail_emergency_evidence() {
+    let policy = TransferPolicy {
+        emergency_warmup: Duration::from_millis(1),
+        stalled_for: Duration::from_millis(2),
+        rolling_window: Duration::from_secs(1),
+        ..TransferPolicy::default()
+    };
+    let progress = AttemptProgress::new(policy.rolling_window);
+    progress.request_started();
+    thread::sleep(Duration::from_millis(4));
+    assert!(progress
+        .snapshot(ByteRange { start: 0, end: 999 }, &policy)
+        .is_some());
 }
 
 #[tokio::test]
-async fn request_coordinator_runs_higher_priority_first() {
-    let coordinator = RequestCoordinator::new(1);
-    let held = coordinator.acquire(0).await.unwrap();
+async fn request_budget_runs_higher_priority_first() {
+    let budget = RequestBudget::new(1);
+    let held = budget.acquire(0).await.unwrap();
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-    let low = coordinator.clone();
+    let low = budget.clone();
     let low_sender = sender.clone();
     tokio::spawn(async move {
         let _permit = low.acquire(10).await.unwrap();
         low_sender.send("low").unwrap();
     });
-    while coordinator.waiting() != 1 {
+    while budget.waiting() != 1 {
         tokio::task::yield_now().await;
     }
-    let high = coordinator.clone();
+    let high = budget.clone();
     tokio::spawn(async move {
         let _permit = high.acquire(1).await.unwrap();
         sender.send("high").unwrap();
     });
-    while coordinator.waiting() != 2 {
+    while budget.waiting() != 2 {
         tokio::task::yield_now().await;
     }
     drop(held);
     assert_eq!(receiver.recv().await, Some("high"));
     assert_eq!(receiver.recv().await, Some("low"));
-}
-
-#[test]
-fn healthy_cdn_rate_variation_does_not_trigger_a_hedge() {
-    let registry = AttemptHealthRegistry::default();
-    let policy = TransferPolicy {
-        hedge_warmup: Duration::from_millis(10),
-        pathological_remaining: Duration::from_millis(20),
-        rolling_window: Duration::from_secs(1),
-        ..TransferPolicy::default()
-    };
-    let slower = registry.register(
-        1,
-        AttemptKind::Original,
-        ByteRange {
-            start: 0,
-            end: 9_999_999,
-        },
-        policy.rolling_window,
-    );
-    let faster = registry.register(
-        2,
-        AttemptKind::Original,
-        ByteRange {
-            start: 0,
-            end: 9_999_999,
-        },
-        policy.rolling_window,
-    );
-    thread::sleep(Duration::from_millis(20));
-    slower.progress(1_000_000);
-    faster.progress(4_000_000);
-
-    assert_eq!(registry.hedge_decision(1, &policy), HedgeDecision::None);
 }
 
 #[derive(Debug)]
@@ -317,14 +291,81 @@ fn sha256(bytes: &[u8]) -> String {
     crate::hash::hex_lower(digest::digest(&digest::SHA256, bytes).as_ref())
 }
 
-fn test_manager(policy: TransferPolicy) -> super::TransferManager {
-    let client = reqwest::Client::builder()
-        .http1_only()
-        .connect_timeout(Duration::from_secs(1))
-        .read_timeout(Duration::from_secs(2))
-        .build()
-        .unwrap();
-    super::TransferManager::with_policy(client, policy)
+fn test_manager(policy: TransferPolicy) -> super::TransferRuntime {
+    let client = || {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(1))
+            .read_timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+    };
+    super::TransferRuntime::with_policy(vec![client()], client(), policy)
+}
+
+#[test]
+fn transport_assignment_explores_equal_unknown_pools() {
+    let clients = (0..4)
+        .map(|_| reqwest::Client::builder().build().unwrap())
+        .collect();
+    let transports = super::OrdinaryTransports::new(clients);
+    let first = (0..4).map(|_| transports.acquire(100)).collect::<Vec<_>>();
+
+    assert_eq!(
+        first.iter().map(|lease| lease.id).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+}
+
+#[test]
+fn completed_slow_pool_does_not_automatically_receive_more_work() {
+    let clients = (0..2)
+        .map(|_| reqwest::Client::builder().build().unwrap())
+        .collect();
+    let transports = super::OrdinaryTransports::new(clients);
+    let mut fast = transports.acquire(100);
+    let mut slow = transports.acquire(100);
+    fast.record_bytes(100);
+    slow.record_bytes(10);
+    drop(fast);
+    drop(slow);
+
+    let fast = transports.acquire(100);
+    assert_eq!(fast.id, 0);
+    let also_fast = transports.acquire(100);
+    assert_eq!(also_fast.id, 0);
+    assert_eq!(also_fast.active_at_admission, 2);
+}
+
+#[test]
+fn dropped_attempt_removes_unreceived_transport_work() {
+    let clients = vec![reqwest::Client::builder().build().unwrap()];
+    let transports = super::OrdinaryTransports::new(clients);
+    let mut attempt = transports.acquire(100);
+    attempt.record_bytes(40);
+    drop(attempt);
+
+    assert_eq!(
+        transports.pools[0]
+            .outstanding_bytes
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(transports.pools[0].active.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn only_the_highest_priority_artifact_enters_emergency_tail() {
+    let manager = test_manager(TransferPolicy::default());
+    let high = manager.register_artifact(1, 5);
+    let low = manager.register_artifact(10, 1);
+
+    assert!(high.handle.tail_eligible().is_none());
+    assert!(low.handle.tail_eligible().is_none());
+    for _ in 0..3 {
+        high.handle.mark_range_complete();
+    }
+    assert!(high.handle.tail_eligible().is_some());
+    assert!(low.handle.tail_eligible().is_none());
 }
 
 #[tokio::test]
@@ -355,7 +396,34 @@ async fn healthy_single_stream_completes_without_speculation() {
     assert_eq!(tokio::fs::read(path).await.unwrap(), *data);
     assert_eq!(report.segments.len(), 1);
     assert_eq!(report.segments[0].attempts, 1);
-    assert_eq!(report.segments[0].hedges, 0);
+    assert_eq!(report.segments[0].emergencies, 0);
+    assert_eq!(report.diagnostics.logical_bytes, data.len() as u64);
+    assert_eq!(report.diagnostics.wire_bytes, data.len() as u64);
+    assert_eq!(report.diagnostics.transport_profile, "test");
+    assert_eq!(report.diagnostics.transport_count, 1);
+    let [first_body, body_complete, verify_complete, sync_complete] =
+        report.diagnostics.subphase_boundaries().unwrap();
+    assert!(first_body <= body_complete);
+    assert!(body_complete <= verify_complete);
+    assert!(verify_complete <= sync_complete);
+    assert!(report
+        .diagnostics
+        .events
+        .iter()
+        .any(|event| { event.event == "attempt_started" && event.transport_id == Some(0) }));
+    assert!(report.diagnostics.events.iter().any(|event| {
+        event.event == "response_headers"
+            && event.http_version.is_some()
+            && event
+                .response_origin
+                .as_deref()
+                .is_some_and(|origin| origin.starts_with("http://127.0.0.1:"))
+    }));
+    assert!(report
+        .diagnostics
+        .events
+        .iter()
+        .any(|event| event.event == "first_body_byte"));
 }
 
 #[cfg(unix)]
@@ -484,7 +552,7 @@ async fn healthy_multipart_completes_without_speculation() {
     let policy = TransferPolicy {
         multipart_threshold: 200_000,
         target_part_size: 150_000,
-        max_multipart_parts: 2,
+
         ..TransferPolicy::default()
     };
     let manager = test_manager(policy);
@@ -507,7 +575,79 @@ async fn healthy_multipart_completes_without_speculation() {
     assert!(report
         .segments
         .iter()
-        .all(|segment| segment.attempts == 1 && segment.hedges == 0));
+        .all(|segment| segment.attempts == 1 && segment.emergencies == 0));
+}
+
+#[tokio::test]
+async fn uniformly_slow_bulk_transfers_do_not_start_emergencies() {
+    let data = Arc::new(vec![47_u8; 100_000]);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let server = test_server({
+        let data = Arc::clone(&data);
+        let requests = Arc::clone(&requests);
+        move |request, stream| {
+            assert!(request.range.is_none());
+            requests.fetch_add(1, Ordering::Relaxed);
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                data.len()
+            );
+            stream.write_all(headers.as_bytes()).unwrap();
+            for chunk in data.chunks(1_000) {
+                if stream.write_all(chunk).is_err() {
+                    break;
+                }
+                let _ = stream.flush();
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    });
+    let policy = TransferPolicy {
+        ordinary_attempts: 3,
+        emergency_warmup: Duration::from_millis(20),
+        stalled_for: Duration::from_millis(30),
+        pathological_remaining: Duration::from_millis(30),
+        max_emergency_rate: 200_000.0,
+        rolling_window: Duration::from_millis(100),
+        ..TransferPolicy::default()
+    };
+    let manager = test_manager(policy);
+    let temp = tempfile::tempdir().unwrap();
+    let digest = sha256(&data);
+    let first_path = temp.path().join("first.tmp");
+    let second_path = temp.path().join("second.tmp");
+    let third_path = temp.path().join("third.tmp");
+    let first = manager.download_with_header_to_path(
+        &server.url,
+        &first_path,
+        &digest,
+        Some(data.len() as u64),
+        None,
+        Arc::new(|_| {}),
+    );
+    let second = manager.download_with_header_to_path(
+        &server.url,
+        &second_path,
+        &digest,
+        Some(data.len() as u64),
+        None,
+        Arc::new(|_| {}),
+    );
+    let third = manager.download_with_header_to_path(
+        &server.url,
+        &third_path,
+        &digest,
+        Some(data.len() as u64),
+        None,
+        Arc::new(|_| {}),
+    );
+
+    assert!(tokio::time::timeout(Duration::from_millis(100), async {
+        let _ = tokio::join!(first, second, third);
+    })
+    .await
+    .is_err());
+    assert_eq!(requests.load(Ordering::Relaxed), 3);
 }
 
 #[tokio::test]
@@ -586,7 +726,7 @@ async fn interrupted_body_resumes_exact_unwritten_suffix() {
         }
     });
     let policy = TransferPolicy {
-        max_hedges: 0,
+        emergency_per_range: 0,
         retry_base: Duration::ZERO,
         ..TransferPolicy::default()
     };
@@ -618,6 +758,44 @@ async fn interrupted_body_resumes_exact_unwritten_suffix() {
     let progress = progress.lock().unwrap();
     assert!(progress.windows(2).all(|pair| pair[0] <= pair[1]));
     assert_eq!(progress.last().copied(), Some(data.len() as u64));
+}
+
+#[tokio::test]
+async fn complete_expected_bytes_survive_a_trailing_body_error() {
+    let data = Arc::new(vec![53_u8; 100_000]);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let server = test_server({
+        let data = Arc::clone(&data);
+        let requests = Arc::clone(&requests);
+        move |request, stream| {
+            assert!(request.range.is_none());
+            requests.fetch_add(1, Ordering::Relaxed);
+            write_response(stream, "200 OK", data.len() + 1, None, &data);
+        }
+    });
+    let policy = TransferPolicy {
+        emergency_per_range: 0,
+        retry_base: Duration::ZERO,
+        ..TransferPolicy::default()
+    };
+    let manager = test_manager(policy);
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("artifact.tmp");
+    let report = manager
+        .download_with_header_to_path(
+            &server.url,
+            &path,
+            &sha256(&data),
+            Some(data.len() as u64),
+            None,
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(tokio::fs::read(path).await.unwrap(), *data);
+    assert_eq!(requests.load(Ordering::Relaxed), 1);
+    assert_eq!(report.segments[0].attempts, 1);
 }
 
 #[tokio::test]
@@ -659,7 +837,7 @@ async fn unknown_size_failure_restarts_whole_object_safely() {
 }
 
 #[tokio::test]
-async fn retryable_status_retries_as_a_range_attempt() {
+async fn retryable_statuses_keep_retrying_beyond_the_old_attempt_limit() {
     let data = Arc::new(
         (0..200_000)
             .map(|value| (value % 227) as u8)
@@ -668,8 +846,13 @@ async fn retryable_status_retries_as_a_range_attempt() {
     let server = test_server({
         let data = Arc::clone(&data);
         move |request, stream| {
-            if request.sequence == 0 {
-                write_response(stream, "503 Service Unavailable", 0, None, &[]);
+            if request.sequence < 5 {
+                let status = match request.sequence {
+                    0 => "408 Request Timeout",
+                    1 => "429 Too Many Requests",
+                    _ => "503 Service Unavailable",
+                };
+                write_response(stream, status, 0, None, &[]);
             } else {
                 let range = request.range.expect("retry must use Range");
                 write_response(
@@ -683,7 +866,7 @@ async fn retryable_status_retries_as_a_range_attempt() {
         }
     });
     let policy = TransferPolicy {
-        max_hedges: 0,
+        emergency_per_range: 0,
         retry_base: Duration::ZERO,
         ..TransferPolicy::default()
     };
@@ -703,7 +886,8 @@ async fn retryable_status_retries_as_a_range_attempt() {
         .unwrap();
 
     assert_eq!(tokio::fs::read(path).await.unwrap(), *data);
-    assert_eq!(report.segments[0].attempts, 2);
+    assert_eq!(report.segments[0].attempts, 6);
+    assert_eq!(report.diagnostics.retries, 5);
 }
 
 #[tokio::test]
@@ -734,8 +918,8 @@ async fn multipart_requests_respect_the_shared_attempt_budget() {
         ordinary_attempts: 2,
         multipart_threshold: 100_000,
         target_part_size: 50_000,
-        max_multipart_parts: 8,
-        max_hedges: 0,
+
+        emergency_per_range: 0,
         ..TransferPolicy::default()
     };
     let manager = test_manager(policy);
@@ -757,7 +941,7 @@ async fn multipart_requests_respect_the_shared_attempt_budget() {
 }
 
 #[tokio::test]
-async fn pathological_segment_is_hedged_before_siblings_finish() {
+async fn final_pathological_range_uses_one_emergency() {
     let data = Arc::new(
         (0..300_000)
             .map(|value| (value % 239) as u8)
@@ -798,10 +982,10 @@ async fn pathological_segment_is_hedged_before_siblings_finish() {
     let policy = TransferPolicy {
         multipart_threshold: 200_000,
         target_part_size: 150_000,
-        max_multipart_parts: 2,
-        max_hedges: 1,
+
+        emergency_per_range: 1,
         monitor_interval: Duration::from_millis(10),
-        hedge_warmup: Duration::from_millis(50),
+        emergency_warmup: Duration::from_millis(50),
         stalled_for: Duration::from_millis(80),
         pathological_remaining: Duration::from_millis(100),
         rolling_window: Duration::from_millis(200),
@@ -830,12 +1014,22 @@ async fn pathological_segment_is_hedged_before_siblings_finish() {
         .iter()
         .find(|segment| segment.start == 0)
         .unwrap();
-    assert_eq!(slow.hedges, 1);
+    assert_eq!(slow.emergencies, 1);
     assert!(slow.attempts >= 2);
+    assert!(report
+        .diagnostics
+        .events
+        .iter()
+        .any(|event| event.event == "emergency_won"));
+    assert!(report
+        .diagnostics
+        .events
+        .iter()
+        .any(|event| event.event == "attempt_cancelled"));
 }
 
 #[tokio::test]
-async fn pathological_single_stream_uses_a_diagnostic_hedge() {
+async fn final_pathological_single_stream_uses_one_emergency() {
     let data = Arc::new(
         (0..300_000)
             .map(|value| (value % 229) as u8)
@@ -858,7 +1052,7 @@ async fn pathological_single_stream_uses_a_diagnostic_hedge() {
                     thread::sleep(Duration::from_millis(20));
                 }
             } else {
-                let range = request.range.expect("diagnostic request must use Range");
+                let range = request.range.expect("emergency request must use Range");
                 write_response(
                     stream,
                     "206 Partial Content",
@@ -870,9 +1064,9 @@ async fn pathological_single_stream_uses_a_diagnostic_hedge() {
         }
     });
     let policy = TransferPolicy {
-        max_hedges: 1,
+        emergency_per_range: 1,
         monitor_interval: Duration::from_millis(10),
-        hedge_warmup: Duration::from_millis(50),
+        emergency_warmup: Duration::from_millis(50),
         stalled_for: Duration::from_millis(80),
         pathological_remaining: Duration::from_millis(100),
         rolling_window: Duration::from_millis(200),
@@ -896,11 +1090,11 @@ async fn pathological_single_stream_uses_a_diagnostic_hedge() {
 
     assert!(started.elapsed() < Duration::from_secs(2));
     assert_eq!(tokio::fs::read(path).await.unwrap(), *data);
-    assert_eq!(report.segments[0].hedges, 1);
+    assert_eq!(report.segments[0].emergencies, 1);
 }
 
 #[tokio::test]
-async fn slow_original_remains_the_fallback_when_hedge_fails() {
+async fn slow_original_remains_the_fallback_when_emergency_fails() {
     let data = Arc::new(vec![11_u8; 100_000]);
     let server = test_server({
         let data = Arc::clone(&data);
@@ -925,12 +1119,12 @@ async fn slow_original_remains_the_fallback_when_hedge_fails() {
         }
     });
     let policy = TransferPolicy {
-        max_hedges: 1,
+        emergency_per_range: 1,
         monitor_interval: Duration::from_millis(10),
-        hedge_warmup: Duration::from_millis(30),
+        emergency_warmup: Duration::from_millis(30),
         stalled_for: Duration::from_millis(60),
         pathological_remaining: Duration::from_millis(50),
-        max_hedge_rate: 1_000_000.0,
+        max_emergency_rate: 1_000_000.0,
         rolling_window: Duration::from_millis(100),
         ..TransferPolicy::default()
     };
@@ -950,11 +1144,11 @@ async fn slow_original_remains_the_fallback_when_hedge_fails() {
         .unwrap();
 
     assert_eq!(tokio::fs::read(path).await.unwrap(), *data);
-    assert_eq!(report.segments[0].hedges, 1);
+    assert_eq!(report.segments[0].emergencies, 1);
 }
 
 #[tokio::test]
-async fn stalled_single_and_diagnostic_do_not_multiply_attempts() {
+async fn stalled_single_launches_only_one_emergency_attempt() {
     let data = Arc::new(vec![29_u8; 100_000]);
     let requests = Arc::new(AtomicUsize::new(0));
     let server = test_server({
@@ -982,10 +1176,9 @@ async fn stalled_single_and_diagnostic_do_not_multiply_attempts() {
         }
     });
     let policy = TransferPolicy {
-        max_retries: 0,
-        max_hedges: 2,
+        emergency_per_range: 1,
         monitor_interval: Duration::from_millis(5),
-        hedge_warmup: Duration::from_millis(20),
+        emergency_warmup: Duration::from_millis(20),
         stalled_for: Duration::from_millis(30),
         pathological_remaining: Duration::from_millis(30),
         rolling_window: Duration::from_millis(100),
@@ -993,23 +1186,25 @@ async fn stalled_single_and_diagnostic_do_not_multiply_attempts() {
     };
     let manager = test_manager(policy);
     let temp = tempfile::tempdir().unwrap();
-    let result = manager
-        .download_with_header_to_path(
+    let result = tokio::time::timeout(
+        Duration::from_millis(100),
+        manager.download_with_header_to_path(
             &server.url,
             &temp.path().join("artifact.tmp"),
             &sha256(&data),
             Some(data.len() as u64),
             None,
             Arc::new(|_| {}),
-        )
-        .await;
+        ),
+    )
+    .await;
 
     assert!(result.is_err());
     assert_eq!(requests.load(Ordering::Relaxed), 2);
 }
 
 #[tokio::test]
-async fn simultaneous_segment_stalls_do_not_fan_out_hedges() {
+async fn two_final_stalled_ranges_have_one_emergency_each() {
     let data = Arc::new(vec![7_u8; 300_000]);
     let request_count = Arc::new(AtomicUsize::new(0));
     let server = test_server({
@@ -1030,10 +1225,9 @@ async fn simultaneous_segment_stalls_do_not_fan_out_hedges() {
     let policy = TransferPolicy {
         multipart_threshold: 200_000,
         target_part_size: 150_000,
-        max_multipart_parts: 2,
-        max_retries: 0,
+
         monitor_interval: Duration::from_millis(10),
-        hedge_warmup: Duration::from_millis(20),
+        emergency_warmup: Duration::from_millis(20),
         stalled_for: Duration::from_millis(30),
         pathological_remaining: Duration::from_millis(30),
         rolling_window: Duration::from_millis(100),
@@ -1041,19 +1235,21 @@ async fn simultaneous_segment_stalls_do_not_fan_out_hedges() {
     };
     let manager = test_manager(policy);
     let temp = tempfile::tempdir().unwrap();
-    let result = manager
-        .download_with_header_to_path(
+    let result = tokio::time::timeout(
+        Duration::from_millis(100),
+        manager.download_with_header_to_path(
             &server.url,
             &temp.path().join("artifact.tmp"),
             &sha256(&data),
             Some(data.len() as u64),
             None,
             Arc::new(|_| {}),
-        )
-        .await;
+        ),
+    )
+    .await;
 
     assert!(result.is_err());
-    assert!(request_count.load(Ordering::Relaxed) <= 2);
+    assert_eq!(request_count.load(Ordering::Relaxed), 4);
 }
 
 #[tokio::test]
@@ -1075,7 +1271,7 @@ async fn ignored_range_is_never_spliced_into_partial_artifact() {
         }
     });
     let policy = TransferPolicy {
-        max_hedges: 0,
+        emergency_per_range: 0,
         retry_base: Duration::ZERO,
         ..TransferPolicy::default()
     };
@@ -1120,7 +1316,16 @@ async fn corrupt_complete_artifact_fails_digest_verification() {
         )
         .await;
 
-    assert!(format!("{:#}", result.unwrap_err()).contains("sha256 mismatch"));
+    let error = result.unwrap_err();
+    assert!(format!("{error:#}").contains("sha256 mismatch"));
+    let failure = error
+        .downcast_ref::<TransferFailure>()
+        .expect("terminal transfer retains diagnostics");
+    assert!(failure
+        .diagnostics()
+        .events
+        .iter()
+        .any(|event| event.event == "verification_failed"));
 }
 
 #[tokio::test]
@@ -1153,9 +1358,8 @@ async fn overlong_range_fails_before_cache_admission() {
     let policy = TransferPolicy {
         multipart_threshold: 200_000,
         target_part_size: 150_000,
-        max_multipart_parts: 2,
-        max_retries: 0,
-        max_hedges: 0,
+
+        emergency_per_range: 0,
         ..TransferPolicy::default()
     };
     let manager = test_manager(policy);
@@ -1175,7 +1379,7 @@ async fn overlong_range_fails_before_cache_admission() {
 }
 
 #[tokio::test]
-async fn cancellation_removes_in_flight_hedge_files() {
+async fn cancellation_removes_in_flight_emergency_files() {
     let data = Arc::new(vec![17_u8; 100_000]);
     let server = test_server({
         let data = Arc::clone(&data);
@@ -1194,7 +1398,7 @@ async fn cancellation_removes_in_flight_hedge_files() {
                     thread::sleep(Duration::from_millis(20));
                 }
             } else {
-                let range = request.range.expect("diagnostic request must use Range");
+                let range = request.range.expect("emergency request must use Range");
                 let headers = format!(
                     "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
                     range.len(), range.start, range.end, data.len()
@@ -1209,9 +1413,9 @@ async fn cancellation_removes_in_flight_hedge_files() {
         }
     });
     let policy = TransferPolicy {
-        max_hedges: 1,
+        emergency_per_range: 1,
         monitor_interval: Duration::from_millis(5),
-        hedge_warmup: Duration::from_millis(20),
+        emergency_warmup: Duration::from_millis(20),
         stalled_for: Duration::from_millis(30),
         pathological_remaining: Duration::from_millis(30),
         rolling_window: Duration::from_millis(100),
@@ -1238,7 +1442,7 @@ async fn cancellation_removes_in_flight_hedge_files() {
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     assert!(
-        names.iter().all(|name| !name.ends_with(".hedge")),
+        names.iter().all(|name| !name.ends_with(".emergency")),
         "{names:?}"
     );
 }
@@ -1262,8 +1466,8 @@ async fn dropping_artifact_future_aborts_owned_attempts() {
     let policy = TransferPolicy {
         multipart_threshold: 200_000,
         target_part_size: 150_000,
-        max_multipart_parts: 2,
-        hedge_warmup: Duration::from_secs(5),
+
+        emergency_warmup: Duration::from_secs(5),
         ..TransferPolicy::default()
     };
     let manager = test_manager(policy);
@@ -1282,5 +1486,12 @@ async fn dropping_artifact_future_aborts_owned_attempts() {
         .await
         .is_err());
     tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(manager.health.active_count(), 0);
+    assert_eq!(manager.ordinary.active(), 0);
+    assert_eq!(manager.emergency_active(), 0);
+    assert!(manager
+        .activity
+        .lock()
+        .expect("transfer activity lock poisoned")
+        .artifacts
+        .is_empty());
 }

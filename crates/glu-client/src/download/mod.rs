@@ -3,7 +3,13 @@ pub(crate) mod ghcr;
 pub(crate) mod http;
 mod transfer;
 
-use crate::download::{cache::ArtifactCache, transfer::TransferManager};
+use crate::{
+    download::{
+        cache::ArtifactCache,
+        transfer::{TransferDiagnostics, TransferFailure, TransferRequest, TransferRuntime},
+    },
+    hash::Sha256Mismatch,
+};
 use anyhow::{Context, Result};
 use glu_core::{ArtifactId, Prefix, ResolvedArtifact};
 use std::{
@@ -73,6 +79,7 @@ pub struct VerifiedArtifact {
     pub path: PathBuf,
     pub sha256: String,
     pub reused: bool,
+    pub(crate) transfer_diagnostics: Option<TransferDiagnostics>,
 }
 
 struct TempArtifactCleanup<'a> {
@@ -91,25 +98,25 @@ impl Drop for TempArtifactCleanup<'_> {
 #[derive(Debug, Clone)]
 pub struct ArtifactDownloader {
     cache: ArtifactCache,
-    transfers: TransferManager,
+    transfers: TransferRuntime,
 }
 
 impl ArtifactDownloader {
     pub fn new(prefix: &Prefix) -> Self {
-        let http = reqwest::Client::builder()
-            // GHCR blob downloads can be much slower with reqwest's HTTP/2 multiplexing
-            // for this workload. In local probes against a 358 MB vips closure, H2
-            // multiplexing collapsed to ~2-3 MB/s even when hash/cache-write time was
-            // sub-second total; forcing separate HTTP/1.1 connections reached the
-            // available ~90 Mbps link in the same probe. Keep artifact fetches off H2.
-            .http1_only()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("failed to build HTTP client");
+        // Independent clients prevent one pathological HTTP/2 connection pool from coupling the
+        // complete install. The transfer allocator concentrates new ranges on pools that have
+        // delivered the most useful capacity while retaining one global logical request budget.
+        let ordinary_http = (0..ORDINARY_TRANSPORT_POOLS)
+            .map(|_| artifact_http_client())
+            .collect();
+        let emergency_http = artifact_http_client();
         Self {
             cache: ArtifactCache::new(prefix),
-            transfers: TransferManager::new(http),
+            transfers: TransferRuntime::new(
+                ordinary_http,
+                emergency_http,
+                format!("negotiated-{ORDINARY_TRANSPORT_POOLS}-pools-capacity-weighted"),
+            ),
         }
     }
 
@@ -162,51 +169,86 @@ impl ArtifactDownloader {
                 path: cached,
                 sha256: artifact.sha256.clone(),
                 reused: true,
+                transfer_diagnostics: None,
             });
         }
 
-        let temp = self.cache.temp_path_for_artifact(artifact)?;
-        let _temp_cleanup = TempArtifactCleanup { path: &temp };
-
-        let report = match self
-            .transfers
-            .download_blob_to_path(
-                &artifact.url,
-                &temp,
-                &artifact.sha256,
-                artifact.bytes,
-                priority,
-                on_progress,
-            )
-            .await
-        {
-            Ok(report) => report,
-            Err(error) => {
+        let on_progress = Arc::new(on_progress);
+        let mut digest_failures = 0_u8;
+        loop {
+            let temp = self.cache.temp_path_for_artifact(artifact)?;
+            let _temp_cleanup = TempArtifactCleanup { path: &temp };
+            let report = match self
+                .transfers
+                .download_blob_to_path(
+                    TransferRequest {
+                        artifact_id: &id.0,
+                        url: &artifact.url,
+                        dest: &temp,
+                        expected_sha256: &artifact.sha256,
+                        expected_size: artifact.bytes,
+                        priority,
+                    },
+                    Arc::clone(&on_progress),
+                )
+                .await
+            {
+                Ok(report) => report,
+                Err(error) if is_sha256_mismatch(&error) && digest_failures == 0 => {
+                    digest_failures += 1;
+                    let _ = tokio::fs::remove_file(&temp).await;
+                    continue;
+                }
+                Err(error) => {
+                    let _ = tokio::fs::remove_file(&temp).await;
+                    return Err(error).with_context(|| format!("downloading artifact {}", id.0));
+                }
+            };
+            if let Err(error) = report.validate(artifact.bytes) {
                 let _ = tokio::fs::remove_file(&temp).await;
-                return Err(error).with_context(|| format!("downloading artifact {}", id.0));
+                return Err(error)
+                    .with_context(|| format!("validating transfer report for artifact {}", id.0));
             }
-        };
-        if let Err(error) = report.validate(artifact.bytes) {
-            let _ = tokio::fs::remove_file(&temp).await;
-            return Err(error)
-                .with_context(|| format!("validating transfer report for artifact {}", id.0));
-        }
-        report
-            .validate_staging_path(&temp)
-            .await
-            .with_context(|| format!("validating staging file for artifact {}", id.0))?;
-        // Cache admission boundary: the temp file reached here only after download-side
-        // sha256 verification and sync. After this rename, `sha256/<digest>` means
-        // "verified at ingest"; prepare still re-verifies every use before commit.
-        tokio::fs::rename(&temp, &cached)
-            .await
-            .with_context(|| format!("moving {} to {}", temp.display(), cached.display()))?;
+            let transfer_diagnostics = report.diagnostics().clone();
+            report
+                .validate_staging_path(&temp)
+                .await
+                .with_context(|| format!("validating staging file for artifact {}", id.0))?;
+            // Cache admission boundary: the temp file reached here only after download-side
+            // sha256 verification and sync. After this rename, `sha256/<digest>` means
+            // "verified at ingest"; prepare still re-verifies every use before commit.
+            tokio::fs::rename(&temp, &cached)
+                .await
+                .with_context(|| format!("moving {} to {}", temp.display(), cached.display()))?;
 
-        Ok(VerifiedArtifact {
-            id,
-            path: cached,
-            sha256: artifact.sha256.clone(),
-            reused: false,
-        })
+            return Ok(VerifiedArtifact {
+                id,
+                path: cached,
+                sha256: artifact.sha256.clone(),
+                reused: false,
+                transfer_diagnostics: Some(transfer_diagnostics),
+            });
+        }
     }
+}
+
+pub(crate) fn transfer_failure_diagnostics(error: &anyhow::Error) -> Option<TransferDiagnostics> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<TransferFailure>())
+        .map(|failure| failure.diagnostics().clone())
+}
+
+fn is_sha256_mismatch(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<Sha256Mismatch>())
+}
+
+const ORDINARY_TRANSPORT_POOLS: usize = 4;
+
+fn artifact_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to build HTTP client")
 }

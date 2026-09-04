@@ -207,6 +207,7 @@ impl InstallResult {
                 "pool": event.pool,
                 "slot": event.slot,
             })).collect::<Vec<_>>(),
+            "diagnostics": self.artifacts,
         })
     }
 }
@@ -810,6 +811,26 @@ mod tests {
             edges,
             pools: pools.iter().map(|(k, v)| (test_pool(k), *v)).collect(),
         }
+    }
+
+    #[test]
+    fn trace_dict_persists_structured_diagnostics() {
+        let result = InstallResult {
+            plan: plan(vec![], vec![], &[]),
+            events: vec![],
+            artifacts: BTreeMap::from([(
+                "download:ghcr_bottle_download:gcc".to_string(),
+                json!({"attempts": 2, "events": [{"event": "first_body_byte"}]}),
+            )]),
+            error: None,
+            failure: None,
+        };
+
+        let trace = result.trace_dict("gcc");
+        assert_eq!(
+            trace["diagnostics"]["download:ghcr_bottle_download:gcc"]["attempts"],
+            2
+        );
     }
 
     struct RecordingOps {

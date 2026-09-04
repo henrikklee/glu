@@ -1,5 +1,5 @@
 use crate::download::ghcr::repo_for_blob_url;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Deserialize;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
@@ -21,10 +21,6 @@ impl GhcrTransport {
             http,
             install_token: Arc::new(RwLock::new(None)),
         }
-    }
-
-    pub(crate) fn client(&self) -> &reqwest::Client {
-        &self.http
     }
 
     pub(crate) async fn configure_install_token<'a>(
@@ -74,41 +70,25 @@ async fn token_for_repos<'a>(
     let mut retry = 0_u32;
     loop {
         match http.get(url.clone()).send().await {
-            Ok(response)
-                if matches!(
-                    response.status(),
-                    reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
-                ) || response.status().is_server_error() =>
-            {
-                if retry >= TOKEN_RETRIES {
-                    return Err(response
-                        .error_for_status()
-                        .expect_err("retryable status must be an error"))
-                    .context("GHCR token request returned an error");
-                }
+            Ok(response) if !response.status().is_success() => {
                 let retry_after = response
                     .headers()
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| value.parse::<u64>().ok())
                     .map(Duration::from_secs);
-                retry += 1;
+                retry = retry.saturating_add(1);
                 tokio::time::sleep(retry_after.unwrap_or_else(|| token_retry_delay(retry))).await;
             }
-            Ok(response) => {
-                return Ok(response
-                    .error_for_status()
-                    .context("GHCR token request returned an error")?
-                    .json::<GhcrTokenResponse>()
-                    .await
-                    .context("failed to decode GHCR token response")?
-                    .token);
-            }
-            Err(error) => {
-                if retry >= TOKEN_RETRIES {
-                    return Err(error).context("GHCR token request failed");
+            Ok(response) => match response.json::<GhcrTokenResponse>().await {
+                Ok(response) => return Ok(response.token),
+                Err(_) => {
+                    retry = retry.saturating_add(1);
+                    tokio::time::sleep(token_retry_delay(retry)).await;
                 }
-                retry += 1;
+            },
+            Err(_) => {
+                retry = retry.saturating_add(1);
                 tokio::time::sleep(token_retry_delay(retry)).await;
             }
         }
@@ -116,10 +96,9 @@ async fn token_for_repos<'a>(
 }
 
 fn token_retry_delay(retry: u32) -> Duration {
-    Duration::from_millis(250 * (1_u64 << retry.saturating_sub(1).min(3)))
+    Duration::from_millis(250 * (1_u64 << retry.saturating_sub(1).min(6)))
+        .min(Duration::from_secs(15))
 }
-
-const TOKEN_RETRIES: u32 = 3;
 
 #[derive(Debug, Deserialize)]
 struct GhcrTokenResponse {
