@@ -19,7 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{oneshot, OwnedSemaphorePermit, Semaphore},
+    sync::{oneshot, OwnedSemaphorePermit, RwLock, Semaphore},
     task::JoinSet,
 };
 
@@ -243,13 +243,14 @@ struct OrdinaryTransports {
 #[derive(Debug)]
 struct OrdinaryTransportPool {
     http: reqwest::Client,
+    budget: RequestBudget,
     active: AtomicUsize,
     outstanding_bytes: AtomicU64,
     observed_bytes: AtomicU64,
 }
 
 impl OrdinaryTransports {
-    fn new(clients: Vec<reqwest::Client>) -> Self {
+    fn new(clients: Vec<reqwest::Client>, attempts_per_pool: usize) -> Self {
         assert!(
             !clients.is_empty(),
             "transfer runtime requires an ordinary HTTP client"
@@ -260,6 +261,7 @@ impl OrdinaryTransports {
                     .into_iter()
                     .map(|http| OrdinaryTransportPool {
                         http,
+                        budget: RequestBudget::new(attempts_per_pool),
                         active: AtomicUsize::new(0),
                         outstanding_bytes: AtomicU64::new(0),
                         observed_bytes: AtomicU64::new(0),
@@ -274,83 +276,40 @@ impl OrdinaryTransports {
         self.pools.len()
     }
 
-    fn first_client(&self) -> reqwest::Client {
-        self.pools[0].http.clone()
-    }
-
-    fn acquire(&self, candidate_bytes: u64) -> OrdinaryTransportLease {
-        let mut next_tie = self.next_tie.lock().expect("transport tie lock poisoned");
-        let bootstrap_capacity = observed_capacity(&self.pools);
-        let len = self.pools.len();
-        let id = (0..len)
-            .map(|offset| (next_tie.wrapping_add(offset)) % len)
-            .min_by(|left, right| {
-                transport_finish_score(&self.pools[*left], candidate_bytes, bootstrap_capacity)
-                    .total_cmp(&transport_finish_score(
-                        &self.pools[*right],
-                        candidate_bytes,
-                        bootstrap_capacity,
-                    ))
-            })
-            .expect("ordinary transport exists");
-        *next_tie = (id + 1) % len;
+    async fn acquire(&self, priority: u64, candidate_bytes: u64) -> Option<OrdinaryTransportLease> {
+        let id = {
+            let mut next_tie = self.next_tie.lock().expect("transport tie lock poisoned");
+            let id = *next_tie;
+            *next_tie = (id + 1) % self.pools.len();
+            id
+        };
         let pool = &self.pools[id];
+        let permit = pool.budget.acquire(priority).await?;
         let active_at_admission = pool.active.fetch_add(1, Ordering::Relaxed) + 1;
         let outstanding_at_admission = pool
             .outstanding_bytes
             .fetch_add(candidate_bytes, Ordering::Relaxed)
             .saturating_add(candidate_bytes);
         let observed_at_admission = pool.observed_bytes.load(Ordering::Relaxed);
-        let effective_capacity = if observed_at_admission == 0 {
-            bootstrap_capacity
-        } else {
-            observed_at_admission
-        };
-        OrdinaryTransportLease {
+        Some(OrdinaryTransportLease {
             id,
             active_at_admission,
             outstanding_at_admission,
             observed_at_admission,
-            work_capacity_ratio: outstanding_at_admission as f64 / effective_capacity as f64,
+            work_capacity_ratio: outstanding_at_admission as f64
+                / observed_at_admission.max(1) as f64,
             remaining_bytes: candidate_bytes,
             pools: Arc::clone(&self.pools),
-        }
+            _permit: permit,
+        })
     }
-}
 
-fn observed_capacity(pools: &[OrdinaryTransportPool]) -> u64 {
-    let mut observed = pools
-        .iter()
-        .map(|pool| pool.observed_bytes.load(Ordering::Relaxed))
-        .filter(|bytes| *bytes > 0)
-        .collect::<Vec<_>>();
-    if observed.is_empty() {
-        return 1;
+    fn active(&self) -> usize {
+        self.pools
+            .iter()
+            .map(|pool| pool.active.load(Ordering::Relaxed))
+            .sum()
     }
-    observed.sort_unstable();
-    observed[observed.len() / 2]
-}
-
-/// Project each pool's remaining work against the useful capacity it has demonstrated during
-/// this install. All pools begin their initial work together, so the shared elapsed-time factor
-/// in `work / (observed_bytes / elapsed)` cancels when comparing candidates. A pool without body
-/// bytes yet borrows the median observation instead of winning merely because it is unknown.
-fn transport_finish_score(
-    pool: &OrdinaryTransportPool,
-    candidate_bytes: u64,
-    bootstrap_capacity: u64,
-) -> f64 {
-    let observed = pool.observed_bytes.load(Ordering::Relaxed);
-    let capacity = if observed == 0 {
-        bootstrap_capacity
-    } else {
-        observed
-    };
-    let work = pool
-        .outstanding_bytes
-        .load(Ordering::Relaxed)
-        .saturating_add(candidate_bytes);
-    work as f64 / capacity as f64
 }
 
 #[derive(Debug)]
@@ -362,6 +321,7 @@ struct OrdinaryTransportLease {
     work_capacity_ratio: f64,
     remaining_bytes: u64,
     pools: Arc<Vec<OrdinaryTransportPool>>,
+    _permit: RequestPermit,
 }
 
 impl OrdinaryTransportLease {
@@ -406,7 +366,6 @@ pub struct TransferRuntime {
     transport: GhcrTransport,
     ordinary_http: OrdinaryTransports,
     emergency_http: reqwest::Client,
-    ordinary: RequestBudget,
     emergency: Arc<Semaphore>,
     activity: Arc<Mutex<RuntimeActivity>>,
     next_attempt_id: Arc<AtomicU64>,
@@ -416,12 +375,14 @@ pub struct TransferRuntime {
 
 impl TransferRuntime {
     pub fn new(
+        resolver_http: reqwest::Client,
         ordinary_http: Vec<reqwest::Client>,
         emergency_http: reqwest::Client,
         transport_profile: impl Into<String>,
     ) -> Self {
         Self::with_policy_and_profile(
             ordinary_http,
+            resolver_http,
             emergency_http,
             TransferPolicy::default(),
             transport_profile.into(),
@@ -430,25 +391,38 @@ impl TransferRuntime {
 
     #[cfg(test)]
     fn with_policy(
+        resolver_http: reqwest::Client,
         ordinary_http: Vec<reqwest::Client>,
         emergency_http: reqwest::Client,
         policy: TransferPolicy,
     ) -> Self {
-        Self::with_policy_and_profile(ordinary_http, emergency_http, policy, "test".to_string())
+        Self::with_policy_and_profile(
+            ordinary_http,
+            resolver_http,
+            emergency_http,
+            policy,
+            "test".to_string(),
+        )
     }
 
     fn with_policy_and_profile(
         ordinary_http: Vec<reqwest::Client>,
+        resolver_http: reqwest::Client,
         emergency_http: reqwest::Client,
         policy: TransferPolicy,
         transport_profile: String,
     ) -> Self {
-        let ordinary_http = OrdinaryTransports::new(ordinary_http);
+        assert!(
+            policy.ordinary_attempts >= ordinary_http.len()
+                && policy.ordinary_attempts.is_multiple_of(ordinary_http.len()),
+            "ordinary request budget must divide evenly across transport pools"
+        );
+        let attempts_per_pool = policy.ordinary_attempts / ordinary_http.len();
+        let ordinary_http = OrdinaryTransports::new(ordinary_http, attempts_per_pool);
         Self {
-            transport: GhcrTransport::new(ordinary_http.first_client()),
+            transport: GhcrTransport::new(resolver_http),
             ordinary_http,
             emergency_http,
-            ordinary: RequestBudget::new(policy.ordinary_attempts),
             emergency: Arc::new(Semaphore::new(policy.emergency_attempts)),
             activity: Arc::new(Mutex::new(RuntimeActivity::default())),
             next_attempt_id: Arc::new(AtomicU64::new(1)),
@@ -464,8 +438,12 @@ impl TransferRuntime {
         self.transport.configure_install_token(urls).await
     }
 
-    fn next_ordinary_transport(&self, candidate_bytes: u64) -> OrdinaryTransportLease {
-        self.ordinary_http.acquire(candidate_bytes)
+    async fn next_ordinary_transport(
+        &self,
+        priority: u64,
+        candidate_bytes: u64,
+    ) -> Option<OrdinaryTransportLease> {
+        self.ordinary_http.acquire(priority, candidate_bytes).await
     }
 
     pub async fn download_blob_to_path<F>(
@@ -476,9 +454,24 @@ impl TransferRuntime {
     where
         F: Fn(u64) + Send + Sync + 'static,
     {
-        let (header_name, header_value) =
-            self.transport.auth_header_for_blob_url(request.url).await?;
-        self.download_to_path(request, Some((header_name, header_value)), on_progress)
+        let trace = TransferTrace::new(
+            request.artifact_id,
+            self.ordinary_http.len(),
+            self.transport_profile.clone(),
+        );
+        let resolved = self.transport.resolve_blob_url(request.url).await?;
+        trace.redirect_resolved(
+            resolved.version,
+            resolved.status,
+            response_origin(&resolved.url),
+            resolved.elapsed,
+        );
+        let source = TransferSource::resolved(
+            request.url,
+            resolved.url.to_string(),
+            self.transport.clone(),
+        );
+        self.download_to_path(request, source, on_progress, trace)
             .await
     }
 
@@ -495,6 +488,11 @@ impl TransferRuntime {
     where
         F: Fn(u64) + Send + Sync + 'static,
     {
+        let trace = TransferTrace::new(
+            "test-artifact",
+            self.ordinary_http.len(),
+            self.transport_profile.clone(),
+        );
         self.download_to_path(
             TransferRequest {
                 artifact_id: "test-artifact",
@@ -504,8 +502,59 @@ impl TransferRuntime {
                 expected_size,
                 priority: 0,
             },
-            auth_header,
+            TransferSource::direct(url, auth_header),
             on_progress,
+            trace,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    async fn download_after_redirect_with_header_to_path<F>(
+        &self,
+        url: &str,
+        dest: &Path,
+        expected_sha256: &str,
+        expected_size: Option<u64>,
+        auth_header: (String, String),
+        on_progress: Arc<F>,
+    ) -> Result<TransferReport>
+    where
+        F: Fn(u64) + Send + Sync + 'static,
+    {
+        let trace = TransferTrace::new(
+            "test-artifact",
+            self.ordinary_http.len(),
+            self.transport_profile.clone(),
+        );
+        if let Some(token) = auth_header.1.strip_prefix("Bearer ") {
+            self.transport.set_test_install_token(token).await;
+        }
+        let resolved = self
+            .transport
+            .resolve_blob_url_with_header(url, &auth_header.0, &auth_header.1)
+            .await?;
+        trace.redirect_resolved(
+            resolved.version,
+            resolved.status,
+            response_origin(&resolved.url),
+            resolved.elapsed,
+        );
+        let source =
+            TransferSource::resolved(url, resolved.url.to_string(), self.transport.clone());
+        self.download_to_path(
+            TransferRequest {
+                artifact_id: "test-artifact",
+                url,
+                dest,
+                expected_sha256,
+                expected_size,
+                priority: 0,
+            },
+            source,
+            on_progress,
+            trace,
         )
         .await
     }
@@ -513,32 +562,28 @@ impl TransferRuntime {
     async fn download_to_path<F>(
         &self,
         request: TransferRequest<'_>,
-        auth_header: Option<(String, String)>,
+        source: TransferSource,
         on_progress: Arc<F>,
+        trace: Arc<TransferTrace>,
     ) -> Result<TransferReport>
     where
         F: Fn(u64) + Send + Sync + 'static,
     {
         let TransferRequest {
-            artifact_id,
+            artifact_id: _,
             url,
             dest,
             expected_sha256,
             expected_size,
             priority,
         } = request;
-        let trace = TransferTrace::new(
-            artifact_id,
-            self.ordinary_http.len(),
-            self.transport_profile.clone(),
-        );
         let Some(expected_size) = expected_size else {
             return self
                 .download_unknown_size_to_path(
-                    url,
+                    source,
                     dest,
+                    url,
                     expected_sha256,
-                    auth_header,
                     priority,
                     on_progress,
                     trace,
@@ -550,8 +595,7 @@ impl TransferRuntime {
         }
 
         let staging = StagingFile::create(dest, Some(expected_size)).await?;
-        let ranges = segment_ranges(expected_size, &self.policy);
-        let range_count = ranges.len();
+        let range_count = segment_count(expected_size, &self.policy);
         let activity = self.register_artifact(priority, range_count);
         trace.record(TransferEvent::artifact(
             "artifact_started",
@@ -569,7 +613,15 @@ impl TransferRuntime {
         let last_reported_at = Arc::new(Mutex::new(Instant::now()));
         let mut tasks = JoinSet::new();
         let mut next_range = 0_usize;
-        let window = self.policy.ordinary_attempts.min(range_count).max(1);
+        // Keep one queued range per transport lane behind the active requests. Without this
+        // lookahead, releasing a permit could admit lower-priority work before this artifact's
+        // supervisor had observed completion and generated its replacement range.
+        let window = self
+            .policy
+            .ordinary_attempts
+            .saturating_add(self.ordinary_http.len())
+            .min(range_count)
+            .max(1);
         while next_range < window {
             spawn_segment(
                 &mut tasks,
@@ -577,11 +629,10 @@ impl TransferRuntime {
                     runtime: self.clone(),
                     activity: activity.handle(),
                     trace: Arc::clone(&trace),
-                    url: url.to_string(),
+                    source: source.clone(),
                     dest: dest.to_path_buf(),
                     staging: staging.clone(),
-                    auth_header: auth_header.clone(),
-                    range: ranges[next_range],
+                    range: segment_range(expected_size, next_range, &self.policy),
                     expected_size,
                     initial_whole_request: is_whole_request,
                     segment_index: next_range,
@@ -608,11 +659,10 @@ impl TransferRuntime {
                                 runtime: self.clone(),
                                 activity: activity.handle(),
                                 trace: Arc::clone(&trace),
-                                url: url.to_string(),
+                                source: source.clone(),
                                 dest: dest.to_path_buf(),
                                 staging: staging.clone(),
-                                auth_header: auth_header.clone(),
-                                range: ranges[next_range],
+                                range: segment_range(expected_size, next_range, &self.policy),
                                 expected_size,
                                 initial_whole_request: false,
                                 segment_index: next_range,
@@ -687,7 +737,7 @@ impl TransferRuntime {
             range_count as u32,
             verify_seconds,
             sync_seconds,
-            self.ordinary.active(),
+            self.ordinary_http.active(),
             self.emergency_active(),
         );
         drop(activity);
@@ -701,10 +751,10 @@ impl TransferRuntime {
     #[allow(clippy::too_many_arguments)]
     async fn download_unknown_size_to_path<F>(
         &self,
-        url: &str,
+        source: TransferSource,
         dest: &Path,
+        display_url: &str,
         expected_sha256: &str,
-        auth_header: Option<(String, String)>,
         priority: u64,
         on_progress: Arc<F>,
         trace: Arc<TransferTrace>,
@@ -719,13 +769,11 @@ impl TransferRuntime {
         let mut max_reported = 0_u64;
         loop {
             let queued = Instant::now();
-            let permit = self
-                .ordinary
-                .acquire(priority)
+            let attempt_id = self.next_attempt_id();
+            let mut transport = self
+                .next_ordinary_transport(priority, self.policy.target_part_size)
                 .await
                 .ok_or_else(|| anyhow::anyhow!("download request budget closed"))?;
-            let attempt_id = self.next_attempt_id();
-            let mut transport = self.next_ordinary_transport(self.policy.target_part_size);
             trace.attempt_started(
                 attempt_id,
                 AttemptKind::from_retries(retries),
@@ -734,17 +782,18 @@ impl TransferRuntime {
                 self.counts(),
                 Some(transport.assignment()),
             );
-            let mut request = transport.client().get(url);
-            if let Some((name, value)) = &auth_header {
+            let (request_url, request_header) = source.request().await;
+            let mut request = transport.client().get(&request_url);
+            if let Some((name, value)) = &request_header {
                 request = request.header(name, value);
             }
             let response = match request.send().await {
                 Ok(response) => response,
                 Err(error) => {
-                    let failure = AttemptFailure::Request(error);
+                    let failure = AttemptFailure::Request(error.without_url());
                     trace.attempt_failed(attempt_id, &failure, self.counts());
                     drop(transport);
-                    drop(permit);
+
                     retries = retries.saturating_add(1);
                     let delay = self.policy.retry_delay(retries);
                     trace.retry_scheduled(attempt_id, delay, self.counts());
@@ -759,6 +808,23 @@ impl TransferRuntime {
                 response_origin(response.url()),
                 self.counts(),
             );
+            if source
+                .refresh_if_rejected(&request_url, response.status())
+                .await
+                .map_err(AttemptFailure::SourceResolution)?
+            {
+                let failure = AttemptFailure::RetryableStatus {
+                    status: response.status(),
+                    retry_after: retry_after(response.headers()),
+                };
+                trace.attempt_failed(attempt_id, &failure, self.counts());
+                drop(transport);
+                retries = retries.saturating_add(1);
+                let delay = self.policy.retry_delay(retries);
+                trace.retry_scheduled(attempt_id, delay, self.counts());
+                tokio::time::sleep(delay).await;
+                continue;
+            }
             if response.status() != StatusCode::OK {
                 let retry_after = retry_after(response.headers());
                 let failure = AttemptFailure::RetryableStatus {
@@ -767,7 +833,7 @@ impl TransferRuntime {
                 };
                 trace.attempt_failed(attempt_id, &failure, self.counts());
                 drop(transport);
-                drop(permit);
+
                 retries = retries.saturating_add(1);
                 let delay = retry_after.unwrap_or_else(|| self.policy.retry_delay(retries));
                 trace.retry_scheduled(attempt_id, delay, self.counts());
@@ -793,7 +859,7 @@ impl TransferRuntime {
                         });
                         event.attempt = Some(attempt_id);
                         event.bytes = Some(received + chunk_len);
-                        event.ordinary_in_flight = self.ordinary.active();
+                        event.ordinary_in_flight = self.ordinary_http.active();
                         event.emergency_in_flight = self.emergency_active();
                         trace.record(event);
                         let chunk = staging.write_all_at(dest, received, chunk).await?;
@@ -806,13 +872,12 @@ impl TransferRuntime {
                         }
                     }
                     Err(error) => {
-                        body_error = Some(AttemptFailure::Body(error));
+                        body_error = Some(AttemptFailure::Body(error.without_url()));
                         break;
                     }
                 }
             }
             drop(transport);
-            drop(permit);
             if let Some(error) = body_error {
                 trace.attempt_failed(attempt_id, &error, self.counts());
                 retries = retries.saturating_add(1);
@@ -830,7 +895,7 @@ impl TransferRuntime {
                     1,
                     0.0,
                     0.0,
-                    Sha256Mismatch::new(url, expected_sha256, actual).into(),
+                    Sha256Mismatch::new(display_url, expected_sha256, actual).into(),
                 ));
             }
             let sync_started = Instant::now();
@@ -842,7 +907,7 @@ impl TransferRuntime {
                 1,
                 0.0,
                 sync_seconds,
-                self.ordinary.active(),
+                self.ordinary_http.active(),
                 self.emergency_active(),
             );
             drop(activity);
@@ -873,7 +938,7 @@ impl TransferRuntime {
                 segments,
                 verify_seconds,
                 sync_seconds,
-                self.ordinary.active(),
+                self.ordinary_http.active(),
                 self.emergency_active(),
             ),
             source,
@@ -936,7 +1001,7 @@ impl TransferRuntime {
 
     fn counts(&self) -> RequestCounts {
         RequestCounts {
-            ordinary: self.ordinary.active(),
+            ordinary: self.ordinary_http.active(),
             emergency: self.emergency_active(),
         }
     }
@@ -1034,6 +1099,69 @@ pub(crate) struct TransferRequest<'a> {
     pub(crate) expected_sha256: &'a str,
     pub(crate) expected_size: Option<u64>,
     pub(crate) priority: u64,
+}
+
+#[derive(Clone)]
+pub(super) struct TransferSource {
+    display_url: String,
+    current_url: Arc<RwLock<String>>,
+    request_header: Option<(String, String)>,
+    resolver: Option<GhcrTransport>,
+}
+
+impl TransferSource {
+    #[cfg(test)]
+    fn direct(url: &str, request_header: Option<(String, String)>) -> Self {
+        Self {
+            display_url: url.to_string(),
+            current_url: Arc::new(RwLock::new(url.to_string())),
+            request_header,
+            resolver: None,
+        }
+    }
+
+    fn resolved(original_url: &str, current_url: String, resolver: GhcrTransport) -> Self {
+        Self {
+            display_url: original_url.to_string(),
+            current_url: Arc::new(RwLock::new(current_url)),
+            request_header: None,
+            resolver: Some(resolver),
+        }
+    }
+
+    pub(super) async fn request(&self) -> (String, Option<(String, String)>) {
+        (
+            self.current_url.read().await.clone(),
+            self.request_header.clone(),
+        )
+    }
+
+    pub(super) fn display_url(&self) -> &str {
+        &self.display_url
+    }
+
+    pub(super) async fn refresh_if_rejected(
+        &self,
+        attempted_url: &str,
+        status: StatusCode,
+    ) -> Result<bool> {
+        if status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN {
+            return Ok(false);
+        }
+        let Some(resolver) = &self.resolver else {
+            return Ok(false);
+        };
+        let mut current = self.current_url.write().await;
+        if current.as_str() != attempted_url {
+            return Ok(true);
+        }
+        *current = resolver
+            .resolve_blob_url(&self.display_url)
+            .await?
+            .url
+            .to_string();
+        Ok(true)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1145,6 +1273,8 @@ enum AttemptFailure {
     InvalidRange(String),
     #[error("local I/O failed: {0}")]
     LocalIo(String),
+    #[error("resolving artifact source failed")]
+    SourceResolution(#[source] anyhow::Error),
     #[error("download request budget closed")]
     BudgetClosed,
 }
@@ -1469,6 +1599,20 @@ impl TransferTrace {
         self.record(event);
     }
 
+    fn redirect_resolved(
+        &self,
+        version: reqwest::Version,
+        status: StatusCode,
+        destination_origin: Option<String>,
+        _elapsed: Duration,
+    ) {
+        let mut event = TransferEvent::simple("source_url_resolved");
+        event.http_version = Some(format!("{version:?}"));
+        event.response_origin = destination_origin;
+        event.status = Some(status.as_u16());
+        self.record(event);
+    }
+
     fn logical_progress(&self, bytes: u64) {
         self.logical_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
@@ -1742,7 +1886,6 @@ struct RequestBudget {
 
 #[derive(Debug)]
 struct RequestBudgetState {
-    limit: usize,
     available: usize,
     next_sequence: u64,
     waiters: BTreeMap<(u64, u64), oneshot::Sender<RequestPermit>>,
@@ -1753,7 +1896,6 @@ impl RequestBudget {
         let limit = limit.max(1);
         Self {
             inner: Arc::new(Mutex::new(RequestBudgetState {
-                limit,
                 available: limit,
                 next_sequence: 0,
                 waiters: BTreeMap::new(),
@@ -1779,11 +1921,6 @@ impl RequestBudget {
         let permit = receiver.await.ok()?;
         cleanup.armed = false;
         Some(permit)
-    }
-
-    fn active(&self) -> usize {
-        let state = self.inner.lock().expect("request budget lock poisoned");
-        state.limit.saturating_sub(state.available)
     }
 
     #[cfg(test)]
@@ -1934,22 +2071,31 @@ fn report_progress<F>(
     }
 }
 
-fn segment_ranges(size: u64, policy: &TransferPolicy) -> Vec<ByteRange> {
+fn segment_count(size: u64, policy: &TransferPolicy) -> usize {
     if !should_use_multipart(size, policy) {
-        return vec![ByteRange {
+        return 1;
+    }
+    size.div_ceil(policy.target_part_size)
+        .max(MIN_MULTIPART_PARTS) as usize
+}
+
+fn segment_range(size: u64, index: usize, policy: &TransferPolicy) -> ByteRange {
+    if !should_use_multipart(size, policy) {
+        debug_assert_eq!(index, 0);
+        return ByteRange {
             start: 0,
             end: size - 1,
-        }];
+        };
     }
-    let part_count = size
-        .div_ceil(policy.target_part_size)
-        .max(MIN_MULTIPART_PARTS) as usize;
-    (0..part_count)
-        .map(|index| {
-            let start = index as u64 * policy.target_part_size;
-            let end = (start + policy.target_part_size).min(size) - 1;
-            ByteRange { start, end }
-        })
+    let start = index as u64 * policy.target_part_size;
+    let end = (start + policy.target_part_size).min(size) - 1;
+    ByteRange { start, end }
+}
+
+#[cfg(test)]
+fn segment_ranges(size: u64, policy: &TransferPolicy) -> Vec<ByteRange> {
+    (0..segment_count(size, policy))
+        .map(|index| segment_range(size, index, policy))
         .collect()
 }
 
@@ -1966,8 +2112,8 @@ const PROGRESS_REPORT_INTERVAL: Duration = Duration::from_millis(250);
 const PROGRESS_TRACE_BYTES: u64 = 1024 * 1024;
 const PROGRESS_TRACE_INTERVAL: Duration = Duration::from_secs(1);
 const MIB: u64 = 1024 * 1024;
-const MIN_MULTIPART_SIZE: u64 = 10 * MIB;
-const TARGET_PART_SIZE: u64 = 10 * MIB;
+const MIN_MULTIPART_SIZE: u64 = MIB;
+const TARGET_PART_SIZE: u64 = MIB;
 const MIN_MULTIPART_PARTS: u64 = 2;
 
 #[cfg(test)]

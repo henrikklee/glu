@@ -1,7 +1,7 @@
 use super::{
     report_progress, retry_after, validate_content_range, ArtifactActivity, AttemptFailure,
     AttemptKind, AttemptProgress, ByteRange, SegmentReport, StagingFile, TransferEvent,
-    TransferRuntime, TransferTrace,
+    TransferRuntime, TransferSource, TransferTrace,
 };
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -21,10 +21,10 @@ pub(super) struct SegmentJob<F> {
     pub(super) runtime: TransferRuntime,
     pub(super) activity: ArtifactActivity,
     pub(super) trace: Arc<TransferTrace>,
-    pub(super) url: String,
+    pub(super) source: TransferSource,
     pub(super) dest: PathBuf,
     pub(super) staging: StagingFile,
-    pub(super) auth_header: Option<(String, String)>,
+
     pub(super) range: ByteRange,
     pub(super) expected_size: u64,
     pub(super) initial_whole_request: bool,
@@ -188,7 +188,7 @@ where
                                 let mut event = TransferEvent::simple("emergency_won");
                                 event.attempt = Some(outcome.id);
                                 event.range = Some(ByteRange { start, end: job.range.end });
-                                event.ordinary_in_flight = job.runtime.ordinary.active();
+                                event.ordinary_in_flight = job.runtime.ordinary_http.active();
                                 event.emergency_in_flight = job.runtime.emergency_active();
                                 job.trace.record(event);
                                 let _ = tokio::fs::remove_file(path).await;
@@ -303,10 +303,10 @@ where
         kind,
         runtime: job.runtime.clone(),
         trace: Arc::clone(&job.trace),
-        url: job.url.clone(),
+        source: job.source.clone(),
         dest: job.dest.clone(),
         staging: job.staging.clone(),
-        auth_header: job.auth_header.clone(),
+
         range: request_range,
         expected_size: job.expected_size,
         whole_request: kind == AttemptKind::Initial && job.initial_whole_request,
@@ -352,9 +352,9 @@ where
         id,
         runtime: job.runtime.clone(),
         trace: Arc::clone(&job.trace),
-        url: job.url.clone(),
+        source: job.source.clone(),
         path: path.clone(),
-        auth_header: job.auth_header.clone(),
+
         range,
         expected_size: job.expected_size,
         progress: Arc::new(AttemptProgress::new(job.runtime.policy.rolling_window)),
@@ -385,10 +385,10 @@ struct PrimaryAttempt<F> {
     kind: AttemptKind,
     runtime: TransferRuntime,
     trace: Arc<TransferTrace>,
-    url: String,
+    source: TransferSource,
     dest: PathBuf,
     staging: StagingFile,
-    auth_header: Option<(String, String)>,
+
     range: ByteRange,
     expected_size: u64,
     whole_request: bool,
@@ -409,13 +409,11 @@ where
     F: Fn(u64) + Send + Sync + 'static,
 {
     let queued = Instant::now();
-    let _permit = attempt
+    let mut transport = attempt
         .runtime
-        .ordinary
-        .acquire(attempt.priority)
+        .next_ordinary_transport(attempt.priority, attempt.range.len())
         .await
         .ok_or(AttemptFailure::BudgetClosed)?;
-    let mut transport = attempt.runtime.next_ordinary_transport(attempt.range.len());
     attempt.progress.request_started();
     attempt.trace.attempt_started(
         attempt.id,
@@ -425,10 +423,11 @@ where
         attempt.runtime.counts(),
         Some(transport.assignment()),
     );
+    let (request_url, request_header) = attempt.source.request().await;
     let response = match send_attempt_request(
         transport.client(),
-        &attempt.url,
-        attempt.auth_header.as_ref(),
+        &request_url,
+        request_header.as_ref(),
         (!attempt.whole_request).then_some(attempt.range),
     )
     .await
@@ -448,11 +447,26 @@ where
         super::response_origin(response.url()),
         attempt.runtime.counts(),
     );
+    if attempt
+        .source
+        .refresh_if_rejected(&request_url, response.status())
+        .await
+        .map_err(AttemptFailure::SourceResolution)?
+    {
+        let error = AttemptFailure::RetryableStatus {
+            status: response.status(),
+            retry_after: retry_after(response.headers()),
+        };
+        attempt
+            .trace
+            .attempt_failed(attempt.id, &error, attempt.runtime.counts());
+        return Err(error);
+    }
     if let Err(error) = validate_attempt_response(
         &response,
         (!attempt.whole_request).then_some(attempt.range),
         attempt.expected_size,
-        &attempt.url,
+        attempt.source.display_url(),
     ) {
         attempt
             .trace
@@ -469,7 +483,7 @@ where
             Some(Ok(chunk)) => chunk,
             Some(Err(source)) => {
                 finish_primary_write(&attempt, pending_write.take()).await?;
-                let error = AttemptFailure::Body(source);
+                let error = AttemptFailure::Body(source.without_url());
                 attempt
                     .trace
                     .attempt_failed(attempt.id, &error, attempt.runtime.counts());
@@ -557,9 +571,9 @@ struct EmergencyAttempt {
     id: u64,
     runtime: TransferRuntime,
     trace: Arc<TransferTrace>,
-    url: String,
+    source: TransferSource,
     path: PathBuf,
-    auth_header: Option<(String, String)>,
+
     range: ByteRange,
     expected_size: u64,
     progress: Arc<AttemptProgress>,
@@ -578,10 +592,11 @@ async fn run_emergency_attempt(
         attempt.runtime.counts(),
         None,
     );
+    let (request_url, request_header) = attempt.source.request().await;
     let response = match send_attempt_request(
         &attempt.runtime.emergency_http,
-        &attempt.url,
-        attempt.auth_header.as_ref(),
+        &request_url,
+        request_header.as_ref(),
         Some(attempt.range),
     )
     .await
@@ -601,11 +616,26 @@ async fn run_emergency_attempt(
         super::response_origin(response.url()),
         attempt.runtime.counts(),
     );
+    if attempt
+        .source
+        .refresh_if_rejected(&request_url, response.status())
+        .await
+        .map_err(AttemptFailure::SourceResolution)?
+    {
+        let error = AttemptFailure::RetryableStatus {
+            status: response.status(),
+            retry_after: retry_after(response.headers()),
+        };
+        attempt
+            .trace
+            .attempt_failed(attempt.id, &error, attempt.runtime.counts());
+        return Err(error);
+    }
     if let Err(error) = validate_attempt_response(
         &response,
         Some(attempt.range),
         attempt.expected_size,
-        &attempt.url,
+        attempt.source.display_url(),
     ) {
         attempt
             .trace
@@ -622,7 +652,7 @@ async fn run_emergency_attempt(
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(source) => {
-                let error = AttemptFailure::Body(source);
+                let error = AttemptFailure::Body(source.without_url());
                 attempt
                     .trace
                     .attempt_failed(attempt.id, &error, attempt.runtime.counts());
@@ -688,7 +718,7 @@ fn record_network_chunk(
         event.attempt = Some(attempt_id);
         event.range = Some(range);
         event.bytes = Some(sample.total);
-        event.ordinary_in_flight = runtime.ordinary.active();
+        event.ordinary_in_flight = runtime.ordinary_http.active();
         event.emergency_in_flight = runtime.emergency_active();
         trace.record(event);
     }
@@ -707,7 +737,10 @@ async fn send_attempt_request(
     if let Some(range) = range {
         request = request.header(header::RANGE, range.header_value());
     }
-    request.send().await.map_err(AttemptFailure::Request)
+    request
+        .send()
+        .await
+        .map_err(|error| AttemptFailure::Request(error.without_url()))
 }
 
 fn validate_attempt_response(
@@ -777,7 +810,7 @@ where
     let mut event = TransferEvent::simple("range_completed");
     event.attempt = Some(attempt);
     event.range = Some(job.range);
-    event.ordinary_in_flight = job.runtime.ordinary.active();
+    event.ordinary_in_flight = job.runtime.ordinary_http.active();
     event.emergency_in_flight = job.runtime.emergency_active();
     job.trace.record(event);
 }
@@ -797,7 +830,7 @@ fn range_failure<F>(job: &SegmentJob<F>, attempts: u32, source: AttemptFailure) 
     RangeTransferFailed {
         start: job.range.start,
         end: job.range.end,
-        url: job.url.clone(),
+        url: job.source.display_url().to_string(),
         attempts,
         source,
     }

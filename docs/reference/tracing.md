@@ -106,7 +106,7 @@ Current node kinds include:
 
 A `ghcr_bottle_download` node represents the complete artifact operation. Runtime ranges, retries, and emergency attempts remain beneath that node and do not appear as additional DAG nodes. Fresh downloads persist their transfer history under `diagnostics["download:<node-id>"]`, including terminal protocol, local I/O, or integrity failures.
 
-Transfer diagnostics separate logical committed bytes from total wire bytes and record queue time independently from network timing. Their `events` array contains request admission, selected transport-pool ID, that pool's active and outstanding work at admission, capacity observations, response origin, response headers, negotiated HTTP version, actual first body byte, sampled body progress, failures, retry backoff, emergency evidence, winner, cancellation, range completion, verification, and artifact completion. `transport_profile` identifies the allocator/transport configuration that produced the trace. Attempt failure text retains the structured source chain available from reqwest. These records are passive: trace persistence and presentation do not participate in scheduling.
+Transfer diagnostics separate logical committed bytes from total wire bytes and record queue time independently from network timing. Their `events` array begins with `source_url_resolved` for the no-follow GHCR redirect, then records request admission, fixed transport-lane ID and active load, response origin, response headers, negotiated HTTP version, actual first body byte, sampled body progress, failures, retry backoff, emergency evidence, winner, cancellation, range completion, verification, and artifact completion. Signed CDN query parameters are never recorded. `transport_profile` identifies the allocator/transport configuration that produced the trace. Attempt failure text retains the structured source chain available from reqwest without request URLs. These records are passive: trace persistence and presentation do not participate in scheduling.
 
 ## Pools
 
@@ -144,7 +144,7 @@ Fresh `ghcr_bottle_download` nodes record four contiguous summary subphases in t
 
 | Subphase | Meaning |
 |---|---|
-| `wait_first_byte` | Artifact-node start through the first actual response-body byte, including any initial admission wait. |
+| `wait_first_byte` | Artifact-node start through the first actual response-body byte, including signed-URL resolution and any initial admission wait. |
 | `body_write` | First body byte through completion of all ordinary/retried/raced range writes. |
 | `verify` | Complete-artifact SHA-256 verification. |
 | `sync` | Synchronizing the verified staging descriptor before cache admission. |

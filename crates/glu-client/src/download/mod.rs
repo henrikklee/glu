@@ -103,9 +103,10 @@ pub struct ArtifactDownloader {
 
 impl ArtifactDownloader {
     pub fn new(prefix: &Prefix) -> Self {
-        // Independent clients prevent one pathological HTTP/2 connection pool from coupling the
-        // complete install. The transfer allocator concentrates new ranges on pools that have
-        // delivered the most useful capacity while retaining one global logical request budget.
+        // Resolve each authenticated GHCR redirect once, then reuse its signed CDN URL for all
+        // ranges. Four fixed four-slot pools bound a slow connection to four 1 MiB assignments;
+        // each free slot pulls its lane's highest-priority waiting range.
+        let resolver_http = artifact_redirect_client();
         let ordinary_http = (0..ORDINARY_TRANSPORT_POOLS)
             .map(|_| artifact_http_client())
             .collect();
@@ -113,9 +114,10 @@ impl ArtifactDownloader {
         Self {
             cache: ArtifactCache::new(prefix),
             transfers: TransferRuntime::new(
+                resolver_http,
                 ordinary_http,
                 emergency_http,
-                format!("negotiated-{ORDINARY_TRANSPORT_POOLS}-pools-capacity-weighted"),
+                format!("direct-cdn-1mib-{ORDINARY_TRANSPORT_POOLS}x4"),
             ),
         }
     }
@@ -246,9 +248,20 @@ fn is_sha256_mismatch(error: &anyhow::Error) -> bool {
 const ORDINARY_TRANSPORT_POOLS: usize = 4;
 
 fn artifact_http_client() -> reqwest::Client {
+    artifact_http_client_builder()
+        .build()
+        .expect("failed to build HTTP client")
+}
+
+fn artifact_redirect_client() -> reqwest::Client {
+    artifact_http_client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("failed to build redirect HTTP client")
+}
+
+fn artifact_http_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .read_timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("failed to build HTTP client")
 }

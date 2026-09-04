@@ -24,26 +24,26 @@ fn reports_every_tenth_of_a_megabyte() {
 }
 
 #[test]
-fn chunking_starts_above_ten_mib() {
+fn chunking_starts_above_one_mib() {
     let policy = TransferPolicy::default();
-    assert!(!should_use_multipart(10 * MIB, &policy));
-    assert!(should_use_multipart(10 * MIB + 1, &policy));
+    assert!(!should_use_multipart(MIB, &policy));
+    assert!(should_use_multipart(MIB + 1, &policy));
 }
 
 #[test]
 fn segment_ranges_stay_fixed_size_for_very_large_artifacts() {
     let ranges = segment_ranges(64 * MIB, &TransferPolicy::default());
-    assert_eq!(ranges.len(), 7);
+    assert_eq!(ranges.len(), 64);
     assert_eq!(ranges.first().unwrap().start, 0);
     assert_eq!(ranges.last().unwrap().end, 64 * MIB - 1);
-    assert!(ranges.iter().all(|range| range.len() <= 10 * MIB));
+    assert!(ranges.iter().all(|range| range.len() <= MIB));
     assert_eq!(
         segment_ranges(164 * MIB, &TransferPolicy::default()).len(),
-        17
+        164
     );
     let huge = segment_ranges(2_240 * MIB, &TransferPolicy::default());
-    assert_eq!(huge.len(), 224);
-    assert!(huge.iter().all(|range| range.len() <= 10 * MIB));
+    assert_eq!(huge.len(), 2_240);
+    assert!(huge.iter().all(|range| range.len() <= MIB));
     assert_eq!(huge.last().unwrap().end, 2_240 * MIB - 1);
 }
 
@@ -58,7 +58,7 @@ fn small_artifact_is_one_segment() {
 #[test]
 fn segment_ranges_cover_odd_sizes_without_overlap() {
     let ranges = segment_ranges(100 * MIB + 123, &TransferPolicy::default());
-    assert_eq!(ranges.len(), 11);
+    assert_eq!(ranges.len(), 101);
     assert_eq!(ranges.first().unwrap().start, 0);
     assert_eq!(ranges.last().unwrap().end, 100 * MIB + 122);
     for pair in ranges.windows(2) {
@@ -173,7 +173,9 @@ async fn request_budget_runs_higher_priority_first() {
 #[derive(Debug)]
 struct TestRequest {
     sequence: usize,
+    path: String,
     range: Option<ByteRange>,
+    authorization: Option<String>,
 }
 
 struct TestServer {
@@ -251,6 +253,12 @@ fn read_request(stream: &mut TcpStream, sequence: usize) -> TestRequest {
         bytes.extend_from_slice(&buffer[..read]);
     }
     let headers = String::from_utf8_lossy(&bytes);
+    let path = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/")
+        .to_string();
     let range = headers.lines().find_map(|line| {
         let (name, value) = line.split_once(':')?;
         if !name.eq_ignore_ascii_case("range") {
@@ -263,7 +271,17 @@ fn read_request(stream: &mut TcpStream, sequence: usize) -> TestRequest {
             end: end.parse().ok()?,
         })
     });
-    TestRequest { sequence, range }
+    let authorization = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("authorization")
+            .then(|| value.trim().to_string())
+    });
+    TestRequest {
+        sequence,
+        path,
+        range,
+        authorization,
+    }
 }
 
 fn write_response(
@@ -287,6 +305,15 @@ fn write_response(
     let _ = stream.flush();
 }
 
+fn write_redirect(stream: &mut TcpStream, location: &str) {
+    write!(
+        stream,
+        "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    stream.flush().unwrap();
+}
+
 fn sha256(bytes: &[u8]) -> String {
     crate::hash::hex_lower(digest::digest(&digest::SHA256, bytes).as_ref())
 }
@@ -299,7 +326,13 @@ fn test_manager(policy: TransferPolicy) -> super::TransferRuntime {
             .build()
             .unwrap()
     };
-    super::TransferRuntime::with_policy(vec![client()], client(), policy)
+    let resolver = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(1))
+        .read_timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    super::TransferRuntime::with_policy(resolver, vec![client()], client(), policy)
 }
 
 #[test]
@@ -307,8 +340,15 @@ fn transport_assignment_explores_equal_unknown_pools() {
     let clients = (0..4)
         .map(|_| reqwest::Client::builder().build().unwrap())
         .collect();
-    let transports = super::OrdinaryTransports::new(clients);
-    let first = (0..4).map(|_| transports.acquire(100)).collect::<Vec<_>>();
+    let transports = super::OrdinaryTransports::new(clients, 4);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let first = runtime.block_on(async {
+        let mut leases = Vec::new();
+        for _ in 0..4 {
+            leases.push(transports.acquire(0, 100).await.unwrap());
+        }
+        leases
+    });
 
     assert_eq!(
         first.iter().map(|lease| lease.id).collect::<Vec<_>>(),
@@ -317,30 +357,31 @@ fn transport_assignment_explores_equal_unknown_pools() {
 }
 
 #[test]
-fn completed_slow_pool_does_not_automatically_receive_more_work() {
+fn transport_assignment_remains_fixed_round_robin_after_observation() {
     let clients = (0..2)
         .map(|_| reqwest::Client::builder().build().unwrap())
         .collect();
-    let transports = super::OrdinaryTransports::new(clients);
-    let mut fast = transports.acquire(100);
-    let mut slow = transports.acquire(100);
-    fast.record_bytes(100);
-    slow.record_bytes(10);
-    drop(fast);
-    drop(slow);
+    let transports = super::OrdinaryTransports::new(clients, 4);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let mut first = transports.acquire(0, 100).await.unwrap();
+        let mut second = transports.acquire(0, 100).await.unwrap();
+        first.record_bytes(100);
+        second.record_bytes(10);
+        drop(first);
+        drop(second);
 
-    let fast = transports.acquire(100);
-    assert_eq!(fast.id, 0);
-    let also_fast = transports.acquire(100);
-    assert_eq!(also_fast.id, 0);
-    assert_eq!(also_fast.active_at_admission, 2);
+        assert_eq!(transports.acquire(0, 100).await.unwrap().id, 0);
+        assert_eq!(transports.acquire(0, 100).await.unwrap().id, 1);
+    });
 }
 
 #[test]
 fn dropped_attempt_removes_unreceived_transport_work() {
     let clients = vec![reqwest::Client::builder().build().unwrap()];
-    let transports = super::OrdinaryTransports::new(clients);
-    let mut attempt = transports.acquire(100);
+    let transports = super::OrdinaryTransports::new(clients, 1);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut attempt = runtime.block_on(transports.acquire(0, 100)).unwrap();
     attempt.record_bytes(40);
     drop(attempt);
 
@@ -351,6 +392,35 @@ fn dropped_attempt_removes_unreceived_transport_work() {
         0
     );
     assert_eq!(transports.pools[0].active.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn fixed_transport_lanes_hold_four_attempts_each() {
+    let clients = (0..4)
+        .map(|_| reqwest::Client::builder().build().unwrap())
+        .collect();
+    let transports = super::OrdinaryTransports::new(clients, 4);
+    let mut leases = Vec::new();
+    for _ in 0..16 {
+        leases.push(transports.acquire(0, 100).await.unwrap());
+    }
+
+    assert_eq!(transports.active(), 16);
+    assert!(transports
+        .pools
+        .iter()
+        .all(|pool| pool.active.load(Ordering::Relaxed) == 4));
+
+    let waiting = transports.clone();
+    let waiter = tokio::spawn(async move { waiting.acquire(0, 100).await.unwrap() });
+    while transports.pools[0].budget.waiting() != 1 {
+        tokio::task::yield_now().await;
+    }
+    let released = leases.iter().position(|lease| lease.id == 0).unwrap();
+    drop(leases.swap_remove(released));
+    let replacement = waiter.await.unwrap();
+    assert_eq!(replacement.id, 0);
+    assert_eq!(replacement.active_at_admission, 4);
 }
 
 #[test]
@@ -576,6 +646,119 @@ async fn healthy_multipart_completes_without_speculation() {
         .segments
         .iter()
         .all(|segment| segment.attempts == 1 && segment.emergencies == 0));
+}
+
+#[tokio::test]
+async fn resolves_one_redirect_then_reuses_the_cdn_url_for_all_ranges() {
+    let data = Arc::new(vec![67_u8; 300_000]);
+    let redirects = Arc::new(AtomicUsize::new(0));
+    let cdn_requests = Arc::new(AtomicUsize::new(0));
+    let server = test_server({
+        let data = Arc::clone(&data);
+        let redirects = Arc::clone(&redirects);
+        let cdn_requests = Arc::clone(&cdn_requests);
+        move |request, stream| {
+            if request.path == "/artifact" {
+                redirects.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(request.authorization.as_deref(), Some("Bearer test-token"));
+                assert_eq!(request.range, None);
+                write_redirect(stream, "/cdn");
+                return;
+            }
+            assert_eq!(request.path, "/cdn");
+            assert_eq!(request.authorization, None);
+            cdn_requests.fetch_add(1, Ordering::Relaxed);
+            let range = request.range.expect("direct CDN request must use Range");
+            write_response(
+                stream,
+                "206 Partial Content",
+                range.len() as usize,
+                Some((range, data.len())),
+                &data[range.start as usize..=range.end as usize],
+            );
+        }
+    });
+    let policy = TransferPolicy {
+        multipart_threshold: 100_000,
+        target_part_size: 100_000,
+        emergency_per_range: 0,
+        ..TransferPolicy::default()
+    };
+    let manager = test_manager(policy);
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("artifact.tmp");
+    let report = manager
+        .download_after_redirect_with_header_to_path(
+            &server.url,
+            &path,
+            &sha256(&data),
+            Some(data.len() as u64),
+            ("Authorization".into(), "Bearer test-token".into()),
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(tokio::fs::read(path).await.unwrap(), *data);
+    assert_eq!(redirects.load(Ordering::Relaxed), 1);
+    assert_eq!(cdn_requests.load(Ordering::Relaxed), 3);
+    assert!(report
+        .diagnostics
+        .events
+        .iter()
+        .any(|event| event.event == "source_url_resolved" && event.status == Some(307)));
+}
+
+#[tokio::test]
+async fn rejected_signed_url_is_resolved_again_and_retried() {
+    let data = Arc::new(vec![71_u8; 50_000]);
+    let redirects = Arc::new(AtomicUsize::new(0));
+    let server = test_server({
+        let data = Arc::clone(&data);
+        let redirects = Arc::clone(&redirects);
+        move |request, stream| match request.path.as_str() {
+            "/artifact" => {
+                let redirect = redirects.fetch_add(1, Ordering::Relaxed);
+                write_redirect(stream, if redirect == 0 { "/expired" } else { "/cdn" });
+            }
+            "/expired" => write_response(stream, "403 Forbidden", 0, None, &[]),
+            "/cdn" => {
+                let range = request.range.expect("retry resumes with a range request");
+                write_response(
+                    stream,
+                    "206 Partial Content",
+                    range.len() as usize,
+                    Some((range, data.len())),
+                    &data[range.start as usize..=range.end as usize],
+                );
+            }
+            path => panic!("unexpected request path {path}"),
+        }
+    });
+    let policy = TransferPolicy {
+        retry_base: Duration::ZERO,
+        emergency_per_range: 0,
+        ..TransferPolicy::default()
+    };
+    let manager = test_manager(policy);
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("artifact.tmp");
+    let report = manager
+        .download_after_redirect_with_header_to_path(
+            &server.url,
+            &path,
+            &sha256(&data),
+            Some(data.len() as u64),
+            ("Authorization".into(), "Bearer test-token".into()),
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(tokio::fs::read(path).await.unwrap(), *data);
+    assert_eq!(redirects.load(Ordering::Relaxed), 2);
+    assert_eq!(report.segments[0].attempts, 2);
+    assert_eq!(report.diagnostics.retries, 1);
 }
 
 #[tokio::test]
@@ -938,6 +1121,60 @@ async fn multipart_requests_respect_the_shared_attempt_budget() {
         .unwrap();
 
     assert!(peak.load(Ordering::SeqCst) <= 2);
+}
+
+#[tokio::test]
+async fn multipart_keeps_one_priority_waiter_behind_each_busy_lane() {
+    let data = Arc::new(vec![17_u8; 300_000]);
+    let server = test_server(move |request, stream| {
+        let range = request.range.expect("multipart request must use Range");
+        let headers = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/300000\r\nConnection: close\r\n\r\n",
+            range.len(), range.start, range.end
+        );
+        stream.write_all(headers.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_millis(500));
+    });
+    let policy = TransferPolicy {
+        ordinary_attempts: 1,
+        multipart_threshold: 100_000,
+        target_part_size: 100_000,
+        emergency_warmup: Duration::from_secs(5),
+        ..TransferPolicy::default()
+    };
+    let manager = test_manager(policy);
+    let task_manager = manager.clone();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("artifact.tmp");
+    let url = server.url.clone();
+    let digest = sha256(&data);
+    let task = tokio::spawn(async move {
+        task_manager
+            .download_with_header_to_path(
+                &url,
+                &path,
+                &digest,
+                Some(data.len() as u64),
+                None,
+                Arc::new(|_| {}),
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let pool = &manager.ordinary_http.pools[0];
+            if pool.active.load(Ordering::Relaxed) == 1 && pool.budget.waiting() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("one active range retains one queued lookahead range");
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -1486,7 +1723,7 @@ async fn dropping_artifact_future_aborts_owned_attempts() {
         .await
         .is_err());
     tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(manager.ordinary.active(), 0);
+    assert_eq!(manager.ordinary_http.active(), 0);
     assert_eq!(manager.emergency_active(), 0);
     assert!(manager
         .activity
