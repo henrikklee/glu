@@ -72,6 +72,8 @@ pub struct InstallStartupDiagnostics {
     pub plan_total_seconds: f64,
     pub execution_setup_seconds: f64,
     pub command_to_execution_seconds: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry_requests: Option<crate::registry::resolve_client::RegistryRequestDiagnostics>,
 }
 use glu_core::{InstalledPackage, PackageId, PackageName, PackageSelector, ResolveRequest};
 use std::{path::PathBuf, sync::Arc};
@@ -510,6 +512,7 @@ pub async fn plan_install(
             manifest_validation_seconds: resolve_timing.validation_seconds,
             state_snapshot_seconds,
             resolve_and_state_wall_seconds,
+            registry_requests: Some(resolve_timing.diagnostics),
             ..Default::default()
         },
     };
@@ -900,10 +903,10 @@ pub async fn plan_update(
         .into_iter()
         .map(|name| PackageSelector(name.0))
         .collect::<Vec<_>>();
-    let (response, latest_glu_version) =
-        HttpResolveClient::new(&client.config().registry_base_url)?
-            .outdated(&installed_selectors, &client.config().target)
-            .await?;
+    let (response, latest_glu_version) = client
+        .registry_client()?
+        .outdated(&installed_selectors, &client.config().target)
+        .await?;
     let outdated = crate::outdated::OutdatedResult {
         packages: crate::outdated::outdated_entries(&state, &response.packages),
         latest_glu_version,
@@ -1159,32 +1162,104 @@ pub(crate) async fn resolve_manifest(
     Ok(resolve_manifest_timed(client, names).await?.0)
 }
 
+#[derive(Debug)]
 struct ResolveManifestTiming {
     registry_seconds: f64,
     validation_seconds: f64,
+    diagnostics: crate::registry::resolve_client::RegistryRequestDiagnostics,
+}
+
+struct ResolutionTraceRecorder {
+    prefix: glu_core::Prefix,
+    plan_name: String,
+    client: HttpResolveClient,
+}
+
+impl ResolutionTraceRecorder {
+    fn new(client: HttpResolveClient, prefix: glu_core::Prefix, names: &[PackageSelector]) -> Self {
+        Self {
+            prefix,
+            plan_name: names
+                .iter()
+                .map(|name| name.0.as_str())
+                .collect::<Vec<_>>()
+                .join("+"),
+            client,
+        }
+    }
+
+    fn write_failure(&self, error: &anyhow::Error) -> Option<PathBuf> {
+        self.write("failed", Some(error.to_string()))
+    }
+
+    fn write(&self, status: &str, error: Option<String>) -> Option<PathBuf> {
+        let trace = serde_json::json!({
+            "schema_version": 3,
+            "status": status,
+            "error": error,
+            "plan": self.plan_name,
+            "nodes": [],
+            "edges": [],
+            "events": [],
+            "diagnostics": {
+                "registry_requests": self.client.diagnostics(),
+            },
+        });
+        write_install_trace(&self.prefix, &self.plan_name, &trace)
+            .ok()
+            .map(|written| written.path)
+    }
 }
 
 async fn resolve_manifest_timed(
     client: &GluClient,
     names: Vec<PackageSelector>,
 ) -> Result<(glu_core::InstallManifest, ResolveManifestTiming)> {
-    let resolve = HttpResolveClient::new(&client.config().registry_base_url)?;
+    let resolve = client.registry_client()?;
+    let trace_recorder =
+        ResolutionTraceRecorder::new(resolve.clone(), client.config().prefix.clone(), &names);
     let registry_started = std::time::Instant::now();
-    let manifest = resolve
+    let manifest = match resolve
         .resolve(&ResolveRequest {
             names,
             target: client.config().target.clone(),
         })
-        .await?;
+        .await
+    {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            if let Some(trace_path) = trace_recorder.write_failure(&error) {
+                return Err(crate::error::RegistryPlanningFailure {
+                    trace_path,
+                    source: error,
+                }
+                .into());
+            }
+            return Err(error);
+        }
+    };
     let registry_seconds = registry_started.elapsed().as_secs_f64();
+    let diagnostics = resolve.diagnostics();
     let validation_started = std::time::Instant::now();
-    planner::validate_manifest(&manifest)?;
-    validate_client_support(&manifest, &client.config().prefix)?;
+    if let Err(error) = planner::validate_manifest(&manifest)
+        .and_then(|_| validate_client_support(&manifest, &client.config().prefix))
+    {
+        if let Some(trace_path) = trace_recorder.write_failure(&error) {
+            return Err(crate::error::RegistryPlanningFailure {
+                trace_path,
+                source: error,
+            }
+            .into());
+        }
+        return Err(error);
+    }
+
     Ok((
         manifest,
         ResolveManifestTiming {
             registry_seconds,
             validation_seconds: validation_started.elapsed().as_secs_f64(),
+            diagnostics,
         },
     ))
 }
@@ -2122,10 +2197,117 @@ mod interrupted_install_tests {
         ResolvedArtifact, ResolvedPackage, Target,
     };
     use std::collections::BTreeMap;
+    #[cfg(feature = "dev-registry")]
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
     use tempfile::TempDir;
     use tokio::sync::Mutex;
 
     static FAULT_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+    #[cfg(feature = "dev-registry")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_preplan_resolution_writes_retry_diagnostics() {
+        let _serial = FAULT_TEST_LOCK.lock().await;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for response in [
+                "HTTP/1.1 522 Unknown\r\nContent-Length: 0\r\nRetry-After: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{",
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let temp = TempDir::new().unwrap();
+        let prefix = Prefix(temp.path().join("prefix"));
+        let client = GluClient::new(ClientConfig {
+            prefix: prefix.clone(),
+            target: Target("test-target".to_string()),
+            registry_base_url: format!("http://{address}"),
+            distribution_base_url: "https://example.invalid/releases".to_string(),
+        });
+        let error = resolve_manifest_timed(&client, vec![PackageSelector("vips".to_string())])
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+
+        let failure = error
+            .downcast_ref::<crate::error::RegistryPlanningFailure>()
+            .expect("planning failure retains trace path");
+        let trace: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&failure.trace_path).unwrap()).unwrap();
+        assert_eq!(trace["status"], "failed");
+        assert!(trace["nodes"].as_array().unwrap().is_empty());
+        let retry = &trace["diagnostics"]["registry_requests"]["retries"][0];
+        assert_eq!(retry["operation"], "resolve");
+        assert_eq!(retry["status"], 522);
+        assert_eq!(retry["backoff_seconds"], 0.0);
+    }
+
+    #[cfg(feature = "dev-registry")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_preplan_resolution_writes_a_typed_failure_trace() {
+        let _serial = FAULT_TEST_LOCK.lock().await;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let temp = TempDir::new().unwrap();
+        let prefix = Prefix(temp.path().join("prefix"));
+        let client = GluClient::new(ClientConfig {
+            prefix,
+            target: Target("test-target".to_string()),
+            registry_base_url: format!("http://{address}"),
+            distribution_base_url: "https://example.invalid/releases".to_string(),
+        });
+        let cancellation = client.cancellation_token();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            cancellation.cancel();
+        });
+
+        let error = resolve_manifest_timed(&client, vec![PackageSelector("vips".to_string())])
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+
+        let failure = error
+            .downcast_ref::<crate::error::RegistryPlanningFailure>()
+            .expect("cancellation retains trace path");
+        assert!(failure
+            .source
+            .downcast_ref::<crate::error::InterruptedError>()
+            .is_some());
+        let trace: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&failure.trace_path).unwrap()).unwrap();
+        assert_eq!(trace["status"], "failed");
+        assert!(trace["error"]
+            .as_str()
+            .unwrap()
+            .contains("interrupted while waiting for the registry"));
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn old_name_dependency_renames_existing_keg_without_downloading_dependency() {

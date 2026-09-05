@@ -64,6 +64,7 @@ pub(crate) async fn deps(
     let queries_registry = online || query.resolve_selector(&selector).is_none();
     let view = while_resolving(
         context.show_resolution && queries_registry,
+        context.client.cancellation_token(),
         context
             .client
             .deps(&query, selector, online, !context.globals.is_null()),
@@ -104,6 +105,7 @@ pub(crate) async fn uses(context: &CommandContext<'_>, name: String, all: bool) 
     };
     let Some(root) = while_resolving(
         context.show_resolution,
+        context.client.cancellation_token(),
         context.client.uses(selector, direct),
     )
     .await??
@@ -129,6 +131,7 @@ pub(crate) async fn info(context: &CommandContext<'_>, names: Vec<String>) -> Co
         let requested = PackageSelector(names.into_iter().next().expect("one info name"));
         let (info, installed) = while_resolving(
             context.show_resolution,
+            context.client.cancellation_token(),
             context.client.info(&query, requested),
         )
         .await??;
@@ -144,8 +147,7 @@ pub(crate) async fn info(context: &CommandContext<'_>, names: Vec<String>) -> Co
     }
 
     let config = context.client.config().clone();
-    let registry =
-        glu_client::registry::resolve_client::HttpResolveClient::new(&config.registry_base_url)?;
+    let registry = context.client.registry_client()?;
     let mut handles = Vec::new();
     for name in names {
         let selector = PackageSelector(name.clone());
@@ -157,13 +159,17 @@ pub(crate) async fn info(context: &CommandContext<'_>, names: Vec<String>) -> Co
         }));
     }
 
-    let results = while_resolving(context.show_resolution, async {
-        let mut results = Vec::with_capacity(handles.len());
-        for handle in handles {
-            results.push(handle.await);
-        }
-        results
-    })
+    let results = while_resolving(
+        context.show_resolution,
+        context.client.cancellation_token(),
+        async {
+            let mut results = Vec::with_capacity(handles.len());
+            for handle in handles {
+                results.push(handle.await);
+            }
+            results
+        },
+    )
     .await?;
     let mut packages = Vec::new();
     for result in results {
@@ -180,6 +186,13 @@ pub(crate) async fn info(context: &CommandContext<'_>, names: Vec<String>) -> Co
                     deactivated: status.is_some_and(|status| status.deactivated),
                     error: None,
                 });
+            }
+            Ok((_, Err(error)))
+                if error
+                    .downcast_ref::<glu_client::error::InterruptedError>()
+                    .is_some() =>
+            {
+                return Err(error.into());
             }
             Ok((name, Err(error))) => {
                 let selector = PackageSelector(name.clone());
@@ -219,8 +232,12 @@ pub(crate) async fn info(context: &CommandContext<'_>, names: Vec<String>) -> Co
 
 pub(crate) async fn outdated(context: &CommandContext<'_>, declared: bool) -> CommandResult {
     let query = context.client.query_state(context.events.as_ref())?;
-    let mut outdated =
-        while_resolving(context.show_resolution, context.client.outdated(&query)).await??;
+    let mut outdated = while_resolving(
+        context.show_resolution,
+        context.client.cancellation_token(),
+        context.client.outdated(&query),
+    )
+    .await??;
     let scope = if declared {
         outdated.packages.retain(|package| {
             query

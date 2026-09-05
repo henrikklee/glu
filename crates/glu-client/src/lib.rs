@@ -110,15 +110,30 @@ impl LocalQuery {
 
 pub struct GluClient {
     config: ClientConfig,
+    cancellation: tokio_util::sync::CancellationToken,
 }
 
 impl GluClient {
     pub fn new(config: ClientConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        }
     }
 
     pub fn config(&self) -> &ClientConfig {
         &self.config
+    }
+
+    pub fn cancellation_token(&self) -> tokio_util::sync::CancellationToken {
+        self.cancellation.clone()
+    }
+
+    pub fn registry_client(&self) -> Result<registry::resolve_client::HttpResolveClient> {
+        registry::resolve_client::HttpResolveClient::with_cancellation(
+            &self.config.registry_base_url,
+            self.cancellation.clone(),
+        )
     }
 
     pub fn query_state(&self, events: &dyn events::ExecutionEvents) -> Result<LocalQuery> {
@@ -292,8 +307,7 @@ impl GluClient {
                 });
             }
         }
-        let resolve =
-            registry::resolve_client::HttpResolveClient::new(&self.config.registry_base_url)?;
+        let resolve = self.registry_client()?;
         let manifest = resolve
             .resolve_slim(&glu_core::ResolveRequest {
                 names: vec![selector.clone()],
@@ -330,8 +344,7 @@ impl GluClient {
         selector: PackageSelector,
         direct: bool,
     ) -> Result<Option<dependency_query::DependencyTreeNode>> {
-        let resolve =
-            registry::resolve_client::HttpResolveClient::new(&self.config.registry_base_url)?;
+        let resolve = self.registry_client()?;
         let response = resolve
             .uses(&selector, &self.config.target, direct)
             .await
@@ -381,10 +394,10 @@ impl GluClient {
         query: &LocalQuery,
         selector: PackageSelector,
     ) -> Result<(glu_core::InfoResponse, Option<glu_core::InstalledPackage>)> {
-        let info =
-            registry::resolve_client::HttpResolveClient::new(&self.config.registry_base_url)?
-                .info(&selector, &self.config.target)
-                .await?;
+        let info = self
+            .registry_client()?
+            .info(&selector, &self.config.target)
+            .await?;
         let installed = query.find_by_key(&info.package_key).cloned();
         Ok((info, installed))
     }
@@ -398,10 +411,10 @@ impl GluClient {
             .into_iter()
             .map(|name| PackageSelector(name.0))
             .collect::<Vec<_>>();
-        let (response, latest_glu_version) =
-            registry::resolve_client::HttpResolveClient::new(&self.config.registry_base_url)?
-                .outdated(&names, &self.config.target)
-                .await?;
+        let (response, latest_glu_version) = self
+            .registry_client()?
+            .outdated(&names, &self.config.target)
+            .await?;
         Ok(outdated::OutdatedResult {
             packages: outdated::outdated_entries(state, &response.packages),
             latest_glu_version,
@@ -442,7 +455,7 @@ impl GluClient {
         &self,
         events: &dyn events::ExecutionEvents,
     ) -> Result<upgrade::UpgradeResult> {
-        upgrade::upgrade(&self.config, events).await
+        upgrade::upgrade(&self.config, self.cancellation.clone(), events).await
     }
 
     pub fn shell_statuses(&self) -> Result<Vec<shell::ShellStatus>> {

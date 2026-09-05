@@ -34,6 +34,7 @@ tar = { version = "0.4", default-features = false }
 tempfile = "3"
 thiserror = "1"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 url = "2"
 
 [profile.release]

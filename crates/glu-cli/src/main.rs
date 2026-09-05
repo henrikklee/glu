@@ -137,30 +137,22 @@ impl From<anyhow::Error> for CliFailure {
     }
 }
 
-#[derive(Debug)]
-struct ResolutionInterrupted;
-
-impl std::fmt::Display for ResolutionInterrupted {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("interrupted while resolving registry request (Ctrl+C)")
-    }
-}
-
-impl std::error::Error for ResolutionInterrupted {}
-
 /// Runs a registry-bound future with transient first-line feedback. Machine
 /// output and non-interactive output await the future without touching the
-/// terminal. Dropping the future clears the spinner through its RAII guard.
-pub(crate) async fn while_resolving<F>(enabled: bool, future: F) -> Result<F::Output, CliFailure>
+/// terminal. Ctrl+C signals cooperative cancellation, then lets the operation
+/// finish its diagnostic cleanup before returning.
+pub(crate) async fn while_resolving<F>(
+    enabled: bool,
+    cancellation: tokio_util::sync::CancellationToken,
+    future: F,
+) -> Result<F::Output, CliFailure>
 where
     F: Future,
 {
-    if !enabled {
-        return Ok(future.await);
-    }
-
     let mut spinner = progress::ResolutionSpinner::new();
-    spinner.start();
+    if enabled {
+        spinner.start();
+    }
 
     let start = tokio::time::Instant::now() + Duration::from_millis(80);
     let mut ticker = tokio::time::interval_at(start, Duration::from_millis(80));
@@ -175,10 +167,11 @@ where
                 spinner.clear();
                 return Ok(output);
             }
-            _ = ticker.tick() => spinner.tick(),
+            _ = ticker.tick(), if enabled => spinner.tick(),
             _ = &mut interrupt => {
+                cancellation.cancel();
                 spinner.clear();
-                return Err(anyhow::Error::new(ResolutionInterrupted).into());
+                return Ok((&mut future).await);
             }
         }
     }
@@ -480,15 +473,6 @@ fn cli_error_for_failure(error: &CliFailure) -> CliError {
 fn runtime_cli_error(error: &anyhow::Error) -> CliError {
     if let Some(unknown) = error.downcast_ref::<help::UnknownHelpCommand>() {
         CliError::runtime(ErrorCode::ParseError, unknown.to_string(), Vec::new(), None)
-    } else if let Some(interrupted) = error.downcast_ref::<ResolutionInterrupted>() {
-        CliError::runtime(
-            ErrorCode::Interrupted,
-            interrupted.to_string(),
-            Vec::new(),
-            Some(CliErrorDetails::Operation(OperationErrorDetails {
-                operation: "resolve".to_string(),
-            })),
-        )
     } else if let Some(interrupted) = error.downcast_ref::<glu_client::error::InterruptedError>() {
         CliError::runtime(
             ErrorCode::Interrupted,
@@ -498,6 +482,12 @@ fn runtime_cli_error(error: &anyhow::Error) -> CliError {
                 operation: interrupted.operation.to_string(),
             })),
         )
+    } else if let Some(planning) =
+        error.downcast_ref::<glu_client::error::RegistryPlanningFailure>()
+    {
+        let mut error = runtime_cli_error(&planning.source);
+        error.message = planning.to_string();
+        error
     } else if let Some(partial) = error.downcast_ref::<glu_client::install::PartialInstallFailure>()
     {
         CliError::runtime(
@@ -562,6 +552,20 @@ fn runtime_cli_error(error: &anyhow::Error) -> CliError {
     }
 }
 
+fn runtime_error_is_interrupted(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<glu_client::error::InterruptedError>()
+        .is_some()
+        || error
+            .downcast_ref::<glu_client::error::RegistryPlanningFailure>()
+            .is_some_and(|failure| {
+                failure
+                    .source
+                    .downcast_ref::<glu_client::error::InterruptedError>()
+                    .is_some()
+            })
+}
+
 fn failure_exit_class(error: &CliFailure) -> ExitClass {
     match error {
         CliFailure::Parse(_) => ExitClass::Usage,
@@ -570,14 +574,7 @@ fn failure_exit_class(error: &CliFailure) -> ExitClass {
         {
             ExitClass::Usage
         }
-        CliFailure::Runtime(error)
-            if error.downcast_ref::<ResolutionInterrupted>().is_some()
-                || error
-                    .downcast_ref::<glu_client::error::InterruptedError>()
-                    .is_some() =>
-        {
-            ExitClass::Interrupted
-        }
+        CliFailure::Runtime(error) if runtime_error_is_interrupted(error) => ExitClass::Interrupted,
         CliFailure::Structured(error)
             if matches!(
                 error.code,
@@ -1129,7 +1126,12 @@ mod tests {
 
     #[test]
     fn resolution_interruption_maps_to_exit_130_without_a_trace() {
-        let failure = CliFailure::Runtime(anyhow::Error::new(ResolutionInterrupted));
+        let failure =
+            CliFailure::Runtime(anyhow::Error::new(glu_client::error::InterruptedError {
+                operation: "registry",
+                message: "interrupted while waiting for the registry (Ctrl+C)",
+                trace_path: None,
+            }));
 
         assert_eq!(failure_exit_class(&failure), ExitClass::Interrupted);
         let value = serde_json::to_value(
@@ -1137,7 +1139,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(value["error"]["code"], "interrupted");
-        assert_eq!(value["error"]["details"]["operation"], "resolve");
+        assert_eq!(value["error"]["details"]["operation"], "registry");
         assert!(!value["error"]["message"]
             .as_str()
             .unwrap()

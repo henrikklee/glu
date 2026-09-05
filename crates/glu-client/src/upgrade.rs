@@ -45,9 +45,13 @@ pub struct UpgradeResult {
     pub status: UpgradeStatus,
 }
 
-pub async fn upgrade(config: &ClientConfig, events: &dyn ExecutionEvents) -> Result<UpgradeResult> {
+pub async fn upgrade(
+    config: &ClientConfig,
+    cancellation: tokio_util::sync::CancellationToken,
+    events: &dyn ExecutionEvents,
+) -> Result<UpgradeResult> {
     let own = env!("CARGO_PKG_VERSION");
-    let registry = HttpResolveClient::new(&config.registry_base_url)?;
+    let registry = HttpResolveClient::with_cancellation(&config.registry_base_url, cancellation)?;
     let (_, latest_glu_version) = registry
         .outdated(&[], &config.target)
         .await

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 pub(crate) async fn migrate(context: &CommandContext<'_>, source: PathBuf) -> CommandResult {
     let plan = while_resolving(
         context.show_resolution,
+        context.client.cancellation_token(),
         context.client.plan_migration(source),
     )
     .await??;

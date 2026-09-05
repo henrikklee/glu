@@ -56,6 +56,7 @@ pub(crate) async fn install(
     startup.main_entry_to_plan_seconds = context.startup_main.elapsed().as_secs_f64();
     let mut install_plan = while_resolving(
         context.show_resolution,
+        context.client.cancellation_token(),
         context.client.plan_install(names, options),
     )
     .await??;
@@ -106,6 +107,7 @@ pub(crate) async fn reinstall(
     startup.main_entry_to_plan_seconds = context.startup_main.elapsed().as_secs_f64();
     let mut install_plan = while_resolving(
         context.show_resolution,
+        context.client.cancellation_token(),
         context.client.plan_install(names, options),
     )
     .await??;
@@ -148,6 +150,7 @@ pub(crate) async fn update(
     let names = names.into_iter().map(PackageSelector).collect();
     let plan = while_resolving(
         context.show_resolution,
+        context.client.cancellation_token(),
         context.client.plan_update(names, all, dependents),
     )
     .await??;

@@ -8,15 +8,48 @@ use glu_core::{
 };
 use reqwest::header::HeaderMap;
 use serde::Deserialize;
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
 use url::Url;
 
 const HEADER_LATEST_GLU_VERSION: &str = "x-glu-latest-version";
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(15);
+
+/// Sanitized diagnostics for registry retries. Deliberately excludes URLs,
+/// request parameters, response bodies, and headers so credentials can never
+/// leak into an install trace or terminal diagnostic.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RegistryRequestDiagnostics {
+    pub retries: Vec<RegistryRetryDiagnostic>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RegistryRetryDiagnostic {
+    pub operation: String,
+    pub request_id: u64,
+    pub attempt: u32,
+    pub failure: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<f64>,
+    pub backoff_seconds: f64,
+}
 
 #[derive(Debug, Clone)]
 pub struct HttpResolveClient {
     base_url: Url,
     http: reqwest::Client,
+    diagnostics: Arc<Mutex<RegistryRequestDiagnostics>>,
+    next_request_id: Arc<AtomicU64>,
+    cancellation: tokio_util::sync::CancellationToken,
 }
 
 /// Structured error body the registry returns for bad requests.
@@ -154,24 +187,9 @@ fn humanize_reason(reason: &str) -> Option<&'static str> {
 /// Converts a non-success registry response into a friendly error, decoding
 /// the structured JSON body when present and falling back to the status code
 /// otherwise (e.g. a wrong `--registry` returning HTML).
-async fn registry_error(response: reqwest::Response, operation: &str) -> anyhow::Error {
-    let status = response.status();
-    match response.text().await {
-        Ok(text) => match serde_json::from_str::<RegistryErrorBody>(&text) {
-            Ok(err) => format_registry_error(&err, operation, Some(status.as_u16())),
-            Err(_) => RegistryFailure {
-                code: RuntimeErrorCode::RegistryError,
-                message: format!("registry returned HTTP {status} during {operation}"),
-                name: None,
-                target: None,
-                reason: None,
-                requested_by: None,
-                suggestions: Vec::new(),
-                operation: operation.to_string(),
-                status: Some(status.as_u16()),
-            }
-            .into(),
-        },
+fn registry_error(status: reqwest::StatusCode, body: &[u8], operation: &str) -> anyhow::Error {
+    match serde_json::from_slice::<RegistryErrorBody>(body) {
+        Ok(err) => format_registry_error(&err, operation, Some(status.as_u16())),
         Err(_) => RegistryFailure {
             code: RuntimeErrorCode::RegistryError,
             message: format!("registry returned HTTP {status} during {operation}"),
@@ -371,12 +389,95 @@ pub(crate) fn bottle_tag_is_compatible(tag: &str, target: &Target) -> bool {
     )
 }
 
+fn retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn request_failure_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        // reqwest reports DNS, TCP connection, and TLS handshake failures
+        // through the connect category.
+        "connect"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "transport"
+    }
+}
+
+fn body_failure_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "response_timeout"
+    } else {
+        "response_body"
+    }
+}
+
+fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds).min(RETRY_MAX_DELAY));
+    }
+
+    let retry_at = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let now = chrono::Utc::now().with_timezone(retry_at.offset());
+    retry_at
+        .signed_duration_since(now)
+        .to_std()
+        .ok()
+        .map(|delay| delay.min(RETRY_MAX_DELAY))
+}
+
+fn exponential_delay(retry: u32) -> Duration {
+    let exponent = retry.saturating_sub(1).min(6);
+    RETRY_BASE_DELAY
+        .saturating_mul(1_u32 << exponent)
+        .min(RETRY_MAX_DELAY)
+}
+
+fn jitter(delay: Duration) -> Duration {
+    use ring::rand::SecureRandom;
+
+    let mut random = [0_u8; 8];
+    if ring::rand::SystemRandom::new().fill(&mut random).is_err() {
+        return delay;
+    }
+    // Uniformly choose 75%..125%. Keep Retry-After itself unjittered: the
+    // server supplied an explicit lower bound rather than a client backoff.
+    let fraction = u64::from_le_bytes(random) as f64 / u64::MAX as f64;
+    delay.mul_f64(0.75 + fraction * 0.5)
+}
+
+fn registry_interrupted() -> anyhow::Error {
+    crate::error::InterruptedError {
+        operation: "registry",
+        message: "interrupted while waiting for the registry (Ctrl+C)",
+        trace_path: None,
+    }
+    .into()
+}
+
 impl HttpResolveClient {
     pub fn new(base_url: &str) -> Result<Self> {
+        Self::with_cancellation(base_url, tokio_util::sync::CancellationToken::new())
+    }
+
+    pub(crate) fn with_cancellation(
+        base_url: &str,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<Self> {
         let base_url = Url::parse(base_url).context("invalid registry base URL")?;
         // Central transport policy (config::validate_registry_url): HTTPS
         // always; loopback HTTP only in dev builds. `new` is the only trusted
-        // entry point for registry base URLs, so every caller is covered.
+        // constructor path for registry base URLs, so every caller is covered.
         crate::config::validate_registry_url(&base_url)?;
         Ok(Self {
             base_url,
@@ -385,7 +486,135 @@ impl HttpResolveClient {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("failed to build HTTP client"),
+            diagnostics: Arc::new(Mutex::new(RegistryRequestDiagnostics::default())),
+            next_request_id: Arc::new(AtomicU64::new(1)),
+            cancellation,
         })
+    }
+
+    pub fn diagnostics(&self) -> RegistryRequestDiagnostics {
+        self.diagnostics
+            .lock()
+            .expect("registry diagnostics lock poisoned")
+            .clone()
+    }
+
+    async fn get_bytes(&self, url: Url, operation: &str) -> Result<(HeaderMap, Vec<u8>)> {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let mut attempt = 1_u32;
+        loop {
+            let response = match tokio::select! {
+                _ = self.cancellation.cancelled() => return Err(registry_interrupted()),
+                response = self.http.get(url.clone()).send() => response,
+            } {
+                Ok(response) => response,
+                Err(source) if !source.is_builder() && !source.is_redirect() => {
+                    let delay = jitter(exponential_delay(attempt));
+                    let failure = request_failure_kind(&source);
+                    self.record_retry(RegistryRetryDiagnostic {
+                        operation: operation.to_string(),
+                        request_id,
+                        attempt,
+                        failure,
+                        status: None,
+                        retry_after_seconds: None,
+                        backoff_seconds: delay.as_secs_f64(),
+                    });
+                    attempt = attempt.saturating_add(1);
+                    self.wait_to_retry(delay).await?;
+                    continue;
+                }
+                Err(source) => {
+                    return Err(RegistryTransportFailure {
+                        operation: operation.to_string(),
+                        source,
+                    }
+                    .into())
+                }
+            };
+
+            let status = response.status();
+            if !status.is_success() {
+                if retryable_status(status) {
+                    let server_delay = retry_after(response.headers());
+                    let delay = server_delay.unwrap_or_else(|| jitter(exponential_delay(attempt)));
+                    self.record_retry(RegistryRetryDiagnostic {
+                        operation: operation.to_string(),
+                        request_id,
+                        attempt,
+                        failure: "http_status",
+                        status: Some(status.as_u16()),
+                        retry_after_seconds: server_delay.map(|delay| delay.as_secs_f64()),
+                        backoff_seconds: delay.as_secs_f64(),
+                    });
+                    attempt = attempt.saturating_add(1);
+                    self.wait_to_retry(delay).await?;
+                    continue;
+                }
+                let body = tokio::select! {
+                    _ = self.cancellation.cancelled() => return Err(registry_interrupted()),
+                    body = response.bytes() => body,
+                };
+                match body {
+                    Ok(body) => return Err(registry_error(status, &body, operation)),
+                    Err(source) => {
+                        let delay = jitter(exponential_delay(attempt));
+                        let failure = body_failure_kind(&source);
+                        self.record_retry(RegistryRetryDiagnostic {
+                            operation: operation.to_string(),
+                            request_id,
+                            attempt,
+                            failure,
+                            status: Some(status.as_u16()),
+                            retry_after_seconds: None,
+                            backoff_seconds: delay.as_secs_f64(),
+                        });
+                        attempt = attempt.saturating_add(1);
+                        self.wait_to_retry(delay).await?;
+                        continue;
+                    }
+                }
+            }
+
+            let headers = response.headers().clone();
+            let body = tokio::select! {
+                _ = self.cancellation.cancelled() => return Err(registry_interrupted()),
+                body = response.bytes() => body,
+            };
+            match body {
+                Ok(body) => return Ok((headers, body.to_vec())),
+                Err(source) => {
+                    let delay = jitter(exponential_delay(attempt));
+                    let failure = body_failure_kind(&source);
+                    self.record_retry(RegistryRetryDiagnostic {
+                        operation: operation.to_string(),
+                        request_id,
+                        attempt,
+                        failure,
+                        status: None,
+                        retry_after_seconds: None,
+                        backoff_seconds: delay.as_secs_f64(),
+                    });
+                    attempt = attempt.saturating_add(1);
+                    self.wait_to_retry(delay).await?;
+                }
+            }
+        }
+    }
+
+    fn record_retry(&self, diagnostic: RegistryRetryDiagnostic) {
+        self.diagnostics
+            .lock()
+            .expect("registry diagnostics lock poisoned")
+            .retries
+            .push(diagnostic);
+    }
+
+    async fn wait_to_retry(&self, delay: Duration) -> Result<()> {
+        tokio::select! {
+            _ = self.cancellation.cancelled() => Err(registry_interrupted()),
+            _ = tokio::time::sleep(delay) => Ok(()),
+        }
     }
 
     pub async fn resolve(&self, request: &ResolveRequest) -> Result<InstallManifest> {
@@ -402,28 +631,13 @@ impl HttpResolveClient {
             query.append_pair("target", &request.target.0);
         }
 
-        let response =
-            self.http
-                .get(url)
-                .send()
-                .await
-                .map_err(|source| RegistryTransportFailure {
-                    operation: "resolve".to_string(),
-                    source,
-                })?;
-
-        if !response.status().is_success() {
-            return Err(registry_error(response, "resolve").await);
-        }
-
-        let manifest =
-            response
-                .json::<InstallManifest>()
-                .await
-                .map_err(|source| RegistryDecodeFailure {
-                    operation: "resolve".to_string(),
-                    source,
-                })?;
+        let (_, body) = self.get_bytes(url, "resolve").await?;
+        let manifest = serde_json::from_slice::<InstallManifest>(&body).map_err(|source| {
+            RegistryDecodeFailure {
+                operation: "resolve".to_string(),
+                source,
+            }
+        })?;
         validate_resolve_response(
             &manifest.schema,
             &manifest.request,
@@ -452,28 +666,13 @@ impl HttpResolveClient {
             query.append_pair("slim", "true");
         }
 
-        let response =
-            self.http
-                .get(url)
-                .send()
-                .await
-                .map_err(|source| RegistryTransportFailure {
-                    operation: "resolve".to_string(),
-                    source,
-                })?;
-
-        if !response.status().is_success() {
-            return Err(registry_error(response, "resolve").await);
-        }
-
-        let manifest =
-            response
-                .json::<SlimManifest>()
-                .await
-                .map_err(|source| RegistryDecodeFailure {
-                    operation: "resolve".to_string(),
-                    source,
-                })?;
+        let (_, body) = self.get_bytes(url, "resolve").await?;
+        let manifest = serde_json::from_slice::<SlimManifest>(&body).map_err(|source| {
+            RegistryDecodeFailure {
+                operation: "resolve".to_string(),
+                source,
+            }
+        })?;
         validate_resolve_response(
             &manifest.schema,
             &manifest.request,
@@ -506,28 +705,12 @@ impl HttpResolveClient {
             }
         }
 
-        let response =
-            self.http
-                .get(url)
-                .send()
-                .await
-                .map_err(|source| RegistryTransportFailure {
-                    operation: "uses".to_string(),
-                    source,
-                })?;
-
-        if !response.status().is_success() {
-            return Err(registry_error(response, "uses").await);
-        }
-
+        let (_, body) = self.get_bytes(url, "uses").await?;
         let response: UsesResponse =
-            response
-                .json()
-                .await
-                .map_err(|source| RegistryDecodeFailure {
-                    operation: "uses".to_string(),
-                    source,
-                })?;
+            serde_json::from_slice(&body).map_err(|source| RegistryDecodeFailure {
+                operation: "uses".to_string(),
+                source,
+            })?;
         validate_uses_response(&response, name, target, direct)?;
         Ok(response)
     }
@@ -581,29 +764,15 @@ impl HttpResolveClient {
             query.append_pair("target", &target.0);
         }
 
-        let response =
-            self.http
-                .get(url)
-                .send()
-                .await
-                .map_err(|source| RegistryTransportFailure {
-                    operation: "outdated".to_string(),
-                    source,
-                })?;
+        let (headers, body) = self.get_bytes(url, "outdated").await?;
+        let latest_glu_version = latest_glu_version_header(&headers);
 
-        if !response.status().is_success() {
-            return Err(registry_error(response, "outdated").await);
-        }
-
-        let latest_glu_version = latest_glu_version_header(response.headers());
-
-        let response = response
-            .json::<OutdatedResponse>()
-            .await
-            .map_err(|source| RegistryDecodeFailure {
+        let response = serde_json::from_slice::<OutdatedResponse>(&body).map_err(|source| {
+            RegistryDecodeFailure {
                 operation: "outdated".to_string(),
                 source,
-            })?;
+            }
+        })?;
         validate_outdated_response(&response, names)?;
 
         Ok((response, latest_glu_version))
@@ -621,28 +790,13 @@ impl HttpResolveClient {
             query.append_pair("target", &target.0);
         }
 
-        let response =
-            self.http
-                .get(url)
-                .send()
-                .await
-                .map_err(|source| RegistryTransportFailure {
-                    operation: "info".to_string(),
-                    source,
-                })?;
-
-        if !response.status().is_success() {
-            return Err(registry_error(response, "info").await);
-        }
-
-        let response =
-            response
-                .json::<InfoResponse>()
-                .await
-                .map_err(|source| RegistryDecodeFailure {
-                    operation: "info".to_string(),
-                    source,
-                })?;
+        let (_, body) = self.get_bytes(url, "info").await?;
+        let response = serde_json::from_slice::<InfoResponse>(&body).map_err(|source| {
+            RegistryDecodeFailure {
+                operation: "info".to_string(),
+                source,
+            }
+        })?;
         validate_info_response(&response, name, target)?;
         Ok(response)
     }
@@ -651,6 +805,46 @@ impl HttpResolveClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "dev-registry")]
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
+
+    #[cfg(feature = "dev-registry")]
+    fn fault_server(responses: Vec<String>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    #[cfg(feature = "dev-registry")]
+    fn response(status: &str, extra_headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
 
     fn build(error: &str) -> RegistryErrorBody {
         RegistryErrorBody {
@@ -681,6 +875,238 @@ mod tests {
 
         headers.insert(HEADER_LATEST_GLU_VERSION, "  ".parse().unwrap());
         assert_eq!(latest_glu_version_header(&headers), None);
+    }
+
+    #[test]
+    fn retry_after_accepts_http_dates() {
+        let retry_at = chrono::Utc::now() + chrono::Duration::seconds(2);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            retry_at
+                .format("%a, %d %b %Y %H:%M:%S GMT")
+                .to_string()
+                .parse()
+                .unwrap(),
+        );
+        let delay = retry_after(&headers).unwrap();
+        assert!(delay > Duration::ZERO);
+        assert!(delay <= Duration::from_secs(2));
+    }
+
+    #[cfg(feature = "dev-registry")]
+    #[tokio::test]
+    async fn retries_522_then_returns_successful_body() {
+        let (base, server) = fault_server(vec![
+            response("522 Unknown", "Retry-After: 0\r\n", ""),
+            response("200 OK", "", "ok"),
+        ]);
+        let client = HttpResolveClient::new(&base).unwrap();
+        let (_, body) = client
+            .get_bytes(Url::parse(&format!("{base}/v1/info")).unwrap(), "info")
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(body, b"ok");
+        let diagnostics = client.diagnostics();
+        assert_eq!(diagnostics.retries.len(), 1);
+        assert_eq!(diagnostics.retries[0].status, Some(522));
+    }
+
+    #[cfg(feature = "dev-registry")]
+    #[tokio::test]
+    async fn honors_retry_after_on_429_then_succeeds() {
+        let (base, server) = fault_server(vec![
+            response("429 Too Many Requests", "Retry-After: 0\r\n", ""),
+            response("200 OK", "", "ok"),
+        ]);
+        let client = HttpResolveClient::new(&base).unwrap();
+        let (_, body) = client
+            .get_bytes(Url::parse(&format!("{base}/v1/uses")).unwrap(), "uses")
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(body, b"ok");
+        let retry = &client.diagnostics().retries[0];
+        assert_eq!(retry.status, Some(429));
+        assert_eq!(retry.retry_after_seconds, Some(0.0));
+        assert_eq!(retry.backoff_seconds, 0.0);
+    }
+
+    #[cfg(feature = "dev-registry")]
+    #[tokio::test]
+    async fn retries_interrupted_response_body() {
+        let (base, server) = fault_server(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\nshort".to_string(),
+            response("200 OK", "", "complete"),
+        ]);
+        let client = HttpResolveClient::new(&base).unwrap();
+        let (_, body) = client
+            .get_bytes(
+                Url::parse(&format!("{base}/v1/resolve")).unwrap(),
+                "resolve",
+            )
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(body, b"complete");
+        assert_eq!(client.diagnostics().retries[0].failure, "response_body");
+    }
+
+    #[cfg(feature = "dev-registry")]
+    #[tokio::test]
+    async fn does_not_exhaust_transient_status_retries() {
+        let mut responses = (0..10)
+            .map(|_| response("503 Service Unavailable", "Retry-After: 0\r\n", ""))
+            .collect::<Vec<_>>();
+        responses.push(response("200 OK", "", "eventual"));
+        let (base, server) = fault_server(responses);
+        let client = HttpResolveClient::new(&base).unwrap();
+        let (_, body) = client
+            .get_bytes(
+                Url::parse(&format!("{base}/v1/outdated")).unwrap(),
+                "outdated",
+            )
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(body, b"eventual");
+        assert_eq!(client.diagnostics().retries.len(), 10);
+    }
+
+    #[cfg(feature = "dev-registry")]
+    #[tokio::test]
+    async fn outdated_retries_only_the_failed_batch_request() {
+        let body = r#"{"schema":"glu.outdated.v1","packages":[]}"#;
+        let (base, server) = fault_server(vec![
+            response("200 OK", "", body),
+            response("503 Service Unavailable", "Retry-After: 0\r\n", ""),
+            response("200 OK", "", body),
+        ]);
+        let client = HttpResolveClient::new(&base).unwrap();
+        let names = (0..30)
+            .map(|index| PackageSelector(format!("package-{index}")))
+            .collect::<Vec<_>>();
+        let (result, _) = client
+            .outdated(&names, &Target("arm64_sequoia".to_string()))
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert!(result.packages.is_empty());
+        let diagnostics = client.diagnostics();
+        assert_eq!(diagnostics.retries.len(), 1);
+        assert_eq!(diagnostics.retries[0].request_id, 2);
+        assert_eq!(diagnostics.retries[0].attempt, 1);
+    }
+
+    #[cfg(feature = "dev-registry")]
+    #[tokio::test]
+    async fn permanent_status_is_not_retried() {
+        let (base, server) = fault_server(vec![response("404 Not Found", "", "missing")]);
+        let client = HttpResolveClient::new(&base).unwrap();
+        let error = client
+            .get_bytes(Url::parse(&format!("{base}/v1/info")).unwrap(), "info")
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.to_string().contains("HTTP 404"));
+        assert!(client.diagnostics().retries.is_empty());
+    }
+
+    #[cfg(feature = "dev-registry")]
+    #[tokio::test]
+    async fn malformed_success_is_not_retried() {
+        let (base, server) = fault_server(vec![response("200 OK", "", "{")]);
+        let client = HttpResolveClient::new(&base).unwrap();
+        let error = client
+            .info(
+                &PackageSelector("vips".to_string()),
+                &Target("arm64_sequoia".to_string()),
+            )
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.downcast_ref::<RegistryDecodeFailure>().is_some());
+        assert!(client.diagnostics().retries.is_empty());
+    }
+
+    #[cfg(feature = "dev-registry")]
+    #[tokio::test]
+    async fn retry_backoff_future_can_be_cancelled_promptly() {
+        let (base, server) = fault_server(vec![response(
+            "429 Too Many Requests",
+            "Retry-After: 15\r\n",
+            "",
+        )]);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let client = HttpResolveClient::with_cancellation(&base, cancellation.clone()).unwrap();
+        let cancel = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancellation.cancel();
+        });
+        let started = std::time::Instant::now();
+        let error = client
+            .get_bytes(
+                Url::parse(&format!("{base}/v1/resolve")).unwrap(),
+                "resolve",
+            )
+            .await
+            .unwrap_err();
+        cancel.await.unwrap();
+        server.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(error
+            .downcast_ref::<crate::error::InterruptedError>()
+            .is_some());
+        assert_eq!(
+            client.diagnostics().retries[0].retry_after_seconds,
+            Some(15.0)
+        );
+    }
+
+    #[cfg(feature = "dev-registry")]
+    #[tokio::test]
+    async fn in_flight_request_future_can_be_cancelled_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancel_from_server = cancellation.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            cancel_from_server.cancel();
+        });
+
+        let base = format!("http://{address}");
+        let client = HttpResolveClient::with_cancellation(&base, cancellation).unwrap();
+        let started = std::time::Instant::now();
+        let error = client
+            .get_bytes(
+                Url::parse(&format!("{base}/v1/resolve")).unwrap(),
+                "resolve",
+            )
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(error
+            .downcast_ref::<crate::error::InterruptedError>()
+            .is_some());
     }
 
     #[test]
