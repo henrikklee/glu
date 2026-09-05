@@ -19,13 +19,14 @@ use command_model::{
     PackagesErrorDetails, PartialInstallDetails, RegistryErrorDetails, RequirementErrorDetails,
     UnsupportedOptionDetails, COMMAND_SPECS,
 };
-use glu_client::{config::ClientConfig, GluClient};
+use glu_client::{config::ClientConfig, install::HostStartupDiagnostics, GluClient};
 #[cfg(test)]
 use glu_core::PackageName;
 use std::{future::Future, io::IsTerminal, time::Duration};
 
 #[tokio::main]
 async fn main() {
+    let main_started = std::time::Instant::now();
     // Restore the default SIGPIPE disposition so `glu foo | head` exits
     // quietly on a closed pipe instead of panicking (Rust's runtime sets
     // SIGPIPE to ignore by default).
@@ -71,8 +72,9 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    let argument_seconds = main_started.elapsed().as_secs_f64();
 
-    match run(cli).await {
+    match run(cli, main_started, argument_seconds).await {
         Ok((Some(result), globals)) => output::render_command_output(&result, &globals),
         Ok((None, _)) => {}
         Err(error) => {
@@ -182,7 +184,12 @@ where
     }
 }
 
-async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOptions), CliFailure> {
+async fn run(
+    cli: Cli,
+    main_started: std::time::Instant,
+    argument_seconds: f64,
+) -> std::result::Result<(Option<CommandOutput>, GlobalOptions), CliFailure> {
+    let command_validation_started = std::time::Instant::now();
     let globals = GlobalOptions::from_args(cli.globals);
     let json = globals.is_json();
     let null = globals.is_null();
@@ -197,6 +204,7 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
     let command_id = command.id();
     let spec = command_spec_by_id(command_id).expect("every command has a descriptor");
     validate_global_options(command_id, spec, &globals)?;
+    let command_validation_seconds = command_validation_started.elapsed().as_secs_f64();
     if let Command::PostinstallWorker { job, result } = &command {
         // Runs under the parent's platform sandbox. Do not resolve config or
         // take the prefix mutation lock here: the parent install already owns
@@ -204,21 +212,27 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
         glu_client::postinstall::sandbox::run_worker(job, result)?;
         return Ok((None, globals));
     }
+    let config_started = std::time::Instant::now();
     let config = ClientConfig::default_for_host();
+    let config_seconds = config_started.elapsed().as_secs_f64();
     // A1: serialize mutating commands against this prefix with a process lock,
     // so two concurrent install/up/rm/upgrade runs can't race on staging
     // dirs, linked markers, or state writes. Read-only queries skip it.
     let mutating = !plan && spec.mutates;
+    let operation_lock_started = std::time::Instant::now();
     let _op_lock = if mutating {
         Some(glu_client::state::op_lock::acquire(&config.prefix)?)
     } else {
         None
     };
+    let operation_lock_seconds = operation_lock_started.elapsed().as_secs_f64();
+    let recovery_started = std::time::Instant::now();
     if mutating {
         // Recovery is an execution-side mutation. Plan commands deliberately
         // use read-only snapshots and must not clean or rewrite prefix state.
         glu_client::state::recovery::cleanup_interrupted(&config.prefix)?;
     }
+    let recovery_seconds = recovery_started.elapsed().as_secs_f64();
     let client = GluClient::new(config);
     let events = events::for_invocation(&globals);
     let context = commands::CommandContext {
@@ -226,6 +240,15 @@ async fn run(cli: Cli) -> std::result::Result<(Option<CommandOutput>, GlobalOpti
         globals,
         events: events.clone(),
         show_resolution,
+        startup_main: main_started,
+        startup: HostStartupDiagnostics {
+            argument_seconds,
+            command_validation_seconds,
+            config_seconds,
+            operation_lock_seconds,
+            recovery_seconds,
+            main_entry_to_plan_seconds: 0.0,
+        },
     };
     let final_output = match command {
         Command::Install { names, force, deps } => {

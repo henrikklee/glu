@@ -49,6 +49,30 @@ pub struct InstallOptions {
     /// How the command updates declaration membership; see `DeclaredPolicy`.
     pub declared_policy: DeclaredPolicy,
 }
+
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct HostStartupDiagnostics {
+    pub argument_seconds: f64,
+    pub command_validation_seconds: f64,
+    pub config_seconds: f64,
+    pub operation_lock_seconds: f64,
+    pub recovery_seconds: f64,
+    pub main_entry_to_plan_seconds: f64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct InstallStartupDiagnostics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostStartupDiagnostics>,
+    pub registry_resolve_seconds: f64,
+    pub manifest_validation_seconds: f64,
+    pub state_snapshot_seconds: f64,
+    pub resolve_and_state_wall_seconds: f64,
+    pub plan_finalize_seconds: f64,
+    pub plan_total_seconds: f64,
+    pub execution_setup_seconds: f64,
+    pub command_to_execution_seconds: f64,
+}
 use glu_core::{InstalledPackage, PackageId, PackageName, PackageSelector, ResolveRequest};
 use std::{path::PathBuf, sync::Arc};
 
@@ -174,9 +198,14 @@ pub struct InstallPlan {
     pub(crate) deactivated_after: BTreeSet<PackageName>,
     declared_before: BTreeSet<PackageName>,
     command_start: std::time::Instant,
+    startup_diagnostics: InstallStartupDiagnostics,
 }
 
 impl InstallPlan {
+    pub fn set_host_startup_diagnostics(&mut self, diagnostics: HostStartupDiagnostics) {
+        self.startup_diagnostics.host = Some(diagnostics);
+    }
+
     /// The resolved plan graph, kept semantic so presentation layers can
     /// render human or machine tree views without re-resolving.
     pub fn dependency_tree(&self) -> Vec<DependencyTreeNode> {
@@ -321,13 +350,19 @@ pub async fn plan_install(
         bail!("install requires at least one package name");
     }
 
+    let resolve_and_state_started = std::time::Instant::now();
+    let state_started = std::time::Instant::now();
     let prefix_for_state = client.config().prefix.clone();
     let state_task = tokio::task::spawn_blocking(move || StateSnapshot::load(&prefix_for_state));
-    let (manifest, snapshot) = tokio::try_join!(resolve_manifest(client, names), async {
-        state_task
-            .await
-            .map_err(|error| anyhow::anyhow!("state snapshot loader panicked: {error}"))?
-    })?;
+    let ((manifest, resolve_timing), (snapshot, state_snapshot_seconds)) =
+        tokio::try_join!(resolve_manifest_timed(client, names), async {
+            let snapshot = state_task
+                .await
+                .map_err(|error| anyhow::anyhow!("state snapshot loader panicked: {error}"))??;
+            Ok::<_, anyhow::Error>((snapshot, state_started.elapsed().as_secs_f64()))
+        })?;
+    let resolve_and_state_wall_seconds = resolve_and_state_started.elapsed().as_secs_f64();
+    let plan_finalize_started = std::time::Instant::now();
     let state = snapshot.installed;
     let declaration_before = snapshot.declaration;
     let mut declaration = declaration_before.clone();
@@ -447,7 +482,7 @@ pub async fn plan_install(
         workset.install.iter(),
     );
 
-    Ok(InstallPlan {
+    let mut plan = InstallPlan {
         requested,
         would_install: package_changes_for_ids(
             &manifest,
@@ -470,7 +505,17 @@ pub async fn plan_install(
         deactivated_after,
         declared_before: declaration_before.names(),
         command_start,
-    })
+        startup_diagnostics: InstallStartupDiagnostics {
+            registry_resolve_seconds: resolve_timing.registry_seconds,
+            manifest_validation_seconds: resolve_timing.validation_seconds,
+            state_snapshot_seconds,
+            resolve_and_state_wall_seconds,
+            ..Default::default()
+        },
+    };
+    plan.startup_diagnostics.plan_finalize_seconds = plan_finalize_started.elapsed().as_secs_f64();
+    plan.startup_diagnostics.plan_total_seconds = command_start.elapsed().as_secs_f64();
+    Ok(plan)
 }
 
 pub async fn execute_install(
@@ -480,6 +525,7 @@ pub async fn execute_install(
     events: Arc<dyn ExecutionEvents>,
 ) -> Result<InstallSummary> {
     let command_start = plan.command_start;
+    let startup_diagnostics = plan.startup_diagnostics.clone();
     let mut summary = InstallSummary {
         requested: plan.requested.clone(),
         resolved_root_keys: plan.resolved_root_keys(),
@@ -512,13 +558,14 @@ pub async fn execute_install(
         return Ok(summary);
     }
 
-    summary.execution = execute_workset(
+    summary.execution = execute_workset_with_startup(
         client,
         plan.manifest.clone(),
         plan.workset.clone(),
         options,
         plan.deactivated_after.clone(),
         command_start,
+        Some(startup_diagnostics),
         events,
     )
     .await?;
@@ -1109,16 +1156,37 @@ pub(crate) async fn resolve_manifest(
     client: &GluClient,
     names: Vec<PackageSelector>,
 ) -> Result<glu_core::InstallManifest> {
+    Ok(resolve_manifest_timed(client, names).await?.0)
+}
+
+struct ResolveManifestTiming {
+    registry_seconds: f64,
+    validation_seconds: f64,
+}
+
+async fn resolve_manifest_timed(
+    client: &GluClient,
+    names: Vec<PackageSelector>,
+) -> Result<(glu_core::InstallManifest, ResolveManifestTiming)> {
     let resolve = HttpResolveClient::new(&client.config().registry_base_url)?;
+    let registry_started = std::time::Instant::now();
     let manifest = resolve
         .resolve(&ResolveRequest {
             names,
             target: client.config().target.clone(),
         })
         .await?;
+    let registry_seconds = registry_started.elapsed().as_secs_f64();
+    let validation_started = std::time::Instant::now();
     planner::validate_manifest(&manifest)?;
     validate_client_support(&manifest, &client.config().prefix)?;
-    Ok(manifest)
+    Ok((
+        manifest,
+        ResolveManifestTiming {
+            registry_seconds,
+            validation_seconds: validation_started.elapsed().as_secs_f64(),
+        },
+    ))
 }
 
 fn canonicalize_declaration_renames(
@@ -1363,6 +1431,31 @@ async fn execute_workset(
     command_start: std::time::Instant,
     events: Arc<dyn ExecutionEvents>,
 ) -> Result<WorksetExecutionSummary> {
+    execute_workset_with_startup(
+        client,
+        manifest,
+        workset,
+        options,
+        deactivated_names,
+        command_start,
+        None,
+        events,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_workset_with_startup(
+    client: &GluClient,
+    manifest: glu_core::InstallManifest,
+    workset: planner::InstallWorkSet,
+    options: InstallOptions,
+    deactivated_names: BTreeSet<PackageName>,
+    command_start: std::time::Instant,
+    startup_diagnostics: Option<InstallStartupDiagnostics>,
+    events: Arc<dyn ExecutionEvents>,
+) -> Result<WorksetExecutionSummary> {
+    let execution_setup_started = std::time::Instant::now();
     let prefix = client.config().prefix.clone();
     let postinstall_plans = PostinstallPlans::analyze(&manifest, &workset.install, &prefix)?;
     let execution_plan =
@@ -1379,6 +1472,11 @@ async fn execute_workset(
     let progress_enabled = events.wants_progress();
     let ctx =
         ExecutionContext::with_events(options.verbose && progress_enabled, Arc::clone(&events));
+    if let Some(mut startup) = startup_diagnostics {
+        startup.execution_setup_seconds = execution_setup_started.elapsed().as_secs_f64();
+        startup.command_to_execution_seconds = command_start.elapsed().as_secs_f64();
+        ctx.put_artifact("startup", serde_json::to_value(startup)?);
+    }
     let plan_for_trace = execution_plan.clone();
     let download_progress = crate::download::DownloadProgress::default();
 
@@ -2049,7 +2147,7 @@ mod interrupted_install_tests {
         assert_eq!(workset.rename[0].old_name.0, "foo");
 
         let events = Arc::new(RecordingExecutionEvents::default());
-        execute_workset(
+        let execution = execute_workset_with_startup(
             &client,
             manifest,
             workset,
@@ -2059,10 +2157,31 @@ mod interrupted_install_tests {
             },
             BTreeSet::new(),
             std::time::Instant::now(),
+            Some(InstallStartupDiagnostics {
+                host: Some(HostStartupDiagnostics {
+                    config_seconds: 0.5,
+                    ..Default::default()
+                }),
+                registry_resolve_seconds: 1.25,
+                ..Default::default()
+            }),
             events.clone(),
         )
         .await
         .unwrap();
+
+        let trace: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(execution.trace_path.expect("trace was written")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            trace["diagnostics"]["startup"]["registry_resolve_seconds"],
+            1.25
+        );
+        assert_eq!(
+            trace["diagnostics"]["startup"]["host"]["config_seconds"],
+            0.5
+        );
 
         let recorded = events.events();
         assert!(matches!(
@@ -2132,6 +2251,7 @@ mod interrupted_install_tests {
             deactivated_after: BTreeSet::new(),
             declared_before: BTreeSet::new(),
             command_start: std::time::Instant::now(),
+            startup_diagnostics: InstallStartupDiagnostics::default(),
         };
         block_trace_writes(&prefix);
         let events = Arc::new(RecordingExecutionEvents::default());

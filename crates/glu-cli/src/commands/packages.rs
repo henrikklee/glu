@@ -52,11 +52,14 @@ pub(crate) async fn install(
         verbose: context.globals.verbose,
         ..Default::default()
     };
-    let install_plan = while_resolving(
+    let mut startup = context.startup;
+    startup.main_entry_to_plan_seconds = context.startup_main.elapsed().as_secs_f64();
+    let mut install_plan = while_resolving(
         context.show_resolution,
         context.client.plan_install(names, options),
     )
     .await??;
+    install_plan.set_host_startup_diagnostics(startup);
     if context.globals.plan {
         return Ok(CommandOutcome::output(CommandOutput::InstallPlan(
             output::install_plan_output(&install_plan),
@@ -99,11 +102,14 @@ pub(crate) async fn reinstall(
         verbose: false,
         declared_policy: glu_client::install::DeclaredPolicy::Preserve,
     };
-    let install_plan = while_resolving(
+    let mut startup = context.startup;
+    startup.main_entry_to_plan_seconds = context.startup_main.elapsed().as_secs_f64();
+    let mut install_plan = while_resolving(
         context.show_resolution,
         context.client.plan_install(names, options),
     )
     .await??;
+    install_plan.set_host_startup_diagnostics(startup);
     if context.globals.plan {
         return Ok(CommandOutcome::output(CommandOutput::ReinstallPlan(
             output::reinstall_plan_output(&install_plan),

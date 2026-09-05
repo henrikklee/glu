@@ -67,6 +67,7 @@ fn plan(exposure: Exposure, declared_before: &[&str]) -> InstallPlan {
             .map(|name| PackageName((*name).to_string()))
             .collect(),
         command_start: std::time::Instant::now(),
+        startup_diagnostics: InstallStartupDiagnostics::default(),
     }
 }
 
