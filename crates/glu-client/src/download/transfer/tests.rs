@@ -1,7 +1,7 @@
 use super::{
     first_body_byte_latency, parse_content_range, segment_ranges, should_report,
-    should_use_multipart, AttemptFailure, AttemptKind, AttemptProgress, ByteRange, RequestBudget,
-    TransferEvent, TransferFailure, TransferPolicy, MIB,
+    should_use_multipart, AttemptFailure, AttemptKind, AttemptProgress, ByteRange, TransferEvent,
+    TransferFailure, TransferPolicy, MIB,
 };
 use ring::digest;
 use std::{
@@ -144,25 +144,26 @@ fn no_progress_is_tail_emergency_evidence() {
 }
 
 #[tokio::test]
-async fn request_budget_runs_higher_priority_first() {
-    let budget = RequestBudget::new(1);
-    let held = budget.acquire(0).await.unwrap();
+async fn central_transport_queue_runs_higher_priority_first() {
+    let transports =
+        super::OrdinaryTransports::new(vec![reqwest::Client::builder().build().unwrap()], 1);
+    let held = transports.acquire(0, 100).await.unwrap();
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-    let low = budget.clone();
+    let low = transports.clone();
     let low_sender = sender.clone();
     tokio::spawn(async move {
-        let _permit = low.acquire(10).await.unwrap();
+        let _lease = low.acquire(10, 100).await.unwrap();
         low_sender.send("low").unwrap();
     });
-    while budget.waiting() != 1 {
+    while transports.waiting() != 1 {
         tokio::task::yield_now().await;
     }
-    let high = budget.clone();
+    let high = transports.clone();
     tokio::spawn(async move {
-        let _permit = high.acquire(1).await.unwrap();
+        let _lease = high.acquire(1, 100).await.unwrap();
         sender.send("high").unwrap();
     });
-    while budget.waiting() != 2 {
+    while transports.waiting() != 2 {
         tokio::task::yield_now().await;
     }
     drop(held);
@@ -357,7 +358,7 @@ fn transport_assignment_explores_equal_unknown_pools() {
 }
 
 #[test]
-fn transport_assignment_remains_fixed_round_robin_after_observation() {
+fn returned_transport_slots_are_reused_without_throughput_scoring() {
     let clients = (0..2)
         .map(|_| reqwest::Client::builder().build().unwrap())
         .collect();
@@ -413,7 +414,7 @@ async fn fixed_transport_lanes_hold_four_attempts_each() {
 
     let waiting = transports.clone();
     let waiter = tokio::spawn(async move { waiting.acquire(0, 100).await.unwrap() });
-    while transports.pools[0].budget.waiting() != 1 {
+    while transports.waiting() != 1 {
         tokio::task::yield_now().await;
     }
     let released = leases.iter().position(|lease| lease.id == 0).unwrap();
@@ -421,6 +422,55 @@ async fn fixed_transport_lanes_hold_four_attempts_each() {
     let replacement = waiter.await.unwrap();
     assert_eq!(replacement.id, 0);
     assert_eq!(replacement.active_at_admission, 4);
+}
+
+#[tokio::test]
+async fn free_pool_serves_work_instead_of_preassigning_it_to_a_busy_pool() {
+    let clients = (0..4)
+        .map(|_| reqwest::Client::builder().build().unwrap())
+        .collect();
+    let transports = super::OrdinaryTransports::new(clients, 4);
+    let mut leases = Vec::new();
+    for _ in 0..16 {
+        leases.push(transports.acquire(0, 100).await.unwrap());
+    }
+
+    // Reproduce the live failure shape: pool 0 remains full while every other pool has room.
+    let mut held_pool_zero = Vec::new();
+    for lease in leases {
+        if lease.id == 0 {
+            held_pool_zero.push(lease);
+        } else {
+            drop(lease);
+        }
+    }
+    assert_eq!(held_pool_zero.len(), 4);
+    assert_eq!(transports.available(), 12);
+
+    let lease = tokio::time::timeout(Duration::from_millis(100), transports.acquire(0, 100))
+        .await
+        .expect("free transport capacity must be used immediately")
+        .unwrap();
+    assert_ne!(lease.id, 0);
+    assert_eq!(transports.waiting(), 0);
+}
+
+#[tokio::test]
+async fn cancelling_a_transport_waiter_loses_no_slot() {
+    let transports =
+        super::OrdinaryTransports::new(vec![reqwest::Client::builder().build().unwrap()], 1);
+    let held = transports.acquire(0, 100).await.unwrap();
+    let waiting = transports.clone();
+    let task = tokio::spawn(async move { waiting.acquire(1, 100).await });
+    while transports.waiting() != 1 {
+        tokio::task::yield_now().await;
+    }
+    task.abort();
+    let _ = task.await;
+    assert_eq!(transports.waiting(), 0);
+    drop(held);
+    assert_eq!(transports.available(), 1);
+    assert!(transports.acquire(1, 100).await.is_some());
 }
 
 #[test]
@@ -1165,7 +1215,7 @@ async fn multipart_keeps_one_priority_waiter_behind_each_busy_lane() {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let pool = &manager.ordinary_http.pools[0];
-            if pool.active.load(Ordering::Relaxed) == 1 && pool.budget.waiting() == 1 {
+            if pool.active.load(Ordering::Relaxed) == 1 && manager.ordinary_http.waiting() == 1 {
                 break;
             }
             tokio::task::yield_now().await;

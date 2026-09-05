@@ -237,16 +237,22 @@ fn sha256_file_descriptor(file: &File) -> io::Result<String> {
 #[derive(Debug, Clone)]
 struct OrdinaryTransports {
     pools: Arc<Vec<OrdinaryTransportPool>>,
-    next_tie: Arc<Mutex<usize>>,
+    coordinator: Arc<Mutex<TransportCoordinatorState>>,
 }
 
 #[derive(Debug)]
 struct OrdinaryTransportPool {
     http: reqwest::Client,
-    budget: RequestBudget,
     active: AtomicUsize,
     outstanding_bytes: AtomicU64,
     observed_bytes: AtomicU64,
+}
+
+#[derive(Debug)]
+struct TransportCoordinatorState {
+    available_slots: VecDeque<usize>,
+    next_sequence: u64,
+    waiters: BTreeMap<(u64, u64), oneshot::Sender<TransportPermit>>,
 }
 
 impl OrdinaryTransports {
@@ -255,20 +261,26 @@ impl OrdinaryTransports {
             !clients.is_empty(),
             "transfer runtime requires an ordinary HTTP client"
         );
+        let pool_count = clients.len();
+        let pools = Arc::new(
+            clients
+                .into_iter()
+                .map(|http| OrdinaryTransportPool {
+                    http,
+                    active: AtomicUsize::new(0),
+                    outstanding_bytes: AtomicU64::new(0),
+                    observed_bytes: AtomicU64::new(0),
+                })
+                .collect(),
+        );
+        let available_slots = (0..attempts_per_pool).flat_map(|_| 0..pool_count).collect();
         Self {
-            pools: Arc::new(
-                clients
-                    .into_iter()
-                    .map(|http| OrdinaryTransportPool {
-                        http,
-                        budget: RequestBudget::new(attempts_per_pool),
-                        active: AtomicUsize::new(0),
-                        outstanding_bytes: AtomicU64::new(0),
-                        observed_bytes: AtomicU64::new(0),
-                    })
-                    .collect(),
-            ),
-            next_tie: Arc::new(Mutex::new(0)),
+            pools,
+            coordinator: Arc::new(Mutex::new(TransportCoordinatorState {
+                available_slots,
+                next_sequence: 0,
+                waiters: BTreeMap::new(),
+            })),
         }
     }
 
@@ -277,14 +289,27 @@ impl OrdinaryTransports {
     }
 
     async fn acquire(&self, priority: u64, candidate_bytes: u64) -> Option<OrdinaryTransportLease> {
-        let id = {
-            let mut next_tie = self.next_tie.lock().expect("transport tie lock poisoned");
-            let id = *next_tie;
-            *next_tie = (id + 1) % self.pools.len();
-            id
+        let (sender, receiver) = oneshot::channel();
+        let key = {
+            let mut state = self
+                .coordinator
+                .lock()
+                .expect("transport coordinator lock poisoned");
+            let key = (priority, state.next_sequence);
+            state.next_sequence = state.next_sequence.wrapping_add(1);
+            state.waiters.insert(key, sender);
+            dispatch_transports(&mut state, &self.coordinator);
+            key
         };
+        let mut waiting = WaitingTransport {
+            coordinator: Arc::clone(&self.coordinator),
+            key,
+            armed: true,
+        };
+        let permit = receiver.await.ok()?;
+        waiting.armed = false;
+        let id = permit.id;
         let pool = &self.pools[id];
-        let permit = pool.budget.acquire(priority).await?;
         let active_at_admission = pool.active.fetch_add(1, Ordering::Relaxed) + 1;
         let outstanding_at_admission = pool
             .outstanding_bytes
@@ -310,6 +335,88 @@ impl OrdinaryTransports {
             .map(|pool| pool.active.load(Ordering::Relaxed))
             .sum()
     }
+
+    #[cfg(test)]
+    fn waiting(&self) -> usize {
+        self.coordinator
+            .lock()
+            .expect("transport coordinator lock poisoned")
+            .waiters
+            .len()
+    }
+
+    #[cfg(test)]
+    fn available(&self) -> usize {
+        self.coordinator
+            .lock()
+            .expect("transport coordinator lock poisoned")
+            .available_slots
+            .len()
+    }
+}
+
+fn dispatch_transports(
+    state: &mut TransportCoordinatorState,
+    coordinator: &Arc<Mutex<TransportCoordinatorState>>,
+) {
+    while !state.available_slots.is_empty() && !state.waiters.is_empty() {
+        let pool_id = state
+            .available_slots
+            .pop_front()
+            .expect("available transport slot exists");
+        let (_, sender) = state.waiters.pop_first().expect("transport waiter exists");
+        let permit = TransportPermit {
+            id: pool_id,
+            coordinator: Arc::clone(coordinator),
+            armed: true,
+        };
+        if let Err(mut permit) = sender.send(permit) {
+            permit.armed = false;
+            state.available_slots.push_front(pool_id);
+        }
+    }
+    debug_assert!(state.available_slots.is_empty() || state.waiters.is_empty());
+}
+
+#[derive(Debug)]
+struct TransportPermit {
+    id: usize,
+    coordinator: Arc<Mutex<TransportCoordinatorState>>,
+    armed: bool,
+}
+
+impl Drop for TransportPermit {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = self
+            .coordinator
+            .lock()
+            .expect("transport coordinator lock poisoned");
+        state.available_slots.push_back(self.id);
+        dispatch_transports(&mut state, &self.coordinator);
+    }
+}
+
+struct WaitingTransport {
+    coordinator: Arc<Mutex<TransportCoordinatorState>>,
+    key: (u64, u64),
+    armed: bool,
+}
+
+impl Drop for WaitingTransport {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = self
+            .coordinator
+            .lock()
+            .expect("transport coordinator lock poisoned");
+        state.waiters.remove(&self.key);
+        dispatch_transports(&mut state, &self.coordinator);
+    }
 }
 
 #[derive(Debug)]
@@ -321,7 +428,7 @@ struct OrdinaryTransportLease {
     work_capacity_ratio: f64,
     remaining_bytes: u64,
     pools: Arc<Vec<OrdinaryTransportPool>>,
-    _permit: RequestPermit,
+    _permit: TransportPermit,
 }
 
 impl OrdinaryTransportLease {
@@ -1877,115 +1984,6 @@ struct ProgressSample {
 struct AttemptHealthSnapshot {
     rate: f64,
     estimated_remaining: Duration,
-}
-
-#[derive(Debug, Clone)]
-struct RequestBudget {
-    inner: Arc<Mutex<RequestBudgetState>>,
-}
-
-#[derive(Debug)]
-struct RequestBudgetState {
-    available: usize,
-    next_sequence: u64,
-    waiters: BTreeMap<(u64, u64), oneshot::Sender<RequestPermit>>,
-}
-
-impl RequestBudget {
-    fn new(limit: usize) -> Self {
-        let limit = limit.max(1);
-        Self {
-            inner: Arc::new(Mutex::new(RequestBudgetState {
-                available: limit,
-                next_sequence: 0,
-                waiters: BTreeMap::new(),
-            })),
-        }
-    }
-
-    async fn acquire(&self, priority: u64) -> Option<RequestPermit> {
-        let (sender, receiver) = oneshot::channel();
-        let key = {
-            let mut state = self.inner.lock().expect("request budget lock poisoned");
-            let key = (priority, state.next_sequence);
-            state.next_sequence = state.next_sequence.wrapping_add(1);
-            state.waiters.insert(key, sender);
-            dispatch_requests(&mut state, &self.inner);
-            key
-        };
-        let mut cleanup = WaitingRequest {
-            budget: self.clone(),
-            key,
-            armed: true,
-        };
-        let permit = receiver.await.ok()?;
-        cleanup.armed = false;
-        Some(permit)
-    }
-
-    #[cfg(test)]
-    fn waiting(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("request budget lock poisoned")
-            .waiters
-            .len()
-    }
-}
-
-fn dispatch_requests(state: &mut RequestBudgetState, budget: &Arc<Mutex<RequestBudgetState>>) {
-    while state.available > 0 {
-        let Some((_, sender)) = state.waiters.pop_first() else {
-            break;
-        };
-        state.available -= 1;
-        let permit = RequestPermit {
-            budget: Arc::clone(budget),
-            armed: true,
-        };
-        if let Err(mut permit) = sender.send(permit) {
-            permit.armed = false;
-            state.available += 1;
-        }
-    }
-}
-
-#[derive(Debug)]
-struct RequestPermit {
-    budget: Arc<Mutex<RequestBudgetState>>,
-    armed: bool,
-}
-
-impl Drop for RequestPermit {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let mut state = self.budget.lock().expect("request budget lock poisoned");
-        state.available += 1;
-        dispatch_requests(&mut state, &self.budget);
-    }
-}
-
-struct WaitingRequest {
-    budget: RequestBudget,
-    key: (u64, u64),
-    armed: bool,
-}
-
-impl Drop for WaitingRequest {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let mut state = self
-            .budget
-            .inner
-            .lock()
-            .expect("request budget lock poisoned");
-        state.waiters.remove(&self.key);
-        dispatch_requests(&mut state, &self.budget.inner);
-    }
 }
 
 fn validate_content_range(
