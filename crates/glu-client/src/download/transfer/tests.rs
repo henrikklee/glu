@@ -24,14 +24,33 @@ fn reports_every_tenth_of_a_megabyte() {
 }
 
 #[test]
-fn chunking_starts_above_one_mib() {
+fn multipart_uses_the_rounded_target_part_count() {
     let policy = TransferPolicy::default();
     assert!(!should_use_multipart(MIB, &policy));
-    assert!(should_use_multipart(MIB + 1, &policy));
+    assert!(!should_use_multipart(MIB + 1, &policy));
+    assert!(should_use_multipart(MIB + MIB / 2, &policy));
+
+    let eight_mib = TransferPolicy::default().with_part_size_mib(8);
+    assert_eq!(segment_ranges(7 * MIB, &eight_mib).len(), 1);
+    assert_eq!(segment_ranges(12 * MIB, &eight_mib).len(), 2);
+    assert_eq!(segment_ranges(20 * MIB, &eight_mib).len(), 3);
 }
 
 #[test]
-fn segment_ranges_stay_fixed_size_for_very_large_artifacts() {
+fn zero_part_size_disables_multipart_splitting() {
+    let policy = TransferPolicy::default().with_part_size_mib(0);
+    assert!(!should_use_multipart(2_240 * MIB, &policy));
+    assert_eq!(
+        segment_ranges(2_240 * MIB, &policy),
+        vec![ByteRange {
+            start: 0,
+            end: 2_240 * MIB - 1,
+        }]
+    );
+}
+
+#[test]
+fn segment_ranges_are_balanced_for_very_large_artifacts() {
     let ranges = segment_ranges(64 * MIB, &TransferPolicy::default());
     assert_eq!(ranges.len(), 64);
     assert_eq!(ranges.first().unwrap().start, 0);
@@ -58,9 +77,12 @@ fn small_artifact_is_one_segment() {
 #[test]
 fn segment_ranges_cover_odd_sizes_without_overlap() {
     let ranges = segment_ranges(100 * MIB + 123, &TransferPolicy::default());
-    assert_eq!(ranges.len(), 101);
+    assert_eq!(ranges.len(), 100);
     assert_eq!(ranges.first().unwrap().start, 0);
     assert_eq!(ranges.last().unwrap().end, 100 * MIB + 122);
+    let shortest = ranges.iter().map(|range| range.len()).min().unwrap();
+    let longest = ranges.iter().map(|range| range.len()).max().unwrap();
+    assert!(longest - shortest < ranges.len() as u64);
     for pair in ranges.windows(2) {
         assert_eq!(pair[0].end + 1, pair[1].start);
     }
@@ -98,6 +120,11 @@ fn retry_classification_is_typed() {
     assert!(AttemptFailure::EarlyEof {
         expected: 10,
         received: 3,
+    }
+    .retryable());
+    assert!(AttemptFailure::Pathological {
+        bytes_per_second: 1.0,
+        estimated_remaining: Duration::from_secs(60),
     }
     .retryable());
     assert!(!AttemptFailure::InvalidRange("wrong range".into()).retryable());
@@ -333,7 +360,7 @@ fn test_manager(policy: TransferPolicy) -> super::TransferRuntime {
         .read_timeout(Duration::from_secs(2))
         .build()
         .unwrap();
-    super::TransferRuntime::with_policy(resolver, vec![client()], client(), policy)
+    super::TransferRuntime::with_policy(resolver, vec![client()], policy)
 }
 
 #[test]
@@ -479,7 +506,9 @@ fn only_the_highest_priority_artifact_enters_emergency_tail() {
     let high = manager.register_artifact(1, 5);
     let low = manager.register_artifact(10, 1);
 
-    assert!(high.handle.tail_eligible().is_none());
+    // With only two active artifacts, the highest-priority artifact is already on the install
+    // tail even when it still has more than two ranges. Lower-priority work remains ineligible.
+    assert!(high.handle.tail_eligible().is_some());
     assert!(low.handle.tail_eligible().is_none());
     for _ in 0..3 {
         high.handle.mark_range_complete();
@@ -521,6 +550,8 @@ async fn healthy_single_stream_completes_without_speculation() {
     assert_eq!(report.diagnostics.wire_bytes, data.len() as u64);
     assert_eq!(report.diagnostics.transport_profile, "test");
     assert_eq!(report.diagnostics.transport_count, 1);
+    assert_eq!(report.diagnostics.configured_part_size_mib, 1);
+    assert!(report.diagnostics.multipart_enabled);
     let [first_body, body_complete, verify_complete, sync_complete] =
         report.diagnostics.subphase_boundaries().unwrap();
     assert!(first_body <= body_complete);
@@ -1339,14 +1370,11 @@ async fn final_pathological_single_stream_uses_one_emergency() {
                     thread::sleep(Duration::from_millis(20));
                 }
             } else {
-                let range = request.range.expect("emergency request must use Range");
-                write_response(
-                    stream,
-                    "206 Partial Content",
-                    range.len() as usize,
-                    Some((range, data.len())),
-                    &data[range.start as usize..=range.end as usize],
+                assert_eq!(
+                    request.range, None,
+                    "range-disabled rescue must request the full object"
                 );
+                write_response(stream, "200 OK", data.len(), None, &data);
             }
         }
     });
@@ -1358,7 +1386,8 @@ async fn final_pathological_single_stream_uses_one_emergency() {
         pathological_remaining: Duration::from_millis(100),
         rolling_window: Duration::from_millis(200),
         ..TransferPolicy::default()
-    };
+    }
+    .with_part_size_mib(0);
     let manager = test_manager(policy);
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("artifact.tmp");
@@ -1381,7 +1410,7 @@ async fn final_pathological_single_stream_uses_one_emergency() {
 }
 
 #[tokio::test]
-async fn slow_original_remains_the_fallback_when_emergency_fails() {
+async fn slow_original_survives_failed_rescues_until_a_later_rescue_wins() {
     let data = Arc::new(vec![11_u8; 100_000]);
     let server = test_server({
         let data = Arc::clone(&data);
@@ -1392,16 +1421,25 @@ async fn slow_original_remains_the_fallback_when_emergency_fails() {
                     data.len()
                 );
                 stream.write_all(headers.as_bytes()).unwrap();
-                for chunk in data.chunks(10_000) {
+                for chunk in data.chunks(1_000) {
                     if stream.write_all(chunk).is_err() {
                         break;
                     }
                     let _ = stream.flush();
                     thread::sleep(Duration::from_millis(30));
                 }
-            } else {
+            } else if request.sequence <= 2 {
                 assert!(request.range.is_some());
                 write_response(stream, "503 Service Unavailable", 0, None, &[]);
+            } else {
+                let range = request.range.expect("rescue request must use Range");
+                write_response(
+                    stream,
+                    "206 Partial Content",
+                    range.len() as usize,
+                    Some((range, data.len())),
+                    &data[range.start as usize..=range.end as usize],
+                );
             }
         }
     });
@@ -1431,11 +1469,11 @@ async fn slow_original_remains_the_fallback_when_emergency_fails() {
         .unwrap();
 
     assert_eq!(tokio::fs::read(path).await.unwrap(), *data);
-    assert_eq!(report.segments[0].emergencies, 1);
+    assert!(report.segments[0].emergencies >= 3);
 }
 
 #[tokio::test]
-async fn stalled_single_launches_only_one_emergency_attempt() {
+async fn stalled_single_continuously_replaces_pathological_rescues() {
     let data = Arc::new(vec![29_u8; 100_000]);
     let requests = Arc::new(AtomicUsize::new(0));
     let server = test_server({
@@ -1459,7 +1497,7 @@ async fn stalled_single_launches_only_one_emergency_attempt() {
             headers.push_str("\r\n");
             stream.write_all(headers.as_bytes()).unwrap();
             let _ = stream.flush();
-            thread::sleep(Duration::from_millis(150));
+            thread::sleep(Duration::from_secs(2));
         }
     });
     let policy = TransferPolicy {
@@ -1474,7 +1512,7 @@ async fn stalled_single_launches_only_one_emergency_attempt() {
     let manager = test_manager(policy);
     let temp = tempfile::tempdir().unwrap();
     let result = tokio::time::timeout(
-        Duration::from_millis(100),
+        Duration::from_millis(750),
         manager.download_with_header_to_path(
             &server.url,
             &temp.path().join("artifact.tmp"),
@@ -1487,11 +1525,11 @@ async fn stalled_single_launches_only_one_emergency_attempt() {
     .await;
 
     assert!(result.is_err());
-    assert_eq!(requests.load(Ordering::Relaxed), 2);
+    assert!(requests.load(Ordering::Relaxed) >= 3);
 }
 
 #[tokio::test]
-async fn two_final_stalled_ranges_have_one_emergency_each() {
+async fn two_final_stalled_ranges_each_receive_rescue_capacity() {
     let data = Arc::new(vec![7_u8; 300_000]);
     let request_count = Arc::new(AtomicUsize::new(0));
     let server = test_server({
@@ -1506,7 +1544,7 @@ async fn two_final_stalled_ranges_have_one_emergency_each() {
                 );
             stream.write_all(headers.as_bytes()).unwrap();
             let _ = stream.flush();
-            thread::sleep(Duration::from_millis(150));
+            thread::sleep(Duration::from_secs(2));
         }
     });
     let policy = TransferPolicy {
@@ -1523,7 +1561,7 @@ async fn two_final_stalled_ranges_have_one_emergency_each() {
     let manager = test_manager(policy);
     let temp = tempfile::tempdir().unwrap();
     let result = tokio::time::timeout(
-        Duration::from_millis(100),
+        Duration::from_millis(750),
         manager.download_with_header_to_path(
             &server.url,
             &temp.path().join("artifact.tmp"),
@@ -1536,7 +1574,7 @@ async fn two_final_stalled_ranges_have_one_emergency_each() {
     .await;
 
     assert!(result.is_err());
-    assert_eq!(request_count.load(Ordering::Relaxed), 4);
+    assert!(request_count.load(Ordering::Relaxed) >= 4);
 }
 
 #[tokio::test]

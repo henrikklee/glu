@@ -129,7 +129,7 @@ pub async fn execute_install_plan(
         postinstall_plans,
         download_progress,
         events,
-    ));
+    )?);
     let execution = execute_plan(plan, ops.clone(), Some(observer), ctx).await?;
     Ok(SchedulerInstallResult {
         execution,
@@ -171,11 +171,11 @@ impl SchedulerInstallOperations {
         postinstall_plans: PostinstallPlans,
         download_progress: DownloadProgress,
         events: Arc<dyn ExecutionEvents>,
-    ) -> Self {
-        let downloader = ArtifactDownloader::new(&prefix);
+    ) -> Result<Self> {
+        let downloader = ArtifactDownloader::new(&prefix)?;
         let writer_pool = Arc::new(WriterPool::new());
         let code_sign_pool = Arc::new(CodeSignPool::new(Arc::clone(&writer_pool)));
-        Self {
+        Ok(Self {
             manifest,
             prefix,
             downloader,
@@ -192,7 +192,7 @@ impl SchedulerInstallOperations {
             writer_pool,
             code_sign_pool,
             events,
-        }
+        })
     }
 
     async fn ghcr_auth(&self) -> Result<()> {

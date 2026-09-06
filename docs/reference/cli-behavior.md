@@ -185,6 +185,18 @@ successful human mutation, isolation notices are limited to resolved requested r
 roots for updates; isolated transitive dependencies remain quiet. Flat list JSON also uses
 `exposure` rather than a source-specific boolean.
 
+## Download part size
+
+`GLU_DOWNLOAD_PART_SIZE_MIB` controls the approximate size of parallel HTTP range requests for bottle downloads. It is supported in release builds.
+
+- Unset defaults to `1` MiB.
+- `0` disables proactive multipart splitting. Each artifact starts with one full-object request;
+  retries may still use a range request to resume transferred bytes.
+- Integers from `1` through `64` select an approximate part size in MiB.
+- Empty, fractional, negative, non-numeric, and larger values fail before download execution.
+
+For nonzero values, glu rounds the artifact-size-to-target-size ratio to the nearest part count, with exact halves rounded upward, and divides the artifact evenly across that count. The final part always ends at the artifact boundary. The configured value is therefore a target, not a strict maximum part size. Download trace diagnostics record the configured size, whether multipart splitting was enabled, the actual ranges, and the resulting transport profile.
+
 ## Short flag composition
 
 Short flags compose when the command supports those flags:

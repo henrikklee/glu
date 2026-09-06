@@ -1,7 +1,7 @@
 use super::{
-    report_progress, retry_after, validate_content_range, ArtifactActivity, AttemptFailure,
-    AttemptKind, AttemptProgress, ByteRange, SegmentReport, StagingFile, TransferEvent,
-    TransferRuntime, TransferSource, TransferTrace,
+    fresh_emergency_http_client, report_progress, retry_after, validate_content_range,
+    ArtifactActivity, AttemptFailure, AttemptKind, AttemptProgress, ByteRange, SegmentReport,
+    StagingFile, TransferEvent, TransferRuntime, TransferSource, TransferTrace,
 };
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -98,7 +98,6 @@ where
     let mut attempts = 1_u32;
     let mut retries = 0_u32;
     let mut emergencies = 0_u32;
-    let mut emergency_used = false;
     let mut last_primary_error: Option<AttemptFailure> = None;
     let mut monitor = tokio::time::interval(job.runtime.policy.monitor_interval);
     monitor.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -244,8 +243,7 @@ where
             }
             _ = monitor.tick(), if primary.is_some()
                 && emergency.is_none()
-                && !emergency_used
-                && emergencies < job.runtime.policy.emergency_per_range =>
+                && job.runtime.policy.emergency_per_range > 0 =>
             {
                 let Some(active) = &primary else { continue };
                 let Some(tail) = job.activity.tail_eligible() else { continue };
@@ -259,10 +257,15 @@ where
                     continue;
                 }
                 let remaining = job.range.remaining_after(received);
+                let rescue_range = if job.runtime.policy.multipart_enabled {
+                    remaining
+                } else {
+                    job.range
+                };
                 let id = job.runtime.next_attempt_id();
                 job.trace.emergency_triggered(
                     id,
-                    remaining,
+                    rescue_range,
                     job.priority,
                     tail,
                     health,
@@ -270,15 +273,14 @@ where
                 );
                 let active = spawn_emergency_attempt(
                     &job,
-                    remaining,
+                    rescue_range,
                     id,
                     permit,
                     &mut tasks,
                 );
                 cleanup.paths.insert(active.path.clone());
                 emergency = Some(active);
-                emergency_used = true;
-                emergencies += 1;
+                emergencies = emergencies.saturating_add(1);
                 attempts = attempts.saturating_add(1);
             }
         }
@@ -593,11 +595,17 @@ async fn run_emergency_attempt(
         None,
     );
     let (request_url, request_header) = attempt.source.request().await;
+    let emergency_http = fresh_emergency_http_client();
+    let requested_range = attempt
+        .runtime
+        .policy
+        .multipart_enabled
+        .then_some(attempt.range);
     let response = match send_attempt_request(
-        &attempt.runtime.emergency_http,
+        &emergency_http,
         &request_url,
         request_header.as_ref(),
-        Some(attempt.range),
+        requested_range,
     )
     .await
     {
@@ -633,7 +641,7 @@ async fn run_emergency_attempt(
     }
     if let Err(error) = validate_attempt_response(
         &response,
-        Some(attempt.range),
+        requested_range,
         attempt.expected_size,
         attempt.source.display_url(),
     ) {
@@ -648,7 +656,29 @@ async fn run_emergency_attempt(
         .map_err(|error| AttemptFailure::LocalIo(format!("{error:#}")))?;
     let mut stream = response.bytes_stream();
     let mut received = 0_u64;
-    while let Some(chunk) = stream.next().await {
+    let mut monitor = tokio::time::interval(attempt.runtime.policy.monitor_interval);
+    monitor.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let next = tokio::select! {
+            chunk = stream.next() => chunk,
+            _ = monitor.tick() => {
+                let Some(health) = attempt
+                    .progress
+                    .snapshot(attempt.range, &attempt.runtime.policy)
+                else {
+                    continue;
+                };
+                let error = AttemptFailure::Pathological {
+                    bytes_per_second: health.rate,
+                    estimated_remaining: health.estimated_remaining,
+                };
+                attempt
+                    .trace
+                    .attempt_failed(attempt.id, &error, attempt.runtime.counts());
+                return Err(error);
+            }
+        };
+        let Some(chunk) = next else { break };
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(source) => {

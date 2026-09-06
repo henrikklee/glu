@@ -472,7 +472,6 @@ impl Drop for OrdinaryTransportLease {
 pub struct TransferRuntime {
     transport: GhcrTransport,
     ordinary_http: OrdinaryTransports,
-    emergency_http: reqwest::Client,
     emergency: Arc<Semaphore>,
     activity: Arc<Mutex<RuntimeActivity>>,
     next_attempt_id: Arc<AtomicU64>,
@@ -484,14 +483,13 @@ impl TransferRuntime {
     pub fn new(
         resolver_http: reqwest::Client,
         ordinary_http: Vec<reqwest::Client>,
-        emergency_http: reqwest::Client,
+        part_size_mib: u64,
         transport_profile: impl Into<String>,
     ) -> Self {
         Self::with_policy_and_profile(
             ordinary_http,
             resolver_http,
-            emergency_http,
-            TransferPolicy::default(),
+            TransferPolicy::default().with_part_size_mib(part_size_mib),
             transport_profile.into(),
         )
     }
@@ -500,22 +498,14 @@ impl TransferRuntime {
     fn with_policy(
         resolver_http: reqwest::Client,
         ordinary_http: Vec<reqwest::Client>,
-        emergency_http: reqwest::Client,
         policy: TransferPolicy,
     ) -> Self {
-        Self::with_policy_and_profile(
-            ordinary_http,
-            resolver_http,
-            emergency_http,
-            policy,
-            "test".to_string(),
-        )
+        Self::with_policy_and_profile(ordinary_http, resolver_http, policy, "test".to_string())
     }
 
     fn with_policy_and_profile(
         ordinary_http: Vec<reqwest::Client>,
         resolver_http: reqwest::Client,
-        emergency_http: reqwest::Client,
         policy: TransferPolicy,
         transport_profile: String,
     ) -> Self {
@@ -529,7 +519,6 @@ impl TransferRuntime {
         Self {
             transport: GhcrTransport::new(resolver_http),
             ordinary_http,
-            emergency_http,
             emergency: Arc::new(Semaphore::new(policy.emergency_attempts)),
             activity: Arc::new(Mutex::new(RuntimeActivity::default())),
             next_attempt_id: Arc::new(AtomicU64::new(1)),
@@ -565,6 +554,8 @@ impl TransferRuntime {
             request.artifact_id,
             self.ordinary_http.len(),
             self.transport_profile.clone(),
+            self.policy.configured_part_size_mib,
+            self.policy.multipart_enabled,
         );
         let resolved = self.transport.resolve_blob_url(request.url).await?;
         trace.redirect_resolved(
@@ -599,6 +590,8 @@ impl TransferRuntime {
             "test-artifact",
             self.ordinary_http.len(),
             self.transport_profile.clone(),
+            self.policy.configured_part_size_mib,
+            self.policy.multipart_enabled,
         );
         self.download_to_path(
             TransferRequest {
@@ -634,6 +627,8 @@ impl TransferRuntime {
             "test-artifact",
             self.ordinary_http.len(),
             self.transport_profile.clone(),
+            self.policy.configured_part_size_mib,
+            self.policy.multipart_enabled,
         );
         if let Some(token) = auth_header.1.strip_prefix("Bearer ") {
             self.transport.set_test_install_token(token).await;
@@ -1088,8 +1083,7 @@ impl TransferRuntime {
         let established_multipart_tail = artifact.total_ranges > 2;
         let install_tail = state.artifacts.len() <= 2;
         (artifact.priority == highest_priority
-            && at_artifact_tail
-            && (established_multipart_tail || install_tail))
+            && ((at_artifact_tail && established_multipart_tail) || install_tail))
             .then_some(TailEvidence {
                 unfinished_ranges: artifact.unfinished_ranges,
                 active_artifacts: state.artifacts.len(),
@@ -1116,6 +1110,14 @@ impl TransferRuntime {
     fn next_attempt_id(&self) -> u64 {
         self.next_attempt_id.fetch_add(1, Ordering::Relaxed)
     }
+}
+
+fn fresh_emergency_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .read_timeout(Duration::from_secs(3))
+        .build()
+        .expect("failed to build fresh emergency HTTP client")
 }
 
 fn spawn_segment<F>(tasks: &mut JoinSet<Result<SegmentReport>>, job: SegmentJob<F>)
@@ -1286,9 +1288,22 @@ struct TransferPolicy {
     rolling_window: Duration,
     multipart_threshold: u64,
     target_part_size: u64,
+    configured_part_size_mib: u64,
+    multipart_enabled: bool,
 }
 
 impl TransferPolicy {
+    fn with_part_size_mib(mut self, part_size_mib: u64) -> Self {
+        self.configured_part_size_mib = part_size_mib;
+        self.multipart_enabled = part_size_mib != 0;
+        if self.multipart_enabled {
+            self.target_part_size = part_size_mib
+                .checked_mul(MIB)
+                .expect("validated download part size overflowed");
+        }
+        self
+    }
+
     fn retry_delay(&self, retry: u32) -> Duration {
         let shift = retry.saturating_sub(1).min(8);
         let multiplier = 1_u32 << shift;
@@ -1316,6 +1331,8 @@ impl Default for TransferPolicy {
             rolling_window: Duration::from_secs(3),
             multipart_threshold: MIN_MULTIPART_SIZE,
             target_part_size: TARGET_PART_SIZE,
+            configured_part_size_mib: 1,
+            multipart_enabled: true,
         }
     }
 }
@@ -1372,6 +1389,13 @@ enum AttemptFailure {
         status: StatusCode,
         retry_after: Option<Duration>,
     },
+    #[error(
+        "pathological transfer: {bytes_per_second:.0} bytes/s with {estimated_remaining:?} remaining"
+    )]
+    Pathological {
+        bytes_per_second: f64,
+        estimated_remaining: Duration,
+    },
     #[error("response ended early: expected {expected} bytes, got {received}")]
     EarlyEof { expected: u64, received: u64 },
     #[error("response exceeded expected length {expected}")]
@@ -1390,7 +1414,11 @@ impl AttemptFailure {
     fn retryable(&self) -> bool {
         matches!(
             self,
-            Self::Request(_) | Self::Body(_) | Self::RetryableStatus { .. } | Self::EarlyEof { .. }
+            Self::Request(_)
+                | Self::Body(_)
+                | Self::RetryableStatus { .. }
+                | Self::Pathological { .. }
+                | Self::EarlyEof { .. }
         )
     }
 
@@ -1474,6 +1502,8 @@ pub(crate) struct TransferDiagnostics {
     artifact_id: String,
     transport_profile: String,
     transport_count: usize,
+    configured_part_size_mib: u64,
+    multipart_enabled: bool,
     segments: u32,
     attempts: u32,
     retries: u32,
@@ -1613,6 +1643,8 @@ struct TransferTrace {
     artifact_id: String,
     transport_profile: String,
     transport_count: usize,
+    configured_part_size_mib: u64,
+    multipart_enabled: bool,
     started: Instant,
     events: Mutex<Vec<TransferEvent>>,
     attempts: AtomicU32,
@@ -1624,11 +1656,19 @@ struct TransferTrace {
 }
 
 impl TransferTrace {
-    fn new(artifact_id: &str, transport_count: usize, transport_profile: String) -> Arc<Self> {
+    fn new(
+        artifact_id: &str,
+        transport_count: usize,
+        transport_profile: String,
+        configured_part_size_mib: u64,
+        multipart_enabled: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             artifact_id: artifact_id.to_string(),
             transport_profile,
             transport_count,
+            configured_part_size_mib,
+            multipart_enabled,
             started: Instant::now(),
             events: Mutex::new(Vec::new()),
             attempts: AtomicU32::new(0),
@@ -1801,6 +1841,8 @@ impl TransferTrace {
             artifact_id: self.artifact_id.clone(),
             transport_profile: self.transport_profile.clone(),
             transport_count: self.transport_count,
+            configured_part_size_mib: self.configured_part_size_mib,
+            multipart_enabled: self.multipart_enabled,
             segments,
             attempts,
             retries,
@@ -2070,23 +2112,27 @@ fn report_progress<F>(
 }
 
 fn segment_count(size: u64, policy: &TransferPolicy) -> usize {
-    if !should_use_multipart(size, policy) {
+    if !policy.multipart_enabled || size <= policy.multipart_threshold {
         return 1;
     }
-    size.div_ceil(policy.target_part_size)
-        .max(MIN_MULTIPART_PARTS) as usize
+    let whole = size / policy.target_part_size;
+    let remainder = size % policy.target_part_size;
+    let rounded = whole + u64::from(remainder >= policy.target_part_size.div_ceil(2));
+    usize::try_from(rounded.max(1)).expect("artifact range count exceeds usize")
 }
 
 fn segment_range(size: u64, index: usize, policy: &TransferPolicy) -> ByteRange {
-    if !should_use_multipart(size, policy) {
+    let count = segment_count(size, policy);
+    if count == 1 {
         debug_assert_eq!(index, 0);
         return ByteRange {
             start: 0,
             end: size - 1,
         };
     }
-    let start = index as u64 * policy.target_part_size;
-    let end = (start + policy.target_part_size).min(size) - 1;
+    let step = size.div_ceil(count as u64);
+    let start = (index as u64).saturating_mul(step);
+    let end = (index as u64 + 1).saturating_mul(step).min(size) - 1;
     ByteRange { start, end }
 }
 
@@ -2097,8 +2143,9 @@ fn segment_ranges(size: u64, policy: &TransferPolicy) -> Vec<ByteRange> {
         .collect()
 }
 
+#[cfg(test)]
 fn should_use_multipart(size: u64, policy: &TransferPolicy) -> bool {
-    size > policy.multipart_threshold
+    segment_count(size, policy) > 1
 }
 
 fn should_report(accumulated: u64, last_reported: u64) -> bool {
@@ -2112,7 +2159,6 @@ const PROGRESS_TRACE_INTERVAL: Duration = Duration::from_secs(1);
 const MIB: u64 = 1024 * 1024;
 const MIN_MULTIPART_SIZE: u64 = MIB;
 const TARGET_PART_SIZE: u64 = MIB;
-const MIN_MULTIPART_PARTS: u64 = 2;
 
 #[cfg(test)]
 mod tests;

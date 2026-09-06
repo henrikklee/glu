@@ -10,7 +10,7 @@ use crate::{
     },
     hash::Sha256Mismatch,
 };
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use glu_core::{ArtifactId, Prefix, ResolvedArtifact};
 use std::{
     collections::BTreeMap,
@@ -47,7 +47,18 @@ impl DownloadProgress {
 
 #[cfg(test)]
 mod tests {
-    use super::{DownloadProgress, TempArtifactCleanup};
+    use super::{parse_download_part_size_mib, DownloadProgress, TempArtifactCleanup};
+
+    #[test]
+    fn download_part_size_is_bounded_and_zero_disables_multipart() {
+        assert_eq!(parse_download_part_size_mib(None).unwrap(), 1);
+        assert_eq!(parse_download_part_size_mib(Some("0")).unwrap(), 0);
+        assert_eq!(parse_download_part_size_mib(Some("8")).unwrap(), 8);
+        assert_eq!(parse_download_part_size_mib(Some("64")).unwrap(), 64);
+        for invalid in ["", "-1", "1.5", "65", "nope"] {
+            assert!(parse_download_part_size_mib(Some(invalid)).is_err());
+        }
+    }
 
     #[test]
     fn aggregates_reports_across_nodes() {
@@ -101,25 +112,62 @@ pub struct ArtifactDownloader {
     transfers: TransferRuntime,
 }
 
+const DOWNLOAD_PART_SIZE_ENV: &str = "GLU_DOWNLOAD_PART_SIZE_MIB";
+const DEFAULT_DOWNLOAD_PART_SIZE_MIB: u64 = 1;
+const MAX_DOWNLOAD_PART_SIZE_MIB: u64 = 64;
+
+fn parse_download_part_size_mib(value: Option<&str>) -> Result<u64> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_DOWNLOAD_PART_SIZE_MIB);
+    };
+    let parsed = value.parse::<u64>().map_err(|_| {
+        anyhow::anyhow!(
+            "{DOWNLOAD_PART_SIZE_ENV} must be an integer from 0 to {MAX_DOWNLOAD_PART_SIZE_MIB}"
+        )
+    })?;
+    if parsed > MAX_DOWNLOAD_PART_SIZE_MIB {
+        bail!("{DOWNLOAD_PART_SIZE_ENV} must be an integer from 0 to {MAX_DOWNLOAD_PART_SIZE_MIB}");
+    }
+    Ok(parsed)
+}
+
+fn configured_download_part_size_mib() -> Result<u64> {
+    let Some(value) = std::env::var_os(DOWNLOAD_PART_SIZE_ENV) else {
+        return Ok(DEFAULT_DOWNLOAD_PART_SIZE_MIB);
+    };
+    let value = value.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{DOWNLOAD_PART_SIZE_ENV} must be an integer from 0 to {MAX_DOWNLOAD_PART_SIZE_MIB}"
+        )
+    })?;
+    parse_download_part_size_mib(Some(value))
+}
+
 impl ArtifactDownloader {
-    pub fn new(prefix: &Prefix) -> Self {
+    pub fn new(prefix: &Prefix) -> Result<Self> {
+        let part_size_mib = configured_download_part_size_mib()?;
         // Resolve each authenticated GHCR redirect once, then reuse its signed CDN URL for all
-        // ranges. Four fixed four-slot pools bound a slow connection to four 1 MiB assignments;
-        // each free slot pulls its lane's highest-priority waiting range.
+        // ranges. Four fixed four-slot pools bound a slow connection to four assignments; each
+        // free slot pulls its lane's highest-priority waiting range. A zero part size disables
+        // proactive multipart splitting; retries may still resume with a range request.
         let resolver_http = artifact_redirect_client();
         let ordinary_http = (0..ORDINARY_TRANSPORT_POOLS)
             .map(|_| artifact_http_client())
             .collect();
-        let emergency_http = artifact_http_client();
-        Self {
+        let layout = if part_size_mib == 0 {
+            "full".to_string()
+        } else {
+            format!("{part_size_mib}mib")
+        };
+        Ok(Self {
             cache: ArtifactCache::new(prefix),
             transfers: TransferRuntime::new(
                 resolver_http,
                 ordinary_http,
-                emergency_http,
-                format!("direct-cdn-1mib-{ORDINARY_TRANSPORT_POOLS}x4"),
+                part_size_mib,
+                format!("direct-cdn-{layout}-{ORDINARY_TRANSPORT_POOLS}x4"),
             ),
-        }
+        })
     }
 
     pub async fn configure_install_token<'a>(
