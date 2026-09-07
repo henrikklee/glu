@@ -239,6 +239,8 @@ glu trace view <target>
 
 The CLI can resolve targets as recent trace IDs, filenames, paths, or plan names depending on command behavior. Exact CLI behavior is discoverable through `glu help --json`.
 
+The self-contained HTML viewer follows the system light/dark preference, including changes while it is open, without resetting filters or zoom. Its brand tokens mirror `glu-www/src/styles/global.css`; timeline fills and SVG colours use live CSS variables. Font stacks prefer the website's typefaces when installed locally and otherwise use system fallbacks. No fonts, scripts, or trace data are fetched over the network.
+
 ## Bug reports
 
 A useful trace-backed report includes:

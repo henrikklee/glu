@@ -110,21 +110,80 @@ const HTML_TEMPLATE: &str = r##"<!doctype html>
 <title>__TITLE__</title>
 <script nonce="__CSP_NONCE__">__DAGRE_JS__</script>
 <style>
+/* Keep the brand tokens aligned with glu-www/src/styles/global.css.
+   Local font stacks deliberately avoid web-font requests in this offline viewer.
+   Chart colours are separate from text accents to keep dark bar labels legible. */
 :root {
-  color-scheme: dark;
-  --bg: #0b0f12;
-  --panel: #12181d;
-  --panel-2: #171f25;
-  --ink: #e8efe7;
-  --muted: #8a9894;
-  --rule: #263139;
-  --acid: #c7ff47;
-  --cyan: #53d6ff;
-  --orange: #ff9f43;
-  --red: #ff5f6d;
-  --green: #35d07f;
-  --violet: #a98bff;
-  --shadow: rgba(0,0,0,.4);
+  color-scheme: light;
+  --font-display: 'Cabinet Grotesk', 'General Sans', -apple-system, sans-serif;
+  --font-body: 'General Sans', -apple-system, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --bg: #f3f5f2;
+  --panel: #edf0ee;
+  --panel-2: #e7ebe8;
+  --ink: #14191d;
+  --muted: #536068;
+  --faint: #69747b;
+  --rule: #cbd2cd;
+  --rule-strong: #c7cec9;
+  --lime: #b5ff3d;
+  --acid: #78b800;
+  --accent-text: #456b00;
+  --accent-soft: rgba(120,184,0,.09);
+  --graph-dot: rgba(83,97,107,.14);
+  --graph-line: rgba(83,97,107,.05);
+  --header-bg: rgba(243,245,242,.77);
+  --surface: rgba(255,255,255,.74);
+  --chart-bg: var(--bg);
+  --lane-rule: rgba(83,97,107,.13);
+  --control: #edf0ee;
+  --control-hover: #d9dfdb;
+  --tooltip-bg: #f3f5f2;
+  --edge: #69747b;
+  --cyan: #62d7ed;
+  --orange: #ffc16b;
+  --green: #62dfa0;
+  --violet: #c0a0f5;
+  --neutral: #a8b7af;
+  --commit: var(--lime);
+  --red: #b8452f;
+  --error-ink: #ffffff;
+  --bar-ink: #071116;
+  --shadow: 15 18 21;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #151a1e;
+    --panel: #171c21;
+    --panel-2: #181e23;
+    --ink: #f5f7f6;
+    --muted: #b6c0bd;
+    --faint: #8e9a97;
+    --rule: #2b343b;
+    --rule-strong: #303a42;
+    --acid: var(--lime);
+    --accent-text: var(--lime);
+    --accent-soft: rgba(181,255,61,.08);
+    --graph-dot: rgba(135,146,154,.14);
+    --graph-line: rgba(135,146,154,.045);
+    --header-bg: rgba(21,26,31,.8);
+    --surface: rgba(21,26,31,.82);
+    --lane-rule: rgba(135,146,154,.13);
+    --control: #22292f;
+    --control-hover: #2c353b;
+    --tooltip-bg: #181e23;
+    --edge: #8e9a97;
+    --cyan: #83cfe3;
+    --orange: #eec18a;
+    --green: #91d4ab;
+    --violet: #c0aceb;
+    --neutral: #9baaa3;
+    --commit: var(--lime);
+    --red: #ff6b4d;
+    --error-ink: var(--bar-ink);
+    --shadow: 0 0 0;
+  }
 }
 * { box-sizing: border-box; }
 body {
@@ -134,12 +193,17 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background:
-    radial-gradient(circle at 15% -10%, rgba(199,255,71,.12), transparent 30rem),
-    radial-gradient(circle at 90% 5%, rgba(83,214,255,.09), transparent 28rem),
-    linear-gradient(180deg, #0b0f12, #090c0e 45rem);
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(circle at 0 0, var(--graph-dot) 1.25px, transparent 1.45px),
+    linear-gradient(to right, var(--graph-line) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--graph-line) 1px, transparent 1px);
+  background-size: 30px 30px;
+  background-position: 1px 1px;
   color: var(--ink);
-  font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font: 12px/1.5 var(--font-body);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 header {
   position: sticky;
@@ -149,21 +213,27 @@ header {
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  padding: 16px 20px;
+  padding: 14px 20px;
   border-bottom: 1px solid var(--rule);
-  background: rgba(11,15,18,.86);
-  backdrop-filter: blur(14px);
+  background: var(--header-bg);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
   flex: none;
 }
-h1 { margin: 0; font-size: 18px; letter-spacing: -.02em; }
+.heading { display: flex; align-items: center; gap: 10px; }
+.package-mark { width: 23px; height: 23px; flex: none; color: var(--acid); stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+h1 { margin: 0; font: 800 22px/1.1 var(--font-display); overflow-wrap: anywhere; }
 #summary { margin-top: 10px; }
-.pill-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.local-note { display: flex; align-items: center; gap: 8px; color: var(--muted); font: 11px var(--font-mono); white-space: nowrap; }
+.local-note::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--acid); box-shadow: 0 0 0 3px var(--accent-soft); }
+.pill-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .pill {
   border: 1px solid var(--rule);
-  background: rgba(255,255,255,.035);
-  border-radius: 999px;
-  padding: 5px 9px;
+  background: var(--surface);
+  border-radius: 6px;
+  padding: 3px 7px;
   color: var(--muted);
+  font: 11px/1.5 var(--font-mono);
 }
 .pill strong { color: var(--ink); font-weight: 650; }
 main {
@@ -171,31 +241,32 @@ main {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  padding: 0 18px 16px;
+  gap: 10px;
+  padding: 0 20px 10px;
 }
-.tabs { display: flex; gap: 8px; flex: none; padding-top: 14px; }
+.tabs { display: flex; gap: 6px; flex: none; padding-top: 10px; }
 .tab {
   border: 1px solid var(--rule);
-  background: #0d1216;
+  background: var(--surface);
   color: var(--muted);
-  border-radius: 10px;
-  padding: 7px 12px;
+  border-radius: 6px;
+  padding: 6px 14px;
   font: inherit;
   cursor: pointer;
 }
 .tab:hover { border-color: var(--acid); }
 .tab.active {
-  color: var(--ink);
-  border-color: rgba(199,255,71,.6);
-  background: rgba(199,255,71,.08);
+  color: var(--bar-ink);
+  border-color: var(--lime);
+  background: var(--lime);
+  font-weight: 600;
 }
 .card {
   overflow: hidden;
   border: 1px solid var(--rule);
-  background: linear-gradient(180deg, rgba(23,31,37,.94), rgba(18,24,29,.94));
-  border-radius: 18px;
-  box-shadow: 0 18px 60px var(--shadow);
+  background: var(--surface);
+  border-radius: 12px;
+  box-shadow: 0 8px 28px rgb(var(--shadow) / .06);
 }
 .pane { display: none; flex-direction: column; flex: 1; min-height: 0; }
 .pane.active { display: flex; }
@@ -205,85 +276,96 @@ main {
   justify-content: space-between;
   gap: 1rem;
   align-items: center;
-  padding: 14px 16px;
+  padding: 10px 12px;
   border-bottom: 1px solid var(--rule);
+  background: var(--panel);
 }
-h2 { margin: 0; font-size: 14px; text-transform: uppercase; letter-spacing: .12em; color: var(--acid); }
+h2 { margin: 0; font: 500 12px/1.4 var(--font-mono); text-transform: uppercase; letter-spacing: .08em; color: var(--accent-text); }
 .controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; color: var(--muted); }
 input, select, button {
   border: 1px solid var(--rule);
-  background: #0d1216;
+  background: var(--control);
   color: var(--ink);
-  border-radius: 10px;
-  padding: 7px 9px;
+  border-radius: 6px;
+  padding: 5px 8px;
   font: inherit;
 }
 button { cursor: pointer; }
-button:hover { border-color: var(--acid); }
-#ganttWrap { flex: 1; min-height: 0; overflow: auto; touch-action: pan-y; }
+button:hover { border-color: var(--acid); background: var(--control-hover); }
+.tab.active:hover { background: var(--lime); }
+.controls label { display: inline-flex; align-items: center; gap: 8px; }
+input { width: 240px; min-width: 0; }
+input::placeholder { color: var(--faint); opacity: 1; }
+:focus-visible { outline: 2px solid var(--accent-text); outline-offset: 3px; }
+::selection { background: var(--lime); color: var(--bar-ink); }
+.gantt, #graphSvg, #tooltip { font-family: var(--font-mono); }
+.pill strong, .tick { font-variant-numeric: tabular-nums; }
+#ganttWrap { flex: 1; min-height: 0; overflow: auto; touch-action: pan-y; background: var(--chart-bg); }
 /* Drag-pan affordances: grabbed cursor + no text selection while the gantt is
    being dragged, and a visible focus ring so keyboard panning (arrows) has an
    obvious target. */
 #ganttWrap.panning { cursor: grabbing; user-select: none; -webkit-user-select: none; }
-#ganttWrap:focus-visible { outline: 2px solid rgba(199,255,71,.45); outline-offset: -2px; }
+#ganttWrap:focus-visible { outline: 2px solid var(--accent-text); outline-offset: -2px; }
 .gantt {
   position: relative;
   min-width: 920px;
-  margin: 14px 16px 20px;
+  margin: 10px 12px 14px;
   display: grid;
-  grid-template-columns: 210px 1fr;
+  grid-template-columns: 180px 1fr;
   gap: 0;
 }
-.axis, .lane-label, .lane-track, .gantt-corner { border-bottom: 1px solid rgba(255,255,255,.065); }
+/* Continuous, quiet row guides rather than boxed label cells. */
+.axis, .gantt-corner { border-bottom: 1px solid var(--rule); }
+.lane-label, .lane-track { border-bottom: 1px solid var(--lane-rule); }
 .gantt-corner {
   grid-column: 1;
-  height: 30px;
+  height: 26px;
   position: sticky;
   left: 0;
   top: 0;
-  background: var(--panel);
+  background: var(--chart-bg);
   z-index: 5;
 }
 .axis {
   grid-column: 2;
-  height: 30px;
+  height: 26px;
   position: sticky;
   top: 0;
-  background: var(--panel);
+  background: var(--chart-bg);
   z-index: 2;
 }
-.tick { position: absolute; top: 0; bottom: 0; border-left: 1px solid rgba(255,255,255,.08); color: var(--muted); font-size: 11px; padding-left: 4px; }
+.tick { position: absolute; top: 0; bottom: 0; color: var(--muted); font-size: 10px; padding-left: 4px; }
 /* The 100% tick's label must end at the axis edge, not overflow past it
    (which otherwise forces a spurious horizontal scrollbar). */
 .tick:last-child { left: auto !important; right: 0; text-align: right; padding-left: 0; padding-right: 6px; border-left: none; }
 .lane-label {
   grid-column: 1;
-  height: 38px;
+  height: 32px;
   display: flex;
   align-items: center;
   padding-right: 12px;
-  color: #b9c4c0;
+  color: var(--muted);
   white-space: nowrap;
   position: sticky;
   left: 0;
   z-index: 4;
-  background: var(--panel);
+  background: var(--chart-bg);
 }
 .lane-track {
   grid-column: 2;
-  height: 38px;
+  height: 32px;
   position: relative;
   overflow: hidden;
-  background-image: linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px);
+  background-image: linear-gradient(90deg, var(--graph-line) 1px, transparent 1px);
   background-size: 10% 100%;
 }
 .bar {
   position: absolute;
-  top: 7px;
-  height: 24px;
+  top: 6px;
+  height: 20px;
   min-width: 1px;
-  border-radius: 7px;
-  box-shadow: 0 0 0 1px rgba(255,255,255,.15) inset, 0 6px 16px rgba(0,0,0,.25);
+  border-radius: 4px;
+  box-shadow: 0 0 0 1px rgb(var(--shadow) / .12) inset;
   background: var(--cyan);
   overflow: hidden;
   user-select: none;
@@ -301,9 +383,9 @@ button:hover { border-color: var(--acid); }
 .seg-content {
   position: absolute;
   inset: 0;
-  line-height: 24px;
-  padding: 0 7px;
-  color: #071014;
+  line-height: 20px;
+  padding: 0 6px;
+  color: var(--bar-ink);
   font-size: 11px;
   white-space: nowrap;
   overflow: hidden;
@@ -314,8 +396,8 @@ button:hover { border-color: var(--acid); }
 .seg-full { left: 0 !important; width: 100% !important; }
 .bar[data-status="error"], .bar[data-status="failed"] { background: var(--red); }
 .bar[data-status="error"] .seg, .bar[data-status="failed"] .seg { background: var(--red) !important; }
-/* Bars forced to the red error background need the dark label flipped to light. */
-.bar[data-status="error"] .seg-content, .bar[data-status="failed"] .seg-content { color: var(--ink); }
+/* Error labels contrast with the danger fill in each system theme. */
+.bar[data-status="error"] .seg-content, .bar[data-status="failed"] .seg-content { color: var(--error-ink); }
 .bar.critical::before {
   content: '';
   position: absolute;
@@ -323,8 +405,7 @@ button:hover { border-color: var(--acid); }
   right: 0;
   top: 0;
   height: 3px;
-  background: #ff2638;
-  box-shadow: 0 0 10px rgba(255,38,56,.7);
+  background: var(--red);
   z-index: 2;
   pointer-events: none;
 }
@@ -336,39 +417,73 @@ button:hover { border-color: var(--acid); }
   pointer-events: none;
   opacity: 0;
   transform: translate(10px, 10px);
-  border: 1px solid rgba(199,255,71,.45);
-  background: rgba(9,12,14,.96);
+  border: 1px solid var(--rule-strong);
+  background: var(--tooltip-bg);
   color: var(--ink);
   border-radius: 12px;
   padding: 9px 10px;
-  box-shadow: 0 16px 50px rgba(0,0,0,.5);
+  box-shadow: 0 12px 36px rgb(var(--shadow) / .18);
+  overflow-wrap: anywhere;
   white-space: pre-wrap;
   transition: opacity .08s ease;
 }
 #tooltip.visible { opacity: 1; }
-#graphWrap { flex: 1; min-height: 0; overflow: auto; padding: 12px; display: flex; align-items: center; justify-content: center; }
-#graphSvg { min-width: 960px; width: 100%; max-height: 100%; background: #0d1216; border-radius: 12px; touch-action: none; cursor: grab; }
+#graphWrap { flex: 1; min-height: 0; overflow: auto; background: var(--chart-bg); display: flex; align-items: center; justify-content: center; }
+#graphSvg { width: 100%; max-height: 100%; touch-action: none; cursor: grab; }
 #graphSvg.panning { cursor: grabbing; }
-.node rect { fill: #18232b; stroke: #3a4851; stroke-width: 1.2; rx: 12; }
+.node rect { fill: var(--panel-2); stroke: var(--rule-strong); stroke-width: 1.2; rx: 6; }
+.node:hover rect { stroke: var(--acid); }
 .node text { fill: var(--ink); font-size: 11px; }
-.node .kind { fill: var(--acid); font-size: 10px; text-transform: uppercase; }
-.edge { fill: none; stroke: #66747b; stroke-width: 1.2; marker-end: url(#arrow); }
-.edge-label { fill: var(--muted); font-size: 9px; paint-order: stroke; stroke: #0d1216; stroke-width: 4px; }
-.graph-grid { fill: none; stroke: rgba(255,255,255,.055); stroke-width: 1; stroke-dasharray: 3 7; }
-.row-label { fill: var(--muted); font-size: 10px; paint-order: stroke; stroke: #0d1216; stroke-width: 4px; }
+.node .kind { fill: var(--accent-text); font-size: 10px; text-transform: uppercase; }
+.edge { fill: none; stroke: var(--edge); stroke-width: 1.2; marker-end: url(#arrow); }
+#arrow path { fill: var(--edge); }
+.edge-label { fill: var(--muted); font-size: 9px; paint-order: stroke; stroke: var(--chart-bg); stroke-width: 4px; }
+.graph-grid { fill: none; stroke: var(--graph-dot); stroke-width: 1; stroke-dasharray: 3 7; }
+.row-label { fill: var(--muted); font-size: 10px; paint-order: stroke; stroke: var(--chart-bg); stroke-width: 4px; }
 .empty { padding: 24px; color: var(--muted); }
-footer { color: var(--muted); padding: 0 18px 18px; }
+footer { flex: none; color: var(--muted); padding: 0 20px 12px; font-size: 11px; }
+@media (max-width: 900px) {
+  header { align-items: flex-start; }
+  .local-note { display: none; }
+  .card-head { align-items: flex-start; flex-direction: column; gap: 12px; }
+  #graphHint { flex-basis: 100%; font-size: 11px; }
+}
+@media (max-width: 600px) {
+  header { padding: 16px; }
+  h1 { font-size: 21px; }
+  main { padding: 0 12px 10px; gap: 10px; }
+  #summary { gap: 5px; margin-top: 12px; }
+  .pill { padding: 3px 6px; font-size: 10px; }
+  .card-head { padding: 12px; }
+  .controls { width: 100%; gap: 8px; }
+  .controls label:first-child { flex: 1; }
+  input { width: 100%; }
+  .gantt { grid-template-columns: 140px 1fr; margin: 12px; }
+  footer { padding: 0 16px 12px; font-size: 11px; }
+}
+/* Keep the chart usable in short windows instead of collapsing its scroll area. */
+@media (max-height: 600px) {
+  body { height: auto; min-height: 100dvh; overflow: auto; }
+  .pane-body { flex: auto; height: 50vh; min-height: 220px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  #tooltip { transition: none; }
+}
 </style>
 </head>
 <body>
 <header>
   <div>
-    <h1 id="title">glu trace</h1>
+    <div class="heading">
+      <svg class="package-mark" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z"></path>
+        <path d="M12 22V12M3.29 7 12 12l8.71-5M7.5 4.27l9 5.15"></path>
+      </svg>
+      <h1 id="title">glu trace</h1>
+    </div>
     <div class="pill-row" id="summary"></div>
   </div>
-  <div class="pill-row">
-    <span class="pill">single-file viewer</span>
-  </div>
+  <span class="local-note">Local trace · no uploads</span>
 </header>
 <main>
   <nav class="tabs" id="tabs" role="tablist" aria-label="Trace views">
@@ -503,21 +618,23 @@ function summarize() {
 
 // Subphase segment colours (the six `bottle_prepare` steps). Falls back to a
 // per-pool tint for whole-node bars that have no subphase breakdown.
+// CSS variables stay live when the system theme changes, without rebuilding
+// either view or losing the current filter, zoom, or pan position.
 const SUBPHASE_COLORS = {
-  extract: '#ff9f43',
-  writer_wait: '#8a9894',
-  text_relocate: '#53d6ff',
-  fixed_prefix_relocate: '#53d6ff',
-  macho_patch: '#53d6ff',
-  codesign: '#a98bff',
+  extract: 'var(--orange)',
+  writer_wait: 'var(--neutral)',
+  text_relocate: 'var(--cyan)',
+  fixed_prefix_relocate: 'var(--cyan)',
+  macho_patch: 'var(--cyan)',
+  codesign: 'var(--violet)',
 };
 const POOL_COLORS = {
-  setup: '#8a9894',
-  download: '#53d6ff',
-  prepare: '#ff9f43',
-  commit: '#c7ff47',
-  postinstall: '#a98bff',
-  registry: '#35d07f',
+  setup: 'var(--neutral)',
+  download: 'var(--cyan)',
+  prepare: 'var(--orange)',
+  commit: 'var(--commit)',
+  postinstall: 'var(--violet)',
+  registry: 'var(--green)',
 };
 
 let ganttView = null;
@@ -604,12 +721,12 @@ function renderGantt() {
           const sStart = Math.max(s.start, bStart), sEnd = Math.min(s.end, bEnd);
           const sl = ((sStart - bStart) / bSpan) * 100;
           const sw = Math.max(((sEnd - sStart) / bSpan) * 100, 0.0001);
-          const col = SUBPHASE_COLORS[s.phase] || '#53d6ff';
+          const col = SUBPHASE_COLORS[s.phase] || 'var(--cyan)';
           const segTip = `${runLine}${fullLabelOf(s)}\npool: ${s.pool} #${s.slot == null ? '?' : s.slot}\nstart: ${fmt(s.start - min)}\nduration: ${fmt(s.end - s.start)}\nstatus: ${s.status || 'unknown'}`;
           return `<div class="seg" data-phase="${escapeAttr(s.phase)}" style="left:${sl}%;width:${sw}%;background:${col}" data-tooltip="${escapeAttr(segTip)}"></div>`;
         }).join('');
       } else {
-        const col = POOL_COLORS[pool] || '#53d6ff';
+        const col = POOL_COLORS[pool] || 'var(--cyan)';
         // Flat segment gets the `seg-content` label treatment (dark text on the
         // bright pool tint) so its label stays readable.
         barFill = `<div class="seg seg-full seg-content" data-phase="" style="background:${col}">${escapeXml(label)}</div>`;
@@ -950,7 +1067,7 @@ function renderGraph() {
   svg.style.height = `${Math.min(height, 1200)}px`;
 
   const showEdgeLabels = graphEdges.length <= 160;
-  let html = `<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#66747b"/></marker></defs><g id="graphViewport">`;
+  let html = `<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--edge)"/></marker></defs><g id="graphViewport">`;
 
   for (const edgeObj of g.edges()) {
     const e = g.edge(edgeObj);
@@ -1045,19 +1162,35 @@ function moveTooltip(event) {
   tooltip.style.top = `${Math.max(pad, y)}px`;
 }
 
+const GRAPH_MIN_ZOOM = 0.18;
+const GRAPH_MAX_ZOOM = 256;
 const graphState = {zoom: 1, panX: 0, panY: 0, pointers: new Map(), lastPinchDistance: 0};
-function applyGraphTransform() {
+let graphFrame = 0;
+function paintGraphTransform() {
   const viewport = document.getElementById('graphViewport');
   if (viewport) viewport.setAttribute('transform', `translate(${graphState.panX} ${graphState.panY}) scale(${graphState.zoom})`);
-  document.getElementById('graphHint').textContent = `zoom ${Math.round(graphState.zoom * 100)}% · wheel/pinch to zoom · drag to pan`;
+  const hint = document.getElementById('graphHint');
+  const text = `zoom ${Math.round(graphState.zoom * 100)}% · wheel/pinch to zoom · drag to pan`;
+  if (hint.textContent !== text) hint.textContent = text;
+}
+function applyGraphTransform() {
+  // Track every input delta, but only mutate the SVG once per display frame.
+  // The root SVG coordinate system stays fixed while its inner group moves.
+  if (graphFrame) return;
+  graphFrame = requestAnimationFrame(() => {
+    graphFrame = 0;
+    paintGraphTransform();
+  });
 }
 function resetGraphView() {
+  cancelAnimationFrame(graphFrame);
+  graphFrame = 0;
   graphState.zoom = 1;
   graphState.panX = 0;
   graphState.panY = 0;
   graphState.pointers.clear();
   graphState.lastPinchDistance = 0;
-  applyGraphTransform();
+  paintGraphTransform();
 }
 function svgPoint(svg, clientX, clientY) {
   const point = svg.createSVGPoint();
@@ -1069,7 +1202,7 @@ function zoomGraphAt(svg, clientX, clientY, factor) {
   const p = svgPoint(svg, clientX, clientY);
   const beforeX = (p.x - graphState.panX) / graphState.zoom;
   const beforeY = (p.y - graphState.panY) / graphState.zoom;
-  graphState.zoom = Math.max(0.18, Math.min(8, graphState.zoom * factor));
+  graphState.zoom = Math.max(GRAPH_MIN_ZOOM, Math.min(GRAPH_MAX_ZOOM, graphState.zoom * factor));
   graphState.panX = p.x - beforeX * graphState.zoom;
   graphState.panY = p.y - beforeY * graphState.zoom;
   applyGraphTransform();
@@ -1221,6 +1354,8 @@ mod tests {
         let trace = json!({ "plan": "vips", "nodes": [], "edges": [], "events": [] });
         let html = render_html(&trace, "glu trace: vips");
         assert!(!html.contains("<script src="));
+        assert!(!html.contains("@import"));
+        assert!(!html.contains("<link"));
         assert!(!html.contains("unpkg.com"));
         assert!(!html.contains("__DAGRE_JS__"));
         assert!(html.contains("dagre.graphlib.Graph"));
@@ -1258,7 +1393,41 @@ mod tests {
     fn viewer_renders_writer_wait_in_muted_grey() {
         let trace = json!({ "plan": "vips", "nodes": [], "edges": [], "events": [] });
         let html = render_html(&trace, "glu trace: vips");
-        assert!(html.contains("writer_wait: '#8a9894'"));
+        assert!(html.contains("writer_wait: 'var(--neutral)'"));
+    }
+
+    #[test]
+    fn viewer_uses_live_system_theme_tokens() {
+        let trace = json!({ "plan": "vips", "nodes": [], "edges": [], "events": [] });
+        let html = render_html(&trace, "glu trace: vips");
+        assert!(html.contains("@media (prefers-color-scheme: dark)"));
+        assert!(html.contains("color-scheme: light;"));
+        assert!(html.contains("color-scheme: dark;"));
+        assert!(html.contains("--bg: #f3f5f2;"));
+        assert!(html.contains("--bg: #151a1e;"));
+        assert!(html.contains("--lime: #b5ff3d;"));
+        assert!(html.contains("#arrow path { fill: var(--edge); }"));
+        assert!(html.contains("color: var(--error-ink)"));
+
+        // Generated inline fills must reference live CSS variables, not a
+        // palette captured at load time that goes stale on a theme change.
+        let palette = &html[html.find("const SUBPHASE_COLORS").unwrap()
+            ..html.find("let ganttView").unwrap()];
+        assert!(!palette.contains('#'));
+        assert!(palette.contains("commit: 'var(--commit)'"));
+        assert!(html.contains("SUBPHASE_COLORS[s.phase] || 'var(--cyan)'"));
+        assert!(html.contains("POOL_COLORS[pool] || 'var(--cyan)'"));
+    }
+
+    #[test]
+    fn graph_supports_deep_zoom_and_frame_batched_updates() {
+        let trace = json!({ "plan": "vips", "nodes": [], "edges": [], "events": [] });
+        let html = render_html(&trace, "glu trace: vips");
+        assert!(html.contains("const GRAPH_MAX_ZOOM = 256;"));
+        assert!(html.contains("Math.min(GRAPH_MAX_ZOOM, graphState.zoom * factor)"));
+        assert!(html.contains("if (graphFrame) return;"));
+        assert!(html.contains("graphFrame = requestAnimationFrame("));
+        assert!(html.contains("cancelAnimationFrame(graphFrame)"));
     }
 
     #[test]
