@@ -358,7 +358,7 @@ fn json_output_is_pure_when_local_state_contains_a_bad_receipt() {
     let human = run(prefix.path(), &["status"]);
     assert!(human.status.success());
     assert!(String::from_utf8_lossy(&human.stderr)
-        .contains("warning: skipped unreadable install receipt"));
+        .contains("warning: ignored invalid package metadata"));
 }
 
 #[test]

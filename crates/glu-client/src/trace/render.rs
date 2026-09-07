@@ -1411,8 +1411,8 @@ mod tests {
 
         // Generated inline fills must reference live CSS variables, not a
         // palette captured at load time that goes stale on a theme change.
-        let palette = &html[html.find("const SUBPHASE_COLORS").unwrap()
-            ..html.find("let ganttView").unwrap()];
+        let palette =
+            &html[html.find("const SUBPHASE_COLORS").unwrap()..html.find("let ganttView").unwrap()];
         assert!(!palette.contains('#'));
         assert!(palette.contains("commit: 'var(--commit)'"));
         assert!(html.contains("SUBPHASE_COLORS[s.phase] || 'var(--cyan)'"));

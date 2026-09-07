@@ -138,11 +138,10 @@ fn cleanup_yes_removes_only_cached_downloads_and_reports_result() {
     let prefix = tempfile::tempdir().unwrap();
     write_cache(prefix.path());
     let unrelated_cache = prefix.path().join("var/glu/cache/postinstall/state");
-    let receipt = prefix.path().join("Cellar/pkg/1.0/.glu/receipt.json");
+    let receipt = prefix.path().join("Cellar/demo/1.0/.glu/receipt.json");
     fs::create_dir_all(unrelated_cache.parent().unwrap()).unwrap();
-    fs::create_dir_all(receipt.parent().unwrap()).unwrap();
     fs::write(&unrelated_cache, b"state").unwrap();
-    fs::write(&receipt, b"receipt").unwrap();
+    assert!(receipt.exists());
 
     let output = run(prefix.path(), &["cleanup", "--yes", "--json"]);
 
