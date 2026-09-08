@@ -598,7 +598,12 @@ function summarize() {
   document.getElementById('title').textContent = `glu trace · ${trace.plan || 'unknown'}`;
   // A lane is a (pool, slot) concurrency token that actually ran a node.
   const lanes = new Set(events.filter(e => e.phase == null && e.pool).map(e => `${e.pool}:${e.slot == null ? '?' : e.slot}`));
-  const packageCount = new Set(events.filter(e => e.phase == null).map(labelOf)).size;
+  // Shared setup/cache tasks have no package identity. Labels are presentation,
+  // not identity: distinct package versions can share the same label.
+  const packageCount = new Set(events.filter(e => e.phase == null)
+    .map(e => nodeById.get(e.node_id))
+    .map(n => n?.package_id || n?.formula)
+    .filter(Boolean)).size;
   const pills = [];
   if (trace.started_at) pills.push(['started', trace.started_at]);
   pills.push(['packages', packageCount], ['nodes', nodes.length], ['edges', edges.length], ['events', events.length],
