@@ -454,20 +454,16 @@ fn extract_patch_tar_gz_parallel(
                 timings.text_relocate += text_start.elapsed();
             }
 
-            // Per-install verification: after the patch
-            // passes, no placeholder or build-prefix literal may survive in any bottle
-            // (skip bottles included — gradle's text placeholders are caught here if the
-            // text pass misses them). A miss means a relocation rule we didn't apply —
-            // fail-closed instead of shipping broken bytes.
+            // Reject unresolved placeholders and relocatable build-prefix strings.
+            // For unequal prefixes, opaque binary data is deliberately preserved,
+            // matching upstream's C-string filter; it is not a missed relocation.
             if let Some(pos) = find_leftover_placeholder(&data) {
                 violations.push(format!(
                     "{rel}: unresolved @@HOMEBREW_* placeholder at byte offset {pos:#x}"
                 ));
             }
             if profile.prefix != profile.build_prefix {
-                if let Some(pos) =
-                    find_leftover_build_prefix(&data, profile.build_prefix.as_bytes())
-                {
+                if let Some(pos) = find_required_build_prefix(&data, &profile) {
                     violations.push(format!(
                         "{rel}: unresolved build-prefix {:?} bytes at offset {pos:#x}",
                         profile.build_prefix
@@ -493,6 +489,7 @@ fn extract_patch_tar_gz_parallel(
             let Some(target) = entry.link_name().context("symlink target")? else {
                 continue;
             };
+            let target = relocated_symlink_target(&rel_path, &target, &profile);
             extraction_root
                 .create_symlink(&target, &rel_path)
                 .with_context(|| format!("symlink {} -> {}", out.display(), target.display()))?;
@@ -572,6 +569,33 @@ fn exclusive_extract_duration(total: Duration, timings: &PreparePhaseTimings) ->
 // Load-command relocation moved to `macho.rs` (see `macho::patch_macho`);
 // prepare.rs keeps the streaming tar loop and the text / fixed-prefix passes.
 
+// Homebrew 7d2a02d2: Keg#relativize_prefix_symlinks!. Work in final Cellar
+// coordinates, not staging coordinates, and never follow the archive symlink.
+fn relocated_symlink_target(rel: &Path, target: &Path, profile: &PrefixProfile) -> PathBuf {
+    let Ok(suffix) = target.strip_prefix(&profile.build_prefix) else {
+        return target.to_path_buf();
+    };
+    let target = Path::new(&profile.prefix).join(suffix);
+    let rel = rel.strip_prefix("opt/homebrew/Cellar").unwrap_or(rel);
+    let installed = Path::new(&profile.prefix).join("Cellar").join(rel);
+    let parent = installed.parent().unwrap();
+    let from = parent.components().collect::<Vec<_>>();
+    let to = target.components().collect::<Vec<_>>();
+    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    let mut relative = PathBuf::new();
+    for _ in common..from.len() {
+        relative.push("..");
+    }
+    for component in &to[common..] {
+        relative.push(component.as_os_str());
+    }
+    if relative.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        relative
+    }
+}
+
 fn patch_fixed_prefix_bytes(
     rel: &str,
     data: &mut Vec<u8>,
@@ -604,7 +628,7 @@ fn patch_fixed_prefix_bytes(
         // verification boundary.
         return replace_all_equal_length_in_place(data, old, new);
     }
-    if memmem::find(data, old).is_none() {
+    if find_required_build_prefix(data, profile).is_none() {
         return false;
     }
     if new.len() > old.len() {
@@ -615,7 +639,9 @@ fn patch_fixed_prefix_bytes(
         return false;
     }
 
-    // Retain Homebrew's NUL-piece padding semantics for unsupported unequal-length dev prefixes.
+    // Homebrew 7d2a02d2: Keg#relocate_build_prefix. Only shrink plausible C
+    // strings; shifting length-prefixed serialized data corrupts V8 snapshots.
+    // glu's equal-length fast path above deliberately preserves every offset.
     let mut out = Vec::with_capacity(data.len());
     let mut mutated = false;
     // Iterate NUL-delimited pieces (Homebrew: binary.split(/\x00/, -1)).
@@ -663,7 +689,7 @@ fn push_rewritten_piece(
     mutated: &mut bool,
 ) {
     let count = memmem::find_iter(piece, old).count();
-    if count == 0 {
+    if count == 0 || !is_relocatable_c_string(piece) {
         out.extend_from_slice(piece);
         return;
     }
@@ -708,16 +734,45 @@ fn find_leftover_placeholder(data: &[u8]) -> Option<usize> {
     memmem::find(data, b"@@HOMEBREW_")
 }
 
-/// No literal build-prefix bytes may survive when the install prefix differs from the
-/// build prefix. If they are the same (theoretical `/opt/homebrew` target), the check yields.
+/// Raw leftover scan for text and equal-length rewrites. Unequal-length binary
+/// relocation uses `find_required_build_prefix` to exclude preserved opaque data.
 fn find_leftover_build_prefix(data: &[u8], build_prefix: &[u8]) -> Option<usize> {
     memmem::find(data, build_prefix)
 }
 
-/// NUL-free heuristic for the text pass: files whose first 8 KiB contain no NUL byte
-/// are treated as text for placeholder substitution.
+// Homebrew 7d2a02d2: MAX_C_STRING_BYTESIZE / C_STRING_REGEX. Use the same
+// eligibility rule for mutation and validation, so preserved serialized data
+// does not turn the corruption fix into a new installation refusal.
+fn is_relocatable_c_string(piece: &[u8]) -> bool {
+    piece.len() <= 16_384
+        && std::str::from_utf8(piece).is_ok_and(|text| {
+            text.chars()
+                .all(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r'))
+        })
+}
+
+fn find_required_build_prefix(data: &[u8], profile: &PrefixProfile) -> Option<usize> {
+    let old = profile.build_prefix.as_bytes();
+    if profile.prefix.len() == old.len() || is_probably_text(data) || is_text_executable(data) {
+        return find_leftover_build_prefix(data, old);
+    }
+    let mut offset = 0;
+    for piece in data.split(|b| *b == 0) {
+        if is_relocatable_c_string(piece) {
+            if let Some(found) = memmem::find(piece, old) {
+                return Some(offset + found);
+            }
+        }
+        offset += piece.len() + 1;
+    }
+    None
+}
+
+// Do not mistake a large serialized chunk for text just because its first NUL
+// is beyond 8 KiB: the text pass would resize the data the binary pass preserved.
+// Script/archive hybrids remain explicitly handled by is_text_executable.
 fn is_probably_text(data: &[u8]) -> bool {
-    !data[..data.len().min(8192)].contains(&0)
+    !data.contains(&0)
 }
 
 /// Homebrew `Pathname#text_executable?` parity: a file whose first 1024 bytes match
@@ -840,6 +895,10 @@ fn normalize_hardlink_target(target: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "prepare/prefix_tests.rs"]
+mod prefix_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -947,6 +1006,74 @@ mod tests {
         expected.resize(42, 0); // piece 2 padded back to 13 bytes, + trailing separator
         assert_eq!(data, expected);
         assert_eq!(data.len(), 42);
+    }
+
+    #[test]
+    fn fixed_prefix_does_not_shrink_serialized_binary_data() {
+        // A length-prefixed V8-style field: bytes after the path are serializer
+        // data, not spare space. NUL-padding this piece corrupts the payload.
+        for original in [
+            b"\x01/opt/homebrew/node\x02\x03\0".to_vec(),
+            b"/opt/homebrew/node\xff\0".to_vec(),
+            [b"/opt/homebrew/".as_slice(), &vec![b'x'; 16_384], b"\0"].concat(),
+        ] {
+            let mut data = original.clone();
+            assert!(!patch_fixed_prefix_bytes(
+                "snapshot",
+                &mut data,
+                &profile("/x"),
+                &mut vec![]
+            ));
+            assert_eq!(data, original);
+            assert!(find_leftover_build_prefix(&data, b"/opt/homebrew").is_some());
+            assert!(find_required_build_prefix(&data, &profile("/x")).is_none());
+        }
+    }
+
+    #[test]
+    fn fixed_prefix_equal_length_preserves_serialized_offsets_and_lengths() {
+        let mut data = b"\x01/opt/homebrew/node\x02\x03\0".to_vec();
+        let allocation = data.as_ptr();
+        assert!(patch_fixed_prefix_bytes(
+            "snapshot",
+            &mut data,
+            &profile("/opt/glustore"),
+            &mut vec![]
+        ));
+        assert_eq!(data, b"\x01/opt/glustore/node\x02\x03\0");
+        assert_eq!(data.as_ptr(), allocation);
+    }
+
+    #[test]
+    fn fixed_prefix_shorter_accepts_utf8_and_whitespace_c_strings() {
+        let mut data = "\t/opt/homebrew/日本語\r\n\0".as_bytes().to_vec();
+        let size = data.len();
+        assert!(patch_fixed_prefix_bytes(
+            "text",
+            &mut data,
+            &profile("/x"),
+            &mut vec![]
+        ));
+        let mut expected = "\t/x/日本語\r\n".as_bytes().to_vec();
+        expected.resize(size, 0);
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn fixed_prefix_preserves_existing_elf_shortening_support() {
+        let mut data = b"\x7fELF\0/opt/homebrew/lib/libfoo.so\0".to_vec();
+        let original = data.clone();
+        let mut warnings = vec![];
+        assert!(patch_fixed_prefix_bytes(
+            "elf",
+            &mut data,
+            &profile("/x"),
+            &mut warnings
+        ));
+        let mut expected = b"\x7fELF\0/x/lib/libfoo.so".to_vec();
+        expected.resize(original.len(), 0);
+        assert_eq!(data, expected);
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -1313,6 +1440,184 @@ mod fused_verify_tests {
             "extraction should succeed for a matching artifact"
         );
         assert!(dst.join("hello.txt").is_file());
+    }
+
+    #[test]
+    fn prepare_preserves_opaque_data_across_prefix_lengths() {
+        let dir = tempfile::tempdir().unwrap();
+        for content in [
+            b"\x01/opt/homebrew/node\x02\x03\0".to_vec(),
+            // Beyond the old text heuristic's 8 KiB window: never send the
+            // preserved serialized data through a length-changing text pass.
+            [b"/opt/homebrew/".as_slice(), &vec![b'x'; 20_000], b"\0"].concat(),
+        ] {
+            let artifact = build_artifact(dir.path(), "snapshot", &content);
+            for (index, prefix) in ["/x", "/opt/glustore", "/a/much/longer/install/prefix"]
+                .iter()
+                .enumerate()
+            {
+                let dst = dir.path().join(format!("out-{index}"));
+                let result = extract_patch_tar_gz_parallel(
+                    &artifact,
+                    &dst,
+                    profile_with(prefix),
+                    &WriterPool::new(),
+                    true,
+                    &sha_file(&artifact),
+                )
+                .unwrap();
+                assert!(result.warnings.is_empty());
+                let mut expected = content.clone();
+                if prefix.len() == "/opt/homebrew".len() {
+                    replace_all_equal_length_in_place(
+                        &mut expected,
+                        b"/opt/homebrew",
+                        prefix.as_bytes(),
+                    );
+                }
+                assert_eq!(
+                    fs::read(dst.join("hello.txt")).unwrap(),
+                    expected,
+                    "{prefix}"
+                );
+                fs::remove_dir_all(dst).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_shortens_c_strings_beside_preserved_snapshot_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = b"header\0/opt/homebrew/lib\0\x01/opt/homebrew/opaque\x02\0";
+        let artifact = build_artifact(dir.path(), "mixed", original);
+        let dst = dir.path().join("out");
+        extract_patch_tar_gz_parallel(
+            &artifact,
+            &dst,
+            profile_with("/x"),
+            &WriterPool::new(),
+            true,
+            &sha_file(&artifact),
+        )
+        .unwrap();
+        let data = fs::read(dst.join("hello.txt")).unwrap();
+        let mut expected = b"header\0/x/lib".to_vec();
+        expected.resize(b"header\0/opt/homebrew/lib\0".len(), 0);
+        expected.extend_from_slice(b"\x01/opt/homebrew/opaque\x02\0");
+        assert_eq!(data, expected);
+        assert_eq!(data.len(), original.len());
+    }
+
+    #[test]
+    fn prepare_relocates_text_and_script_archives_across_prefix_lengths() {
+        let dir = tempfile::tempdir().unwrap();
+        for content in [
+            b"literal=/opt/homebrew/lib\nplaceholder=@@HOMEBREW_PREFIX@@/lib\n".as_slice(),
+            b"#!/opt/homebrew/bin/php\n<?php echo 'fixture'; ?>\0archive payload",
+        ] {
+            let artifact = build_artifact(dir.path(), "text", content);
+            for (index, prefix) in ["/x", "/opt/glustore", "/a/much/longer/install/prefix"]
+                .iter()
+                .enumerate()
+            {
+                let dst = dir.path().join(format!("text-{index}"));
+                let result = extract_patch_tar_gz_parallel(
+                    &artifact,
+                    &dst,
+                    profile_with(prefix),
+                    &WriterPool::new(),
+                    true,
+                    &sha_file(&artifact),
+                )
+                .unwrap();
+                assert!(result.warnings.is_empty());
+                let expected = String::from_utf8(content.to_vec())
+                    .unwrap()
+                    .replace("/opt/homebrew", prefix)
+                    .replace("@@HOMEBREW_PREFIX@@", prefix)
+                    .into_bytes();
+                assert_eq!(
+                    fs::read(dst.join("hello.txt")).unwrap(),
+                    expected,
+                    "{prefix}"
+                );
+                fs::remove_dir_all(dst).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn required_c_strings_and_placeholders_are_still_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = build_artifact(
+            dir.path(),
+            "missing-capacity",
+            b"header\0/opt/homebrew/lib\0",
+        );
+        let error = extract_patch_tar_gz_parallel(
+            &artifact,
+            &dir.path().join("out"),
+            profile_with("/a/much/longer/install/prefix"),
+            &WriterPool::new(),
+            true,
+            &sha_file(&artifact),
+        )
+        .unwrap_err();
+        // This is the pre-existing fixed-size capacity limit, not a prefix-wide
+        // restriction: text and Mach-O header-pad growth succeed independently.
+        assert!(error.to_string().contains("unresolved build-prefix"));
+        assert!(find_leftover_placeholder(b"\x01@@HOMEBREW_PREFIX@@\x02\0").is_some());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn absolute_build_prefix_symlinks_are_relocated_relative_to_the_installed_keg() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = build_custom_artifact(dir.path(), "prefix-links", |tar| {
+            for root in ["fixture/1.0", "opt/homebrew/Cellar/fixture/1.0"] {
+                for (name, target) in [
+                    ("keg", "/opt/homebrew/Cellar/fixture/1.0/lib/tool"),
+                    ("dep", "/opt/homebrew/opt/dep/lib/tool"),
+                    ("external", "/opt/homebrew-other/lib/tool"),
+                    ("relative", "../lib/tool"),
+                ] {
+                    append_symlink(
+                        tar,
+                        &Path::new(root).join("bin").join(name),
+                        Path::new(target),
+                    );
+                }
+            }
+        });
+        for (index, prefix) in ["/x", "/opt/glustore", "/a/much/longer/install/prefix"]
+            .iter()
+            .enumerate()
+        {
+            let dst = dir.path().join(format!("links-{index}"));
+            extract_patch_tar_gz_parallel(
+                &artifact,
+                &dst,
+                profile_with(prefix),
+                &WriterPool::new(),
+                true,
+                &sha_file(&artifact),
+            )
+            .unwrap();
+            for root in ["fixture/1.0", "opt/homebrew/Cellar/fixture/1.0"] {
+                for (name, expected) in [
+                    ("keg", "../lib/tool"),
+                    ("dep", "../../../../opt/dep/lib/tool"),
+                    ("external", "/opt/homebrew-other/lib/tool"),
+                    ("relative", "../lib/tool"),
+                ] {
+                    assert_eq!(
+                        fs::read_link(dst.join(root).join("bin").join(name)).unwrap(),
+                        Path::new(expected),
+                        "{prefix}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

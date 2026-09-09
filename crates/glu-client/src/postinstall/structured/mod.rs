@@ -1,41 +1,38 @@
 //! Structured postinstall step execution.
 //!
-//! Provenance: this module is a Rust port of Homebrew's declarative
-//! `post_install_steps` machinery, cross-checked against the Homebrew tree at
-//! `/opt/homebrew` (git HEAD `4dacfe77b6`, short `4dacfe77`, 2026-08-11).
-//! Citations were originally verified against `9e9f316d` (2026-07-31) and
-//! re-baselined here after `brew update` moved the tree. Semantic deltas in
-//! the re-baseline: `configure_php` / `bootstrap_cpython` / `bootstrap_pypy`
-//! became real Homebrew step types (formula_actions.rb:141/200/280); the
-//! `symlink_tree` TYPE STRING was retired from the Runner (the DSL method of
-//! that name now emits type `link_dir`); `run` gained `allow_failure` /
-//! `writable_paths` / `network_access` fields; `write` now raises only on
-//! `nil` content (empty string allowed); `run_formula_tool` now checks the
-//! opt binary is executable. The DSL method renames (`symlink_tree`,
-//! `symlink_children`, `write_file`, `update_*_cache`) all emit UNCHANGED
-//! type strings (`link_dir`, `link_children`, `write`, `gio_querymodules`, …).
-//! The upstream
-//! sources of truth are:
+//! Provenance: Rust port of Homebrew's declarative `post_install_steps`,
+//! reviewed against Homebrew/brew `7d2a02d22aa174b891f7a631d6ce9aecfe643352`
+//! (`7d2a02d2`, 2026-09-09). Inline citations use source files and symbols
+//! rather than line numbers, which drift when unrelated Ruby code changes.
+//!
+//! All 34 serialized step types and the specialized formula actions remain
+//! supported. Deprecated DSL aliases still emit supported types; do not drop
+//! them. Cask-only arch expansion and privileged-step brokering do not apply
+//! to formula jobs (`{{arch}}` stays literal). Sandbox staging protection and
+//! the expanded package-manager cache environment follow this revision.
+//! Formula network-policy ingestion is deferred: the client enforces supplied
+//! metadata but still defaults to allowing network when the registry omits it.
+//!
+//! Upstream sources of truth:
 //!
 //! - `Library/Homebrew/install_steps.rb` (DSL + Runner) — the step types,
 //!   path/guard resolution, and per-step execution semantics.
 //! - `Library/Homebrew/install_steps/formula_actions.rb` — the
 //!   `configure_*`/`install_gzipped_executable` actions.
-//! - `Library/Homebrew/formula.rb` (1617 `run_post_install`, 1601
-//!   `run_post_install_steps`), `formula_installer.rb` (1002-1017 gating,
-//!   1391+ subprocess postinstall), `Library/Homebrew/postinstall.rb` — the
+//! - `Library/Homebrew/formula.rb` (`run_post_install`, `run_post_install_steps`),
+//!   `formula_installer.rb` (`post_install`), `Library/Homebrew/postinstall.rb` — the
 //!   surrounding post-install environment (env, HOME, sandbox).
 //! - `Library/Homebrew/utils/inreplace.rb`, `utils/string_inreplace_extension.rb`
 //!   — inreplace audit semantics.
-//! - `Library/Homebrew/utils/clang.rb` (14-31 `write_system_config_files`) —
+//! - `Library/Homebrew/utils/clang.rb` (`write_system_config_files`) —
 //!   `configure_clang_system`.
-//! - `Library/Homebrew/utils/path.rb` (36, 128) — opt-prefix / installed-formula
+//! - `Library/Homebrew/utils/path.rb` — opt-prefix / installed-formula
 //!   checks used by the global tool steps.
 //!
 //! Parts with no Homebrew counterpart are glu inventions (not upstream
 //! behavior), documented in `docs/explanation/install-pipeline.md`: the
-//! global-postinstall deferral/coalescing machinery and the `search_path`
-//! base. Everything else is Homebrew behavior; intentional differences from
+//! global-postinstall deferral/coalescing machinery. `search_path` is an
+//! upstream glob-search base, not a glu invention. Intentional differences from
 //! upstream are flagged inline as compatibility notes.
 //!
 //! Platform & architecture scope
@@ -49,7 +46,7 @@
 //! platform-neutral.
 //!
 //! Conventions used inline:
-//! - `// Homebrew 4dacfe77: install_steps.rb:NNN (fn)` — provenance citation.
+//! - `// Homebrew 7d2a02d2: install_steps.rb (fn)` — provenance citation.
 //! - `// Compatibility: ...` — an intentional divergence, silent no-op, or
 //!   platform capability not supported by the current target.
 //! - `// PLATFORM: ...` — platform/arch assumption (see section above).
@@ -143,8 +140,8 @@ pub fn run_deferred_global_postinstall(
     )
 }
 
-// Homebrew 4dacfe77: install_steps.rb:891-903 (Runner#run) — per-step loop is
-// `run_install_step`, guard evaluation is `step_guards_match?` (978-1003).
+// Homebrew 7d2a02d2: install_steps.rb (Runner#run) — per-step loop is
+// `run_install_step`, guard evaluation is `step_guards_match?`.
 // This in-process runner expects its caller to provide the process security
 // boundary. Normal installs call it from `postinstall::sandbox`'s worker with
 // a parent-computed plan, so native Rust filesystem steps and child commands
@@ -195,7 +192,7 @@ struct PostinstallContext<'a> {
     env: &'a PostinstallEnvSnapshot,
     deferred: Option<&'a mut DeferredPostinstallQueue>,
     verbose: bool,
-    /// Homebrew 4dacfe77: install_steps.rb:1178-1198 — guard results memoized
+    /// Homebrew 7d2a02d2: install_steps.rb — guard results memoized
     /// per run (@guard_results), keyed by the guard spec's canonical JSON.
     guards: RefCell<BTreeMap<String, bool>>,
 }
@@ -206,8 +203,8 @@ struct GlobalPostinstallContext<'a> {
     verbose: bool,
 }
 
-// Homebrew 4dacfe77: install_steps.rb:954-1170 (run_install_step case dispatch).
-// Each arm below cites its upstream lines; deviations are flagged inline.
+// Homebrew 7d2a02d2: install_steps.rb (run_install_step case dispatch).
+// Each arm below cites its upstream behavior; deviations are flagged inline.
 fn run_step(
     ctx: &mut PostinstallContext<'_>,
     step: &Value,
@@ -246,14 +243,14 @@ fn run_step_dispatch(
 ) -> Result<()> {
     let typ = step_type(step)?;
     match typ {
-        // Homebrew 4dacfe77: install_steps.rb:958-959 (`mkdir` Runner
+        // Homebrew 7d2a02d2: install_steps.rb (`mkdir` Runner
         // `.mkdir` — fails if the path exists; same as `fs::create_dir`).
         "mkdir" => fs::create_dir(path(ctx, req(step, "path")?)?)?,
-        // Homebrew 4dacfe77: install_steps.rb:960-961 (`.mkpath`).
+        // Homebrew 7d2a02d2: install_steps.rb (`.mkpath`).
         "mkdir_p" => fs::create_dir_all(path(ctx, req(step, "path")?)?)?,
-        // Homebrew 4dacfe77: install_steps.rb:1321-1356 (run_init_data_dir).
+        // Homebrew 7d2a02d2: install_steps.rb (run_init_data_dir).
         "init_data_dir" => init_data_dir(ctx, step)?,
-        // Homebrew 4dacfe77: install_steps.rb:964-967. Homebrew uses
+        // Homebrew 7d2a02d2: install_steps.rb. Homebrew uses
         // `FileUtils.touch` which updates mtime even for existing files; glu
         // now does the same via `File::set_times` (std 1.75+).
         "touch" => {
@@ -269,14 +266,14 @@ fn run_step_dispatch(
                     .set_modified(now),
             )?;
         }
-        // Homebrew 4dacfe77: install_steps.rb:968-972 (move case:
+        // Homebrew 7d2a02d2: install_steps.rb (move case:
         // `FileUtils.mv source, target, force: step["force"] == true`).
         // Dir targets move INTO the directory (see `move_path`).
         "move" => move_path(
             &single_source(ctx, step)?,
             &path(ctx, req(step, "target")?)?,
         )?,
-        // Homebrew 4dacfe77: install_steps.rb:982-989 (move_children/move_contents:
+        // Homebrew 7d2a02d2: install_steps.rb (move_children/move_contents:
         // `children = source.children.reject { |child| child == target }` then
         // `FileUtils.mv children, target` — each child moved INTO target).
         "move_children" | "move_contents" => {
@@ -293,8 +290,8 @@ fn run_step_dispatch(
                 move_path(&child, &target)?;
             }
         }
-        // Homebrew 4dacfe77: install_steps.rb:990-1003 + step_destination
-        // (1421). Homebrew raises Errno::EEXIST when `!overwrite` and the
+        // Homebrew 7d2a02d2: install_steps.rb + step_destination
+        // helper. Homebrew raises Errno::EEXIST when `!overwrite` and the
         // destination exists; for overwrite, non-recursive copies are
         // `FileUtils.cp` (in-place overwrite, symlink removed first) and
         // recursive copies are `FileUtils.cp_r ... remove_destination:`.
@@ -305,26 +302,26 @@ fn run_step_dispatch(
             step.get("overwrite").and_then(Value::as_bool) != Some(false),
         )?,
         "remove" => remove_step(ctx, step)?,
-        // Homebrew 4dacfe77: install_steps.rb:1026-1036 + utils/inreplace.rb +
-        // utils/string_inreplace_extension.rb:26-45 (audit). Regexp::EXTENDED
+        // Homebrew 7d2a02d2: install_steps.rb + utils/inreplace.rb +
+        // utils/string_inreplace_extension.rb (audit). Regexp::EXTENDED
         // free-spacing normalization is handled by `strip_extended`.
         "inreplace" => inreplace(ctx, step)?,
-        // Homebrew 4dacfe77: install_steps.rb:1037-1051 (link_dir case). The
+        // Homebrew 7d2a02d2: install_steps.rb (link_dir case). The
         // `symlink_tree` TYPE STRING was retired from the Runner — the DSL
-        // method `symlink_tree` (install_steps.rb:449) now emits `link_dir`.
+        // method `symlink_tree` (install_steps.rb) now emits `link_dir`.
         // `.DS_Store` skip, existing-dir preservation and relative symlinks
         // implemented in `link_dir_tree`.
         "link_dir" => link_dir_step(ctx, step)?,
-        // Homebrew 4dacfe77: install_steps.rb:1052-1059 (link_children: relative
+        // Homebrew 7d2a02d2: install_steps.rb (link_children: relative
         // symlinks with prefix/suffix via `install_symlink`).
         "link_children" => link_children_step(ctx, step)?,
-        // Homebrew 4dacfe77: install_steps.rb:1060-1075 + create_symlink (1253-1265).
+        // Homebrew 7d2a02d2: install_steps.rb (symlink case + create_symlink).
         "symlink" => symlink_step(ctx, step)?,
-        // Homebrew 4dacfe77: install_steps.rb:1076-1084 (write case). Upstream
+        // Homebrew 7d2a02d2: install_steps.rb (write case). Upstream
         // raises ArgumentError only when content is nil — empty strings are
         // allowed since 2026-08 (pre-2026-08 `blank?` also rejected "").
         // NOTE: `overwrite` defaults to false here, but `write_file` — the new
-        // canonical DSL method (install_steps.rb:519) — emits `overwrite: true`
+        // canonical DSL method (install_steps.rb) — emits `overwrite: true`
         // and `append_newline: false`.
         "write" => {
             let content = step
@@ -340,12 +337,12 @@ fn run_step_dispatch(
                 fs::write(p, expand(ctx, &content))?;
             }
         }
-        // Homebrew 4dacfe77: install_steps.rb:1199-1220 (run_serialised_command).
+        // Homebrew 7d2a02d2: install_steps.rb (run_serialised_command).
         // `allow_failure` is the JSON inverse of the DSL's `must_succeed`
-        // (install_steps.rb:697 `"allow_failure" => !must_succeed`); `sudo` is
-        // `step["sudo"] == true` (install_steps.rb:1203) — both now implemented.
+        // (install_steps.rb `"allow_failure" => !must_succeed`); `sudo` is
+        // `step["sudo"] == true` (install_steps.rb) — both now implemented.
         // NOTE: `suppress_stderr` below is the JSON field name the DSL emits
-        // (install_steps.rb:699 `"suppress_stderr" => !print_stderr`) — the
+        // (install_steps.rb `"suppress_stderr" => !print_stderr`) — the
         // inversion is upstream's, glu reads it as-is; correct, do not "fix".
         "run" => {
             if let Some((kind, key)) = global_kind_key(ctx, step)? {
@@ -354,17 +351,17 @@ fn run_step_dispatch(
                 run_command_step(ctx, step)?;
             }
         }
-        // Homebrew 4dacfe77: install_steps.rb:1221-1251 (run_terminate_process).
+        // Homebrew 7d2a02d2: install_steps.rb (run_terminate_process).
         // Name-match uses `/usr/bin/killall <name>`; full-match uses
         // `/usr/bin/pkill -f <name>`.
         "terminate_process" => terminate_process(ctx, step)?,
-        // Homebrew 4dacfe77: install_steps.rb:27-36 (InstallSteps.change_dylib_id:
+        // Homebrew 7d2a02d2: install_steps.rb (InstallSteps.change_dylib_id:
         // ruby-macho `MachO::Tools.change_dylib_id` + `MachO.codesign!` on arm64).
         // glu's in-process rewrite lives in bottle/macho.rs, with ad-hoc
         // signing in bottle/codesign.rs using ruby-macho
         // identifier parity.
         "change_dylib_id" => change_dylib_id(ctx, step)?,
-        // Homebrew 4dacfe77: utils/output.rb:68 (opoo → stderr "Warning:").
+        // Homebrew 7d2a02d2: utils/output.rb (opoo → stderr "Warning:").
         "warn" => crate::worker_output::notice(&crate::style::yellow(&format!(
             "Warning: {}",
             expand(
@@ -372,11 +369,11 @@ fn run_step_dispatch(
                 step.get("message").and_then(Value::as_str).unwrap_or("")
             )
         ))),
-        // Homebrew 4dacfe77: install_steps/formula_actions.rb:10-64
-        // (run_configure_gcc_runtime) and 90-119 (run_configure_glibc_runtime).
+        // Homebrew 7d2a02d2: install_steps/formula_actions.rb
+        // (run_configure_gcc_runtime / run_configure_glibc_runtime).
         // PLATFORM (arm64 macOS, v0.1): glu is a silent no-op on both —
         // compliant for `configure_gcc_runtime` by construction (upstream's own
-        // guard, formula_actions.rb:11, no-ops off Linux) but NOT for
+        // guard, formula_actions.rb, no-ops off Linux) but NOT for
         // `configure_glibc_runtime` (no upstream guard; runs localedef).
         // Intel: same as arm64 (still macOS).
         // Compatibility: a future Linux implementation must add both actions
@@ -385,17 +382,17 @@ fn run_step_dispatch(
         // off Linux; the macOS `configure_gcc_runtime` no-op matches upstream's
         // own guard.
         "configure_gcc_runtime" | "configure_glibc_runtime" => {}
-        // Homebrew 4dacfe77: install_steps/formula_actions.rb:66-88
+        // Homebrew 7d2a02d2: install_steps/formula_actions.rb
         // (run_install_gzipped_executable).
         "install_gzipped_executable" => install_gzipped_executable(ctx, step)?,
-        // Homebrew 4dacfe77: install_steps/formula_actions.rb:120-140 +
-        // utils/clang.rb:14-31 (write_system_config_files).
+        // Homebrew 7d2a02d2: install_steps/formula_actions.rb +
+        // utils/clang.rb (write_system_config_files).
         "configure_clang_system" => configure_clang_system(ctx)?,
-        // Homebrew 4dacfe77: install_steps.rb:1105-1109 (Runner arms) +
-        // formula_actions.rb:141/200/280 (run_configure_php, run_bootstrap_cpython,
+        // Homebrew 7d2a02d2: install_steps.rb (Runner arms) +
+        // formula_actions.rb (run_configure_php, run_bootstrap_cpython,
         // run_bootstrap_pypy(abi_version)). Ported in `configure_php` /
         // `bootstrap_cpython` / `bootstrap_pypy` below; `bootstrap_pypy` requires
-        // the `abi_version` field (install_steps.rb:786-789).
+        // the `abi_version` field (install_steps.rb).
         "configure_php" => configure_php(ctx)?,
         "bootstrap_cpython" => bootstrap_cpython(ctx)?,
         "bootstrap_pypy" => {
@@ -408,22 +405,22 @@ fn run_step_dispatch(
             }
             bootstrap_pypy(ctx, abi)?;
         }
-        // Homebrew 4dacfe77: install_steps.rb:1266-1274 (run_set_permissions).
+        // Homebrew 7d2a02d2: install_steps.rb (run_set_permissions).
         // chmod runs without sudo upstream; matches.
         "set_permissions" => chmod_paths(ctx, step)?,
-        // Homebrew 4dacfe77: install_steps.rb:1276-1302 (run_set_ownership).
+        // Homebrew 7d2a02d2: install_steps.rb (run_set_ownership).
         // See the compatibility note on `chown_paths` /
         // `app_management_permissions_granted` for the remaining App
         // Management heuristic difference.
         "set_ownership" => chown_paths(ctx, step)?,
-        // Homebrew 4dacfe77: install_steps.rb:1507-1516 (run_formula_tool) —
+        // Homebrew 7d2a02d2: install_steps.rb (run_formula_tool) —
         // glu defers/coalesces these via DEFERRABLE_GLOBAL_TYPES (glu invention;
         // Homebrew runs them per-package, per docs/explanation/install-pipeline.md).
         typ if DEFERRABLE_GLOBAL_TYPES.contains(&typ) => {
             let key = global_key(ctx, typ, step)?;
             run_or_defer_global(ctx, plan, typ.to_string(), key)?;
         }
-        // Homebrew 4dacfe77: install_steps.rb:1134-1160 (delete_keychain_certificate
+        // Homebrew 7d2a02d2: install_steps.rb (delete_keychain_certificate
         // case: /usr/bin/security find/delete-certificate with sudo, optional
         // openssl fingerprint match). Implemented in `delete_keychain_certificate`.
         // PLATFORM (arm64 macOS, v0.1): macOS-ONLY step (`/usr/bin/security`,
@@ -445,7 +442,7 @@ fn req<'a>(step: &'a Value, key: &str) -> Result<&'a Value> {
         .ok_or_else(|| anyhow::anyhow!("postinstall step missing {key}"))
 }
 // glu helper (no Homebrew equivalent; upstream raises on `unknown install
-// step` / missing type in run_install_step's else branch, install_steps.rb:1167).
+// step` / missing type in run_install_step's else branch, install_steps.rb).
 fn step_type(step: &Value) -> Result<&str> {
     step.get("type")
         .and_then(Value::as_str)

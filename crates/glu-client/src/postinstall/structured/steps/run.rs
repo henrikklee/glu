@@ -1,16 +1,16 @@
 use super::super::*;
 
-// Homebrew 4dacfe77: install_steps.rb:1199-1220 (run_serialised_command).
+// Homebrew 7d2a02d2: install_steps.rb (run_serialised_command).
 // `allow_failure` is the JSON inverse of the DSL's `must_succeed`
-// (install_steps.rb:697 `"allow_failure" => !must_succeed`, default false —
+// (install_steps.rb `"allow_failure" => !must_succeed`, default false —
 // run steps fail the install on non-zero exit unless opted out); `sudo` is
-// `step["sudo"] == true` (install_steps.rb:1203) and is now implemented.
+// `step["sudo"] == true` (install_steps.rb) and is now implemented.
 // Compatibility: glu buffers output and prints it after completion. Homebrew
 // streams stdout/stderr through SystemCommand as the child writes
 // (print_stdout / print_stderr flags), which matters for long-running steps.
-// Provenance note: `writable_paths` / `network_access` are sandbox metadata
-// (install_steps.rb:706-717); glu has no sandbox, so they have no observable
-// step effect here.
+// Provenance note: `writable_paths` / `network_access` are cask step sandbox
+// metadata. Formula workers use formula-level paths/network policy, matching
+// FormulaInstaller#post_install; these fields do not alter command execution.
 pub(in crate::postinstall::structured) fn run_command_step(
     ctx: &PostinstallContext<'_>,
     step: &Value,
@@ -34,7 +34,7 @@ pub(in crate::postinstall::structured) fn run_command_step(
             .map(|(k, v)| (k.clone(), expand(ctx, v.as_str().unwrap_or(""))))
             .collect::<Vec<_>>()
     });
-    // Homebrew 4dacfe77: install_steps.rb:1203 — `sudo: step["sudo"] == true`.
+    // Homebrew 7d2a02d2: install_steps.rb — `sudo: step["sudo"] == true`.
     let must_succeed = step.get("allow_failure").and_then(Value::as_bool) != Some(true);
     let sudo = step.get("sudo").and_then(Value::as_bool) == Some(true);
     let output = run_command(
@@ -73,7 +73,7 @@ pub(in crate::postinstall::structured) fn run_command_step(
         }
     }
     if let Some(stdout_path) = step.get("stdout_path") {
-        // Homebrew 4dacfe77: install_steps.rb:1213-1218 — stdout_path is only
+        // Homebrew 7d2a02d2: install_steps.rb — stdout_path is only
         // written when the command succeeded.
         if output.status.success() {
             let p = path(ctx, stdout_path)?;

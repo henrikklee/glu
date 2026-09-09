@@ -280,6 +280,7 @@ impl SandboxProfile {
                 profile.allow_write_path(prefix.0.clone());
             }
         }
+        profile.deny_installer_write_paths(prefix);
         profile.deny_toolchain_write_paths(prefix)?;
         Ok(profile)
     }
@@ -375,6 +376,37 @@ impl SandboxProfile {
         Ok(())
     }
 
+    // Homebrew 7d2a02d2: Sandbox#deny_write_temp_cellar. Keep broad formula
+    // and deferred-cache grants, but never let hooks alter prepared packages
+    // or installer control state. Language caches and logs remain writable.
+    fn deny_installer_write_paths(&mut self, prefix: &Prefix) {
+        self.deny_write_path(prefix.0.join("var/glu"));
+        self.allow_write_path(prefix.0.join("var/glu/logs"));
+        self.allow_write_path(prefix.0.join("var/glu/cache"));
+        self.deny_write_path(prefix.0.join("var/glu/cache/artifacts"));
+        self.deny_write_path(prefix.0.join("var/glu/staging"));
+        self.deny_write_path(prefix.0.join("glu.json"));
+
+        // Denying descendants alone does not prevent renaming their ancestors.
+        // Include both the lexical names (symlinks) and their resolved targets.
+        let control = prefix.0.join("var/glu/cache");
+        for root in [&control, &sandbox_path(&control)] {
+            for ancestor in root.ancestors() {
+                self.rules.push(format!(
+                    "(deny file-write-unlink (literal \"{}\"))",
+                    seatbelt_quote(&sandbox_entry_path(ancestor).to_string_lossy())
+                ));
+            }
+        }
+        let cellar = sandbox_path(&prefix.0.join("Cellar"));
+        let cellar = regex::escape(&cellar.to_string_lossy()).replace('"', "\\\"");
+        // Match future receipts as well as existing ones without a Cellar walk.
+        self.deny_write_filter(&format!("(regex #\"^{cellar}/[^/]+/[^/]+/\\.glu(/|$)\")"));
+        self.rules.push(format!(
+            "(deny file-write-unlink (regex #\"^{cellar}(/[^/]+(/[^/]+)?)?$\"))"
+        ));
+    }
+
     fn deny_toolchain_write_paths(&mut self, prefix: &Prefix) -> Result<()> {
         if let Ok(exe) = env::current_exe() {
             self.deny_write_literal(canonicalize_existing(&exe).unwrap_or(exe.clone()));
@@ -405,7 +437,7 @@ impl SandboxProfile {
     }
 
     fn allow_write_path(&mut self, path: PathBuf) {
-        let path = normalize_private_macos(canonicalize_existing(&path).unwrap_or(path));
+        let path = sandbox_path(&path);
         let filter = format!("(subpath \"{}\")", seatbelt_quote(&path.to_string_lossy()));
         self.rules.push(format!("(allow file-write* {filter})"));
         self.rules
@@ -422,23 +454,31 @@ impl SandboxProfile {
     }
 
     fn deny_write_path(&mut self, path: PathBuf) {
-        let path = normalize_private_macos(canonicalize_existing(&path).unwrap_or(path));
-        self.rules.push(format!(
-            "(deny file-write* (subpath \"{}\"))",
+        let path = sandbox_path(&path);
+        self.deny_write_filter(&format!(
+            "(subpath \"{}\")",
             seatbelt_quote(&path.to_string_lossy())
         ));
     }
 
     fn deny_write_literal(&mut self, path: PathBuf) {
-        let path = normalize_private_macos(canonicalize_existing(&path).unwrap_or(path));
-        self.rules.push(format!(
-            "(deny file-write* (literal \"{}\"))",
+        let path = sandbox_path(&path);
+        self.deny_write_filter(&format!(
+            "(literal \"{}\")",
             seatbelt_quote(&path.to_string_lossy())
         ));
     }
 
+    fn deny_write_filter(&mut self, filter: &str) {
+        // Match the explicit mode/setugid grants too: a file-write* denial
+        // alone does not override these more specific Seatbelt operations.
+        for operation in ["file-write*", "file-write-mode", "file-write-setugid"] {
+            self.rules.push(format!("(deny {operation} {filter})"));
+        }
+    }
+
     fn deny_read_path(&mut self, path: PathBuf) {
-        let path = normalize_private_macos(canonicalize_existing(&path).unwrap_or(path));
+        let path = sandbox_path(&path);
         self.rules.push(format!(
             "(deny file-read* (subpath \"{}\"))",
             seatbelt_quote(&path.to_string_lossy())
@@ -505,15 +545,29 @@ fn canonicalize_existing(path: &Path) -> Option<PathBuf> {
     fs::canonicalize(path).ok()
 }
 
-fn normalize_private_macos(path: PathBuf) -> PathBuf {
-    let s = path.to_string_lossy();
-    if let Some(rest) = s.strip_prefix("/private/tmp") {
-        PathBuf::from(format!("/tmp{rest}"))
-    } else if let Some(rest) = s.strip_prefix("/private/var") {
-        PathBuf::from(format!("/var{rest}"))
-    } else {
-        path
+// Resolve the parent but not the entry itself, to protect a symlink's name
+// as well as the target when denying unlink/rename.
+fn sandbox_entry_path(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => sandbox_path(parent).join(name),
+        _ => path.to_path_buf(),
     }
+}
+
+// New prefixes may not have staging or cache directories yet. Resolve the
+// existing ancestor so Seatbelt sees the eventual real path, not a symlink alias.
+fn sandbox_path(path: &Path) -> PathBuf {
+    for ancestor in path.ancestors() {
+        if let Ok(real) = fs::canonicalize(ancestor) {
+            let suffix = path.strip_prefix(ancestor).unwrap();
+            return if suffix.as_os_str().is_empty() {
+                real
+            } else {
+                real.join(suffix)
+            };
+        }
+    }
+    path.to_path_buf()
 }
 
 fn dev_repo_from_exe(exe: &Path) -> Option<PathBuf> {
@@ -609,6 +663,10 @@ const HOMEBREW_SENSITIVE_HOME_PATHS: &[&str] = &[
     "OneDrive",
 ];
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "sandbox/integration_tests.rs"]
+mod integration_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,7 +675,7 @@ mod tests {
         ArtifactId, KegVersion, PackageDependency, PackageInstallMetadata, PackageName,
     };
 
-    fn package() -> ResolvedPackage {
+    pub(super) fn package() -> ResolvedPackage {
         ResolvedPackage {
             package_key: glu_core::PackageKey("package:fixture".to_string()),
             name: PackageName("fixture".to_string()),
@@ -637,6 +695,150 @@ mod tests {
                 post_install_steps: vec![],
                 postinstall_network_access_allowed: false,
             },
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_protects_installer_state_without_breaking_cache_writes() {
+        use std::os::unix::fs::symlink;
+
+        for deferred in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let real_prefix = tmp.path().join("real prefix (test) [1]");
+            fs::create_dir(&real_prefix).unwrap();
+            // Exercise canonicalization of a missing protected path beneath a symlink.
+            let alias = tmp.path().join("prefix-alias");
+            symlink(&real_prefix, &alias).unwrap();
+            let prefix = Prefix(alias);
+            let job = if deferred {
+                PostinstallWorkerJob::DeferredGlobal {
+                    prefix: prefix.clone(),
+                    kind: "fontconfig_fc_cache".into(),
+                    key: vec![],
+                    network_access_allowed: false,
+                    verbose: false,
+                }
+            } else {
+                PostinstallWorkerJob::Formula {
+                    prefix: prefix.clone(),
+                    package: Box::new(package()),
+                    keg: prefix.0.join("Cellar/fixture/1.0"),
+                    plan: PostinstallPlan::default(),
+                    verbose: false,
+                }
+            };
+            // Generate before staging/cache directories exist, as on a fresh prefix.
+            let profile = SandboxProfile::for_job(&job, tmp.path()).unwrap().render();
+            let profile_path = tmp.path().join("test.sb");
+            fs::write(&profile_path, profile).unwrap();
+            let run = |script: &str, args: &[&Path]| {
+                let output = Command::new("/usr/bin/sandbox-exec")
+                    .args(["-f"])
+                    .arg(&profile_path)
+                    .args(["/bin/sh", "-c", script, "sandbox-test"])
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "deferred={deferred}: {script} {args:?}\n{}\n{}",
+                    String::from_utf8_lossy(&output.stderr),
+                    fs::read_to_string(&profile_path).unwrap()
+                );
+            };
+
+            let protected = [
+                "var/glu/staging/other/1.0/bin/tool",
+                "var/glu/cache/artifacts/sha256/bottle",
+                "var/glu/operations.lock",
+                "var/glu/link-overwrite-backups/other/bin/tool",
+                "glu.json",
+                "Cellar/fixture/1.0/.glu/receipt.json",
+                "Cellar/other/1.0/.glu/receipt.json",
+            ];
+            for rel in protected {
+                let path = real_prefix.join(rel);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, b"trusted").unwrap();
+                run("if printf tampered > \"$1\"; then exit 1; fi", &[&path]);
+                run("if /bin/rm \"$1\"; then exit 1; fi", &[&path]);
+                run("if /bin/chmod 777 \"$1\"; then exit 1; fi", &[&path]);
+                let replacement = tmp.path().join("replacement");
+                fs::write(&replacement, b"untrusted").unwrap();
+                run(
+                    "if /bin/mv -f \"$1\" \"$2\"; then exit 1; fi",
+                    &[&replacement, &path],
+                );
+                let hardlink = tmp.path().join("hardlink");
+                run(
+                    "if /bin/ln \"$1\" \"$2\"; then exit 1; fi",
+                    &[&path, &hardlink],
+                );
+                assert_eq!(fs::read(&path).unwrap(), b"trusted");
+            }
+            for rel in [
+                "var/glu/staging",
+                "var/glu/cache",
+                "var/glu",
+                "var",
+                "Cellar/fixture/1.0",
+                "Cellar/fixture",
+                "Cellar",
+                "",
+            ] {
+                let path = real_prefix.join(rel);
+                let replacement = path.with_extension("moved");
+                run(
+                    "if /bin/mv \"$1\" \"$2\"; then exit 1; fi",
+                    &[&path, &replacement],
+                );
+                assert!(path.is_dir(), "{rel} was moved");
+            }
+            run(
+                "if /bin/mv \"$1\" \"$2\"; then exit 1; fi",
+                &[&prefix.0, &tmp.path().join("moved-alias")],
+            );
+            assert!(prefix.0.is_symlink());
+            let staging = real_prefix.join("var/glu/staging");
+            let staging_link = real_prefix.join("share/staging-alias");
+            fs::create_dir_all(staging_link.parent().unwrap()).unwrap();
+            symlink(&staging, &staging_link).unwrap();
+            let new_staged_file = staging_link.join("planted");
+            run(
+                "if /usr/bin/touch \"$1\"; then exit 1; fi",
+                &[&new_staged_file],
+            );
+            assert!(!new_staged_file.exists());
+
+            for rel in [
+                "var/glu/logs",
+                "var/glu/cache/npm_cache",
+                "var/glu/cache/uv_cache",
+                "var/glu/cache/cargo_cache",
+                "etc/fixture",
+                "var/fixture",
+                "share/glib-2.0/schemas",
+                "Cellar/fixture/1.0/lib",
+            ] {
+                let dir = real_prefix.join(rel);
+                run(
+                    "/bin/mkdir -p \"$1\" && printf cache > \"$1/value\"",
+                    &[&dir],
+                );
+                assert_eq!(fs::read(dir.join("value")).unwrap(), b"cache");
+            }
+            // The reason deferred jobs retain broad prefix access: a public cache
+            // path can resolve into a different installed package's keg.
+            if deferred {
+                let target = real_prefix.join("Cellar/other/1.0/lib/gtk-3.0");
+                fs::create_dir_all(&target).unwrap();
+                let link = real_prefix.join("lib/gtk-3.0");
+                fs::create_dir_all(link.parent().unwrap()).unwrap();
+                symlink(&target, &link).unwrap();
+                run("printf cache > \"$1/immodules.cache\"", &[&link]);
+                assert_eq!(fs::read(target.join("immodules.cache")).unwrap(), b"cache");
+            }
         }
     }
 
@@ -705,7 +907,7 @@ mod tests {
         assert!(denied_profile.contains("(deny network*)"));
         assert!(allowed_profile.contains(&format!(
             "(allow file-write* (subpath \"{}\"))",
-            prefix.0.display()
+            sandbox_path(&prefix.0).display()
         )));
     }
 }

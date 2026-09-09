@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
-// Homebrew 4dacfe77: install_steps.rb:1517-1568 (root_path/context_path/formula_base)
-// + formula.rb:1067-1550 (Formula path methods). `search_path` is a glu
-// invention (no Homebrew base). `staged_path`, `appdir`, `caskroom_path` are
-// Cask DSL bases (cask/dsl.rb:683) that Homebrew's formula Runner would reject
+// Homebrew 7d2a02d2: install_steps.rb (root_path/context_path/formula_base)
+// + formula.rb (Formula path methods). `search_path` is an upstream glob-only
+// base. `staged_path`, `appdir`, `caskroom_path` are Cask DSL bases that
+// Homebrew's formula Runner would reject
 // with "unknown install step base"; glu accepts the protocol vocabulary but
 // these bases should not appear in formula postinstall steps.
 pub(super) const SUPPORTED_BASES: &[&str] = &[
@@ -85,7 +85,7 @@ pub(super) fn resolve_base_path(ctx: &BasePathContext<'_>, base: &str) -> Option
         "var" => Some(ctx.prefix.join("var")),
         "pkgetc" => Some(ctx.prefix.join("etc").join(ctx.package_name)),
         "formula_pkgetc" => Some(ctx.prefix.join("etc").join(name)),
-        // Homebrew 4dacfe77: formula.rb:1401-1428 — these resolve KEG-relative
+        // Homebrew 7d2a02d2: formula.rb — these resolve KEG-relative
         // upstream (`prefix/etc/bash_completion.d`, `share/zsh/site-functions`,
         // `share/fish/vendor_completions.d`, `share/pwsh/completions` — formula
         // `prefix` is the keg during postinstall).

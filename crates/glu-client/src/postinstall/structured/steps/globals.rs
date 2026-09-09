@@ -35,12 +35,12 @@ impl HasPrefix for GlobalPostinstallContext<'_> {
     }
 }
 
-// Homebrew 4dacfe77: install_steps.rb:1507-1516 (run_formula_tool: resolves
+// Homebrew 7d2a02d2: install_steps.rb (run_formula_tool: resolves
 // `Utils::Path.formula_opt_bin(formula)/executable` and raises ArgumentError
 // unless it is executable). The per-type commands match upstream's
 // run_install_step cases for compile_gsettings_schemas / gio_querymodules /
 // gdk_pixbuf_query_loaders / update_mime_database / update_desktop_database
-// (install_steps.rb:1115-1133). Deferral/coalescing of these is a glu invention
+// (install_steps.rb). Deferral/coalescing of these is a glu invention
 // (see DEFERRABLE_GLOBAL_TYPES). `fontconfig_fc_cache` is glu-invented: it
 // intercepts formula `run` steps of fc-cache (see `global_kind_key`).
 pub(in crate::postinstall::structured) fn run_global(
@@ -58,8 +58,8 @@ pub(in crate::postinstall::structured) fn run_global(
             &["--update-cache".into()],
         ),
         "gtk_update_icon_cache" => {
-            // Homebrew 4dacfe77: install_steps.rb:1121-1129 — gtk4 chosen via
-            // `Utils::Path.formula_any_version_installed?("gtk4")` (utils/path.rb:128,
+            // Homebrew 7d2a02d2: install_steps.rb — gtk4 chosen via
+            // `Utils::Path.formula_any_version_installed?("gtk4")` (utils/path.rb,
             // any installed keg). glu: any keg dir under Cellar/gtk4 (glu kegs are
             // always installed); installed-but-unlinked gtk4 picks gtk4 and then
             // fails on the missing opt binary, same as upstream.
@@ -174,7 +174,7 @@ fn run_tool_stdout_to_path(
     Ok(())
 }
 
-// Homebrew 4dacfe77: install_steps.rb:1507-1516 (run_formula_tool) — upstream
+// Homebrew 7d2a02d2: install_steps.rb (run_formula_tool) — upstream
 // resolves `Utils::Path.formula_opt_bin(formula)/executable` and raises
 // ArgumentError unless it is executable. glu uses the same path and bails with
 // a clear error instead of a raw spawn failure.
@@ -241,11 +241,11 @@ fn run_tool(ctx: &impl HasPrefix, formula: &str, executable: &str, args: &[Strin
     }
 }
 
-// Homebrew 4dacfe77: install_steps.rb:812-814 (add_rebuild_action: path with
+// Homebrew 7d2a02d2: install_steps.rb (add_rebuild_action: path with
 // base :homebrew_prefix) — the coalescing key matches upstream's rebuild paths
 // (share/glib-2.0/schemas, lib/gio/modules, share/icons/hicolor, share/mime,
 // share/applications). `gdk_pixbuf_query_loaders` takes no path upstream
-// (install_steps.rb:566-570); matches.
+// (install_steps.rb); matches.
 pub(in crate::postinstall::structured) fn global_key(
     ctx: &PostinstallContext<'_>,
     typ: &str,

@@ -4,16 +4,10 @@ use serde_json::Value;
 
 use super::{base_paths::SUPPORTED_BASES, step_type};
 
-// Homebrew 4dacfe77: install_steps.rb:230-786 (DSL method names) +
-// :1105-1109 (Runner arms for the 2026-08 additions). This list is exactly
-// Homebrew's supported step types — no more, no less. Every type the DSL can
-// emit (31 in the DSL + the 3 added 2026-08: `configure_php`, `bootstrap_cpython`,
-// `bootstrap_pypy` at :776-786) plus NOTHING else: the `symlink_tree` type
-// string was retired from the Runner (install_steps.rb:1037 is now `when
-// "link_dir"` alone; the DSL method `symlink_tree` at :449 emits `link_dir`),
-// so glu rejects it too. No Homebrew type may be dropped and no glu-invented
-// type may be added; any future change here must be cross-checked against
-// install_steps.rb first.
+// Homebrew 7d2a02d2: install_steps.rb (DSL + Runner#run_install_step).
+// All 34 serialized step types, including deprecated names still accepted by
+// the Runner. The DSL's `symlink_tree` emits `link_dir`, not a new type.
+// Cross-check any additions/removals against upstream before changing this set.
 const SUPPORTED_TYPES: &[&str] = &[
     "mkdir",
     "mkdir_p",
@@ -37,9 +31,8 @@ const SUPPORTED_TYPES: &[&str] = &[
     "install_gzipped_executable",
     "configure_glibc_runtime",
     "configure_clang_system",
-    // Homebrew 4dacfe77: install_steps.rb:776-786 — added 2026-08 (PHP
-    // configuration, CPython bootstrap, PyPy bootstrap; implementations in
-    // formula_actions.rb:141/200/280). These are the structured successors of
+    // Homebrew 7d2a02d2: install_steps/formula_actions.rb (run_configure_php,
+    // run_bootstrap_cpython, run_bootstrap_pypy). These are the successors of
     // the removed `post_install` blocks. NOTE: `bootstrap_pypy` carries an
     // `abi_version` field in the JSON.
     "configure_php",

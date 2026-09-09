@@ -1,7 +1,7 @@
 use super::super::*;
 
-// Homebrew 4dacfe77: install_steps.rb:1266-1274 (run_set_permissions) +
-// 1404-1407 (existing_step_paths) — `chmod [-R] -- <permissions> <paths>`
+// Homebrew 7d2a02d2: install_steps.rb (run_set_permissions) +
+// (existing_step_paths) — `chmod [-R] -- <permissions> <paths>`
 // without sudo, skipping paths whose `.exist?` is false (including dangling
 // symlinks).
 pub(in crate::postinstall::structured) fn chmod_paths(
@@ -46,7 +46,7 @@ pub(in crate::postinstall::structured) fn chmod_paths(
     ))?;
     Ok(())
 }
-// Homebrew 4dacfe77: install_steps.rb:1276-1302 (run_set_ownership). Upstream:
+// Homebrew 7d2a02d2: install_steps.rb (run_set_ownership). Upstream:
 // per-path `Cask::Quarantine.app_management_permissions_granted?` (macOS App
 // Management privacy permission, cask/quarantine.rb) raising CaskError with
 // remediation when not granted; then `sudo chown [-R] -- user:group paths` with
@@ -108,7 +108,7 @@ pub(in crate::postinstall::structured) fn chown_paths(
     Ok(())
 }
 
-// Homebrew 4dacfe77: cask/quarantine.rb:211-272
+// Homebrew 7d2a02d2: cask/quarantine.rb
 // (app_management_permissions_granted?). Upstream returns true for
 // non-directories; otherwise computes whether the current user/group/mode looks
 // writable without sudo, then either performs a plain write probe or a sudo

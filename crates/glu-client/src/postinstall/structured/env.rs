@@ -102,7 +102,7 @@ fn is_sensitive_env_key(key: &OsString) -> bool {
     ) || homebrew_sensitive_env_key(&key)
 }
 
-// Homebrew 4dacfe77: extend/ENV/sensitive.rb:21 — clear any environment key
+// Homebrew 7d2a02d2: extend/ENV/sensitive.rb — clear any environment key
 // matching /(cookie|key|token|password|passphrase|auth)/i before formula
 // evaluation/postinstall. This is broader than just dynamic-loader hygiene and
 // preserves Homebrew compatibility better than an invented allowlist.
@@ -113,6 +113,8 @@ fn homebrew_sensitive_env_key(key: &str) -> bool {
         .any(|needle| lower.contains(needle))
 }
 
+// Homebrew 7d2a02d2: Formula#common_sandbox_env + PackageManagerCache.env.
+// Cache paths are glu-owned; Java's explicit temporary directory is retained.
 fn upsert_common_sandbox_env(
     prefix: &Prefix,
     home: &Path,
@@ -130,12 +132,39 @@ fn upsert_common_sandbox_env(
                 temp.display()
             ),
         ),
+        ("BUNDLE_GLOBAL_GEM_CACHE", "true".to_string()),
+        (
+            "BUNDLE_USER_CACHE",
+            format!("{}/bundler_cache", cache.display()),
+        ),
+        ("CABAL_DIR", format!("{}/cabal_cache", cache.display())),
+        (
+            "COMPOSER_CACHE_DIR",
+            format!("{}/composer_cache", cache.display()),
+        ),
+        ("GEM_SPEC_CACHE", format!("{}/gem_cache", cache.display())),
         ("GOCACHE", format!("{}/go_cache", cache.display())),
         ("GIT_CONFIG_GLOBAL", "/dev/null".to_string()),
         ("GIT_TERMINAL_PROMPT", "0".to_string()),
         ("GOENV", "off".to_string()),
         ("GOPATH", format!("{}/go_mod_cache", cache.display())),
         ("CARGO_HOME", format!("{}/cargo_cache", cache.display())),
+        ("HEX_HOME", format!("{}/hex_cache", cache.display())),
+        ("NPM_CONFIG_CACHE", format!("{}/npm_cache", cache.display())),
+        (
+            "NPM_CONFIG_STORE_DIR",
+            format!("{}/pnpm_cache", cache.display()),
+        ),
+        ("NUGET_PACKAGES", format!("{}/nuget_cache", cache.display())),
+        ("UV_CACHE_DIR", format!("{}/uv_cache", cache.display())),
+        (
+            "YARN_CACHE_FOLDER",
+            format!("{}/yarn_cache", cache.display()),
+        ),
+        (
+            "ZIG_GLOBAL_CACHE_DIR",
+            format!("{}/zig_cache", cache.display()),
+        ),
         ("BUNDLE_COOLDOWN", "1".to_string()),
         ("PIP_CACHE_DIR", format!("{}/pip_cache", cache.display())),
         ("PIP_CONFIG_FILE", "/dev/null".to_string()),
@@ -165,6 +194,53 @@ fn remove_env(vars: &mut Vec<(OsString, OsString)>, key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_manager_caches_override_inherited_locations() {
+        let prefix = Prefix(PathBuf::from("/opt/glustore"));
+        let caches = [
+            ("BUNDLE_USER_CACHE", "bundler_cache"),
+            ("CABAL_DIR", "cabal_cache"),
+            ("CARGO_HOME", "cargo_cache"),
+            ("COMPOSER_CACHE_DIR", "composer_cache"),
+            ("GEM_SPEC_CACHE", "gem_cache"),
+            ("GOCACHE", "go_cache"),
+            ("GOPATH", "go_mod_cache"),
+            ("HEX_HOME", "hex_cache"),
+            ("NPM_CONFIG_CACHE", "npm_cache"),
+            ("NPM_CONFIG_STORE_DIR", "pnpm_cache"),
+            ("NUGET_PACKAGES", "nuget_cache"),
+            ("PIP_CACHE_DIR", "pip_cache"),
+            ("UV_CACHE_DIR", "uv_cache"),
+            ("YARN_CACHE_FOLDER", "yarn_cache"),
+            ("ZIG_GLOBAL_CACHE_DIR", "zig_cache"),
+        ];
+        let mut vars = caches
+            .iter()
+            .map(|(key, _)| (OsString::from(key), OsString::from("/caller/cache")))
+            .collect::<Vec<_>>();
+        vars.push(("BUNDLE_GLOBAL_GEM_CACHE".into(), "false".into()));
+        upsert_common_sandbox_env(
+            &prefix,
+            Path::new("/tmp/home"),
+            Path::new("/tmp/temp"),
+            &mut vars,
+        );
+        for (key, dir) in caches {
+            let matches = vars.iter().filter(|(k, _)| k == key).collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1, "duplicate {key}");
+            assert_eq!(
+                matches[0].1,
+                prefix.0.join("var/glu/cache").join(dir).as_os_str(),
+                "{key}"
+            );
+        }
+        assert!(vars.contains(&("BUNDLE_GLOBAL_GEM_CACHE".into(), "true".into())));
+        assert!(vars.contains(&(
+            "_JAVA_OPTIONS".into(),
+            "-Duser.home=/opt/glustore/var/glu/cache/java_cache -Djava.io.tmpdir=/tmp/temp".into()
+        )));
+    }
 
     #[test]
     fn postinstall_path_prefers_system_tools_before_user_path() {

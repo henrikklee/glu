@@ -627,7 +627,7 @@ fn move_children_excludes_target_child_inside_source() {
     run_structured_postinstalls(&prefix, &package, &keg, None, false).unwrap();
 
     // The target child (inside the source) must not be moved into itself;
-    // siblings land inside it (install_steps.rb:986).
+    // siblings land inside it (install_steps.rb).
     assert!(share.join("icons").is_dir());
     assert_eq!(fs::read_to_string(share.join("icons/a")).unwrap(), "a");
     assert_eq!(fs::read_to_string(share.join("icons/b")).unwrap(), "b");
@@ -656,7 +656,7 @@ fn link_dir_skips_ds_store_preserves_real_dirs_and_links_relatively() {
 
     run_structured_postinstalls(&prefix, &package, &keg, None, false).unwrap();
 
-    // .DS_Store never linked (install_steps.rb:1042).
+    // .DS_Store never linked (install_steps.rb).
     assert!(!tgt.join(".DS_Store").exists());
     // Files become RELATIVE symlinks.
     let link = tgt.join("file");
@@ -664,7 +664,7 @@ fn link_dir_skips_ds_store_preserves_real_dirs_and_links_relatively() {
     assert!(!fs::read_link(&link).unwrap().is_absolute());
     assert_eq!(fs::read_to_string(&link).unwrap(), "f");
     // An existing real dir at the link target is PRESERVED, not replaced
-    // (install_steps.rb:1043), and its subtree still gets linked.
+    // (install_steps.rb), and its subtree still gets linked.
     assert!(tgt.join("sub").is_dir());
     assert!(!tgt.join("sub").is_symlink());
     assert_eq!(fs::read_to_string(tgt.join("sub/keep")).unwrap(), "k");
@@ -711,10 +711,10 @@ fn run_step_allow_failure_does_not_fail_install_and_skips_stdout_path() {
     let prefix = Prefix(tmp.path().join("prefix"));
     let keg = prefix.0.join("Cellar/fixture/1.2.3");
     fs::create_dir_all(&keg).unwrap();
-    // Homebrew 4dacfe77: install_steps.rb:1199-1220 — `allow_failure` is the
-    // JSON inverse of the DSL's `must_succeed` (install_steps.rb:697); when
+    // Homebrew 7d2a02d2: install_steps.rb — `allow_failure` is the
+    // JSON inverse of the DSL's `must_succeed` (install_steps.rb); when
     // true a non-zero exit does not fail the install and stdout_path is NOT
-    // written (only written on success, :1216-1219).
+    // written (only written on success).
     let package = package_with_steps(vec![json!({
         "type": "run",
         "command": {"path": "/bin/sh"},
@@ -743,7 +743,7 @@ fn run_step_allow_failure_does_not_fail_install_and_skips_stdout_path() {
 
 #[test]
 fn version_major_minor_matches_homebrew() {
-    // Homebrew 4dacfe77: version.rb:686-692 — tokens[0..1], single-component
+    // Homebrew 7d2a02d2: version.rb — tokens.first(2), single-component
     // versions yield that component.
     assert_eq!(version_major_minor("3.11.9").as_deref(), Some("3.11"));
     assert_eq!(version_major_minor("8.4.3").as_deref(), Some("8.4"));
@@ -952,14 +952,15 @@ fn expand_substitutes_user_and_version_tokens() {
             "{{version.major}}",
             "{{version.major_minor}}",
             "{{HOMEBREW_BREW_FILE}}",
-            "{{homebrew_prefix}}"
+            "{{homebrew_prefix}}",
+            "{{arch}}"
         ],
         "stdout_path": {"base": "prefix", "path": "out.txt"}
     })]);
 
     run_structured_postinstalls(&prefix, &package, &keg, None, false).unwrap();
 
-    // Homebrew 4dacfe77: install_steps.rb:1366-1402 — user / version.major /
+    // Homebrew 7d2a02d2: install_steps.rb — user / version.major /
     // version.major_minor / HOMEBREW_BREW_FILE substitute; homebrew_prefix is
     // NOT a content token upstream and passes through literally.
     let out = fs::read_to_string(keg.join("out.txt")).unwrap();
@@ -969,6 +970,8 @@ fn expand_substitutes_user_and_version_tokens() {
     assert_eq!(parts[2], "1.2");
     assert!(!parts[3].is_empty());
     assert_eq!(parts[4], "{{homebrew_prefix}}");
+    // Upstream expands arch only for cask contexts exposing an arch stanza.
+    assert_eq!(parts[5], "{{arch}}");
 }
 
 #[test]
@@ -987,7 +990,7 @@ fn completion_bases_are_keg_relative() {
         verbose: false,
         guards: RefCell::new(BTreeMap::new()),
     };
-    // Homebrew 4dacfe77: formula.rb:1401-1428 — keg-relative.
+    // Homebrew 7d2a02d2: formula.rb — keg-relative.
     assert_eq!(
         base_path(&ctx, "bash_completion", None),
         keg.join("etc/bash_completion.d")
@@ -1063,7 +1066,7 @@ fn if_exists_guard_ignores_dangling_symlinks() {
     let prefix = Prefix(tmp.path().join("prefix"));
     let keg = prefix.0.join("Cellar/fixture/1.2.3");
     fs::create_dir_all(&keg).unwrap();
-    // Homebrew 4dacfe77: path_spec_exists? = .any?(&:exist?) — a DANGLING
+    // Homebrew 7d2a02d2: path_spec_exists? = .any?(&:exist?) — a DANGLING
     // symlink does NOT satisfy if_exists (Pathname#exist? follows the link).
     std::os::unix::fs::symlink(keg.join("nonexistent"), keg.join("dangling")).unwrap();
     let package = package_with_steps(vec![json!({
@@ -1089,7 +1092,7 @@ fn terminate_process_swallows_no_match_failure_and_bails_on_must_succeed() {
     // matching processes belonging to you were found" on stderr.
     let name = format!("glu-no-such-process-{}", std::process::id());
 
-    // Homebrew 4dacfe77: install_steps.rb:1239-1251 — a nonzero exit is a
+    // Homebrew 7d2a02d2: install_steps.rb — a nonzero exit is a
     // non-fatal failure when `must_succeed` is false: retry, continue
     // silently (only a step `failure_message` would show, opoo-style). The
     // raw killall stderr is routine — the agent usually isn't running —
@@ -1100,7 +1103,7 @@ fn terminate_process_swallows_no_match_failure_and_bails_on_must_succeed() {
     })]);
     run_structured_postinstalls(&prefix, &package, &keg, None, false).unwrap();
 
-    // `must_succeed: true` (the step DSL flag, install_steps.rb:1250)
+    // `must_succeed: true` (the step DSL flag, install_steps.rb)
     // re-raises instead of swallowing — the install must fail.
     let package = package_with_steps(vec![json!({
         "type": "terminate_process",

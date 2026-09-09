@@ -1,6 +1,6 @@
 use super::*;
 
-// Utils::Inreplace.inreplace with a regexp (install_steps.rb:1026-1036 +
+// Utils::Inreplace.inreplace with a regexp (install_steps.rb +
 // utils/inreplace.rb): multi-line regexp replace-all with audit, atomic write,
 // and Ruby backref translation. Used by the configure_php / bootstrap_cpython
 // actions; regexp EXTENDED caveats are shared with `inreplace` below.
@@ -19,8 +19,8 @@ pub(super) fn inreplace_regexp_file(path: &Path, regexp: &str, replacement: &str
     Ok(())
 }
 
-// Homebrew 4dacfe77: install_steps.rb:1026-1036 (inreplace case) + utils/inreplace.rb
-// + utils/string_inreplace_extension.rb:26-45. Port notes:
+// Homebrew 7d2a02d2: install_steps.rb (inreplace case) + utils/inreplace.rb
+// + utils/string_inreplace_extension.rb. Port notes:
 // - File.binread → byte reads (`regex::bytes`), so binary files match byte-wise
 //   exactly like Ruby (verified: "\xFFab".gsub(/a/, "X") → "\xFFXb").
 // - Ruby gsub/sub replacement escapes (`\1`, `\&`, `\0`, `\k<name>`, `\\`,
@@ -97,7 +97,7 @@ pub(super) fn inreplace(ctx: &PostinstallContext<'_>, step: &Value) -> Result<()
     Ok(())
 }
 
-// Homebrew 4dacfe77: extend/file/atomic.rb — write to a random Tempfile in
+// Homebrew 7d2a02d2: extend/file/atomic.rb — write to a random Tempfile in
 // the same directory + rename, then restore original ownership/mode best-effort
 // (EPERM/EACCES ignored). Random same-dir temps avoid predictable-name symlink
 // races while preserving the atomic same-filesystem rename behavior.

@@ -1,6 +1,6 @@
 use super::super::*;
 
-// Homebrew 4dacfe77: install_steps.rb:1321-1356 (run_init_data_dir).
+// Homebrew 7d2a02d2: install_steps.rb (run_init_data_dir).
 // mysql/mariadb pass `--user=#{ENV.fetch("USER")}` upstream, so glu fails
 // closed when the per-context postinstall USER snapshot is absent. TMPDIR is
 // unset via run_command's env_remove (`with_env(TMPDIR: nil)` upstream).
@@ -72,9 +72,9 @@ pub(in crate::postinstall::structured) fn init_data_dir(
     };
     Ok(())
 }
-// Homebrew 4dacfe77: install_steps.rb:1221-1251 (run_terminate_process).
+// Homebrew 7d2a02d2: install_steps.rb (run_terminate_process).
 // match: :name → /usr/bin/killall <name>; :full → /usr/bin/pkill -f <name>
-// (install_steps.rb:1233-1236); sudo from step (1238); attempts retry with a
+// (install_steps.rb); sudo from step; attempts retry with a
 // 1s sleep, and must_succeed=false failures surface a notice then continue.
 // Provenance note: Homebrew `ohai`s the notices (stdout) with formatting;
 // glu writes them to captured worker stderr; the parent relays them through
@@ -96,7 +96,7 @@ pub(in crate::postinstall::structured) fn terminate_process(
         return Ok(());
     }
     let (command, args) = if step.get("match").and_then(Value::as_str) == Some("full") {
-        // Homebrew 4dacfe77: install_steps.rb:1233-1236 — full match →
+        // Homebrew 7d2a02d2: install_steps.rb — full match →
         // /usr/bin/pkill -f <name>; name match → /usr/bin/killall <name>.
         (
             PathBuf::from("/usr/bin/pkill"),
@@ -106,9 +106,9 @@ pub(in crate::postinstall::structured) fn terminate_process(
         (PathBuf::from("/usr/bin/killall"), vec![name.clone()])
     };
     let attempts = step.get("attempts").and_then(Value::as_u64).unwrap_or(1);
-    // Homebrew 4dacfe77: install_steps.rb:1238 — `sudo: step["sudo"] == true`.
+    // Homebrew 7d2a02d2: install_steps.rb — `sudo: step["sudo"] == true`.
     let sudo = step.get("sudo").and_then(Value::as_bool) == Some(true);
-    // Homebrew 4dacfe77: install_steps.rb:1239-1251 — `SystemCommand.run!`
+    // Homebrew 7d2a02d2: install_steps.rb — `SystemCommand.run!`
     // raises on nonzero exit and the rescue swallows it when `must_succeed` is
     // false. The raw killall stderr ("No matching processes belonging to you
     // were found") is routine — the agent usually isn't running — and is never
@@ -137,18 +137,18 @@ pub(in crate::postinstall::structured) fn terminate_process(
 /// Sets a dylib's install ID in-process (no `install_name_tool`) for the
 /// structured-postinstall `change_dylib_id` step, then ad-hoc re-signs the
 /// file. Step type and behavior mirror Homebrew's `InstallSteps.change_dylib_id`
-/// (install_steps.rb:27-36); the in-process Mach-O editing is glu's own
+/// (install_steps.rb); the in-process Mach-O editing is glu's own
 /// (`bottle/macho.rs`) instead of ruby-macho. `resolve_source`
 /// resolves the source path strictly when set.
 ///
-// Homebrew 4dacfe77: install_steps.rb:27-36 (InstallSteps.change_dylib_id).
+// Homebrew 7d2a02d2: install_steps.rb (InstallSteps.change_dylib_id).
 // Upstream uses ruby-macho in-process editing too — `MachO::Tools.change_dylib_id`
 // + `file.ensure_writable`, then `MachO.codesign! file if Hardware::CPU.arm?`.
 // glu's in-process Mach-O rewrite lives in bottle/macho.rs; ad-hoc signing
 // lives in bottle/codesign.rs.
 // PLATFORM (arm64 macOS, v0.1): Mach-O only, so macOS-only. The ad-hoc
 // re-sign below is arm64-compliant (Homebrew re-signs when
-// `Hardware::CPU.arm?`, install_steps.rb:33) — gated on `target_arch =
+// `Hardware::CPU.arm?`, install_steps.rb) — gated on `target_arch =
 // "aarch64"` so Intel macOS automatically stops re-signing, matching upstream.
 // Linux: N/A (no Mach-O bottles).
 // `MachO.codesign!` is ad-hoc signing for Homebrew's bottle use; glu uses
@@ -173,7 +173,7 @@ pub(in crate::postinstall::structured) fn change_dylib_id(
     if cfg!(target_arch = "aarch64")
         && crate::bottle::macho::header_layout(&data[..data.len().min(24)]).is_some()
     {
-        // Homebrew 4dacfe77: install_steps.rb:33 — re-sign only on arm64
+        // Homebrew 7d2a02d2: install_steps.rb — re-sign only on arm64
         // (`Hardware::CPU.arm?`); Intel macOS must NOT re-sign (PLATFORM marker).
         // The surrounding guard is the `file.ensure_writable` parity for both
         // the dylib-id rewrite and this re-sign, avoiding a second chmod cycle.
@@ -181,15 +181,15 @@ pub(in crate::postinstall::structured) fn change_dylib_id(
     }
     Ok(())
 }
-// Homebrew 4dacfe77: install_steps/formula_actions.rb:120-140
-// (run_configure_clang_system) + utils/clang.rb:14-31 (write_system_config_files).
+// Homebrew 7d2a02d2: install_steps/formula_actions.rb
+// (run_configure_clang_system) + utils/clang.rb (write_system_config_files).
 // PLATFORM (arm64 macOS, v0.1): macOS-only by construction (the cfg!
 // early-return below mirrors upstream's own guard,
-// formula_actions.rb:121 `return unless simulating_or_running_on_macos?`).
+// formula_actions.rb `return unless simulating_or_running_on_macos?`).
 // Intel: unchanged (still macOS; `uname -m` → x86_64 lands in the same arch
 // set upstream expects). Linux: N/A — upstream no-ops off macOS too.
-// Sysroot matches utils/clang.rb:17-21: macos_version is `MacOS.version`
-// (full version with patch stripped, os/mac.rb:32) and the sysroot is the
+// Sysroot matches utils/clang.rb: macos_version is `MacOS.version`
+// (full version with patch stripped, os/mac.rb) and the sysroot is the
 // versioned CLT SDK. Unknown kernel/macOS versions fail closed, matching
 // upstream's refusal to continue without a kernel version. Config files are
 // written atomically below, matching `Pathname#atomic_write`.
@@ -230,7 +230,7 @@ pub(in crate::postinstall::structured) fn configure_clang_system(
     if macos_full.is_empty() {
         bail!("configure_clang_system could not determine macOS version");
     }
-    // Homebrew 4dacfe77: MacOS.version (os/mac.rb:32) — strip the patch.
+    // Homebrew 7d2a02d2: MacOS.version (os/mac.rb) — strip the patch.
     let macos = strip_patch(&macos_full);
     let mut arches = BTreeSet::from([
         "arm64".to_string(),
@@ -253,7 +253,7 @@ pub(in crate::postinstall::structured) fn configure_clang_system(
     if names.iter().all(|name| config_dir.join(name).exists()) {
         return Ok(());
     }
-    // Homebrew 4dacfe77: utils/clang.rb:17-21 — versioned CLT SDK; the
+    // Homebrew 7d2a02d2: utils/clang.rb — versioned CLT SDK; the
     // "running newer than target" branch is dead since target == running here.
     let sdk = format!("/Library/Developer/CommandLineTools/SDKs/MacOSX{macos}.sdk");
     fs::create_dir_all(&config_dir)?;
@@ -268,9 +268,9 @@ pub(in crate::postinstall::structured) fn configure_clang_system(
 
 // ===== ports of the 2026-08 Homebrew step actions (install_steps/formula_actions.rb) =====
 
-// Homebrew 4dacfe77: version.rb:686-692 (Version#major_minor — tokens[0..1], a
+// Homebrew 7d2a02d2: version.rb (Version#major_minor — tokens.first(2), a
 // single-component version yields that component). Used by configure_php /
-// bootstrap_cpython via context_version_major_minor (install_steps.rb:1370-1374);
+// bootstrap_cpython via context_version_major_minor (install_steps.rb);
 // this is also what the missing `{{version.major_minor}}` token expands to.
 pub(in crate::postinstall::structured) fn version_major_minor(version: &str) -> Option<String> {
     let mut parts = version.split('.');
@@ -284,8 +284,8 @@ pub(in crate::postinstall::structured) fn version_major_minor(version: &str) -> 
     }
 }
 
-// Homebrew 4dacfe77: version.rb:656-659 (Version#major — tokens.first). Also
-// what the `{{version.major}}` token expands to (install_steps.rb:1367-1369).
+// Homebrew 7d2a02d2: version.rb (Version#major — tokens.first). Also
+// what the `{{version.major}}` token expands to (install_steps.rb).
 pub(in crate::postinstall::structured) fn version_major(version: &str) -> Option<String> {
     let major = version.split('.').next()?;
     if major.is_empty() {
@@ -295,7 +295,7 @@ pub(in crate::postinstall::structured) fn version_major(version: &str) -> Option
     }
 }
 
-// Homebrew 4dacfe77: Version#strip_patch (used by MacOS.version, os/mac.rb:32)
+// Homebrew 7d2a02d2: Version#strip_patch (used by MacOS.version, os/mac.rb)
 // — "15.7.9" → "15.7", "15.7" → "15.7", "15" → "15".
 fn strip_patch(version: &str) -> String {
     let parts = version.split('.').collect::<Vec<_>>();
@@ -339,7 +339,7 @@ fn glob_matches(pattern: &Path) -> Result<Vec<PathBuf>> {
     Ok(matches)
 }
 
-// Homebrew 4dacfe77: install_steps/formula_actions.rb:141-199 (run_configure_php).
+// Homebrew 7d2a02d2: install_steps/formula_actions.rb (run_configure_php).
 // Port notes: context_version_major_minor → version_major_minor;
 // `FileUtils.cp_r "#{pear_prefix}/.", pear_path` is a contents copy via
 // `copy_entry_contents`; FileUtils.chmod/touch are exact-mode chmod /
@@ -478,10 +478,10 @@ pub(in crate::postinstall::structured) fn configure_php(
     Ok(())
 }
 
-// Homebrew 4dacfe77: install_steps/formula_actions.rb:200-279 (run_bootstrap_cpython).
+// Homebrew 7d2a02d2: install_steps/formula_actions.rb (run_bootstrap_cpython).
 // Port notes: ENV.delete("PYTHONPATH") is applied to every child process via
 // run_command's env_remove; lib_cellar is the frameworks path on macOS
-// (formula_actions.rb:205-210, SimulateSystem — glu is macOS-only in v0.1, the
+// (formula_actions.rb, SimulateSystem — glu is macOS-only in v0.1, the
 // linux branch is kept for parity); install_symlink → relative
 // create_relative_symlink; Dir[] globs → remove_glob_quiet; Utils::Inreplace →
 // inreplace_regexp_file. PLATFORM (arm64 macOS, v0.1): python is macOS-installable,
@@ -594,7 +594,7 @@ pub(in crate::postinstall::structured) fn bootstrap_cpython(
     )?;
 
     // make_cpython_venv_activation_scripts_writable(lib_cellar): chmod u+w on
-    // lib_cellar/venv/scripts/**/* files (formula_actions.rb:275-278).
+    // lib_cellar/venv/scripts/**/* files (formula_actions.rb).
     for entry in glob_matches(&lib_cellar.join("venv/scripts/**/*"))? {
         if entry.is_file() {
             let mode = fs::metadata(&entry)?.permissions().mode();
@@ -645,7 +645,7 @@ pub(in crate::postinstall::structured) fn bootstrap_cpython(
     Ok(())
 }
 
-// Homebrew 4dacfe77: install_steps/formula_actions.rb:280-331
+// Homebrew 7d2a02d2: install_steps/formula_actions.rb
 // (run_bootstrap_pypy(abi_version)). Port notes: the module-import probe runs
 // with must_succeed=false (@command.run, failures ignored); archives are
 // extracted with the `tar` crate (UnpackStrategy.detect for .tar.gz,
@@ -785,7 +785,7 @@ pub(in crate::postinstall::structured) fn bootstrap_pypy(
     Ok(())
 }
 
-// Homebrew 4dacfe77: install_steps/formula_actions.rb:66-88
+// Homebrew 7d2a02d2: install_steps/formula_actions.rb
 // (run_install_gzipped_executable). Upstream `Zlib::GzipReader` reads one gzip
 // member and `target.chmod 0755` sets the mode exactly; `flate2::read::GzDecoder`
 // and `chmod_mode(0o755)` match those semantics.

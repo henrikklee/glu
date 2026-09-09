@@ -1,6 +1,6 @@
 use super::{base_paths::resolve_base_path, base_paths::BasePathContext, *};
 
-// Homebrew 4dacfe77: install_steps.rb:1482-1492 (resolve_path) — blank/
+// Homebrew 7d2a02d2: install_steps.rb (resolve_path) — blank/
 // `absolute` bases call `Pathname#expand_path`, while `relative` stays raw and
 // all other bases join against `root_path`.
 pub(super) fn path(ctx: &PostinstallContext<'_>, spec: &Value) -> Result<PathBuf> {
@@ -31,7 +31,7 @@ pub(super) fn expand_absolute_path(ctx: &PostinstallContext<'_>, value: &str) ->
     }
 }
 
-// Homebrew 4dacfe77: install_steps.rb:1493-1499 (resolve_command).
+// Homebrew 7d2a02d2: install_steps.rb (resolve_command).
 // Upstream leaves blank/`relative` commands as raw strings and routes
 // everything else through `resolve_path`. A `path`/`search_path` command base
 // would RAISE "unknown install step base" upstream; glu rejects those bases in
@@ -48,8 +48,8 @@ pub(super) fn command_path(ctx: &PostinstallContext<'_>, spec: &Value) -> Result
     path(ctx, spec)
 }
 
-// Homebrew 4dacfe77: install_steps.rb:1426-1444 (expand_path_glob).
-// `path` is normalized to `search_path` upstream; `search_path` is glu's
+// Homebrew 7d2a02d2: install_steps.rb (expand_path_glob).
+// `path` is normalized to `search_path` upstream; glu uses the same
 // protocol name for PATH lookup. Upstream only invokes globbing when the final
 // candidate string contains one of `[?*[{]`; no-glob PATH candidates are
 // returned unconditionally and later consumers decide whether existence matters.
@@ -187,15 +187,14 @@ pub(super) fn split_brace_arms(inner: &str) -> Vec<&str> {
     arms
 }
 
-// Homebrew 4dacfe77: install_steps.rb:1517-1533 (root_path) + 1535-1543
-// (context_path) + 1544-1555 (formula_base), backed by Formula path methods
-// (formula.rb:1067 rack, 1164 libexec, 1314 pkgshare, 1338 frameworks, 1357
-// etc, 1366 pkgetc, 1374 var, 1401 bash_completion, 1410 zsh_completion, 1419
-// fish_completion, 1428 pwsh_completion, 1508 opt_prefix, 1550 opt_pkgshare).
+// Homebrew 7d2a02d2: install_steps.rb (root_path, context_path, formula_base),
+// backed by Formula path methods (rack, libexec, pkgshare, frameworks,
+// etc, pkgetc, var, bash_completion, zsh_completion,
+// fish_completion, pwsh_completion, opt_prefix, opt_pkgshare).
 // Provenance notes: `bash_completion`/`zsh_completion`/`fish_completion`/
-// `pwsh_completion` resolve keg-relative, matching formula.rb:1401-1428.
-// `staged_path`/`appdir`/`caskroom_path` are Cask DSL bases (cask/dsl.rb:683)
-// that Homebrew's formula Runner rejects (install_steps.rb:1538); glu keeps
+// `pwsh_completion` resolve keg-relative, matching formula.rb.
+// `staged_path`/`appdir`/`caskroom_path` are Cask DSL bases (cask/dsl.rb)
+// that Homebrew's formula Runner rejects (install_steps.rb); glu keeps
 // them only because the protocol declares the accepted base vocabulary.
 // `search_path` is handled in `expand_glob`; `home`/`temp` use glu's fresh
 // per-context postinstall env.
@@ -224,7 +223,7 @@ pub(super) fn base_path(
 /// base table in `base_paths.rs`; a token missing here silently passes through
 /// as a literal `{{...}}` string into whatever command consumes it (this is what
 /// broke on `{{pkgshare}}`).
-// Homebrew 4dacfe77: install_steps.rb:876-890 (CONTENT_PATH_TOKENS) — this list
+// Homebrew 7d2a02d2: install_steps.rb (CONTENT_PATH_TOKENS) — this list
 // must match it exactly: the tokens `expand` substitutes in free-form
 // args/content. `{{user}}`, `{{version.major}}`, `{{version.major_minor}}` and
 // `{{HOMEBREW_BREW_FILE}}` are handled directly in `expand` (they are not path
@@ -255,7 +254,7 @@ pub(super) const EXPAND_BASE_TOKENS: &[&str] = &[
     "pwsh_completion",
 ];
 
-// Homebrew 4dacfe77: install_steps.rb:1358-1402 (expand_template_tokens /
+// Homebrew 7d2a02d2: install_steps.rb (expand_template_tokens /
 // template_token_value). Unknown tokens pass through verbatim in both
 // implementations. `user` → $USER (upstream ENV.fetch("USER"), raises if
 // unset — glu passes empty); `HOMEBREW_BREW_FILE` → the glu binary itself
@@ -297,10 +296,10 @@ pub(super) fn expand(ctx: &PostinstallContext<'_>, text: &str) -> String {
 // PLATFORM: `on` guards resolve against the COMPILE-TIME target; v0.1 builds
 // are macOS (arm64 or Intel — same result). Intel: unchanged (still macOS).
 // Linux: works via `target_os = "linux"`, but note Homebrew also honours
-// `--simulate-macos`/`--simulate-linux` (SimulateSystem, install_steps.rb:1188-1189)
+// `--simulate-macos`/`--simulate-linux` (SimulateSystem, install_steps.rb)
 // which glu has no equivalent for.
-// Homebrew 4dacfe77: install_steps.rb:1178-1198 (step_guards_match? /
-// guard_matches?) + 1445-1448 (path_spec_exists?). Guard results are memoized
+// Homebrew 7d2a02d2: install_steps.rb (step_guards_match? /
+// guard_matches? / path_spec_exists?). Guard results are memoized
 // per run (@guard_results) keyed by the guard spec's canonical JSON; a DANGLING
 // SYMLINK does not satisfy `if_exists` upstream (Pathname#exist? follows the
 // link). The `on` guard matches upstream modulo `SimulateSystem`

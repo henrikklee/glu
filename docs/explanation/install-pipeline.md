@@ -81,7 +81,13 @@ It owns:
 - ad-hoc signing of mutated Mach-O files;
 - fail-closed checks for unresolved relocation bytes.
 
-Prepare can run before runtime dependencies are committed because prepared files are not installed state and are not public prefix state.
+Prepare can run before runtime dependencies are committed because prepared files are not installed state and are not public prefix state. Postinstall workers cannot write to the staging tree or downloaded artifact storage, including through symlink aliases or by renaming their ancestors.
+
+The relocation machinery supports shorter, equal and longer prefixes wherever the file representation permits; the v0.1 production fixed-cellar gate is a separate policy, not a reason to remove that capability. Text can resize and Mach-O load commands can grow into available header padding. Fixed-size embedded binary strings retain their existing capacity limit: they can be shortened or rewritten at equal length, but cannot grow without a format-aware relocation mechanism.
+
+Fixed-prefix relocation retains glu's equal-length, in-place fast path, preserving binary offsets and serialized string lengths. With unequal prefixes, only plausible C strings are relocation candidates (valid UTF-8, at most 16 KiB, no control characters except tab, newline and carriage return), following Homebrew's snapshot-corruption fix. Opaque binary chunks stay unchanged and do not count as missing relocations. Mutation and leftover validation share that predicate; unresolved placeholders and remaining eligible build-prefix strings still fail validation. Binary data is not sent through the text resizer merely because its first NUL lies beyond 8 KiB. ELF files retain the existing shortening path rather than being refused as a class.
+
+Legacy absolute symlinks into the bottle's build prefix are converted to relative links in final installed coordinates during extraction. Relative and external symlinks are preserved; extraction never follows them.
 
 Extraction and code-signing writes share one install-wide writer pool and memory budget. Signing workers compute the canonical signed Mach-O bytes, compare them with the relocated staged file, and enqueue only changed load-command and signature ranges. This preserves the signer's exact output without rewriting unchanged executable code pages or bypassing the filesystem concurrency limit.
 
@@ -109,7 +115,11 @@ Package-local postinstall runs during commit, after package files are visible an
 
 Postinstall is structured. The client validates supported step types before execution and refuses unsupported manual Ruby postinstall behavior.
 
-Execution happens through a sandboxed worker model on macOS. The generated profile denies writes by default, then permits the package, prefix, temporary, cache, and setup locations required for compatibility. The worker uses a temporary `HOME`, a system-first `PATH`, and Homebrew-compatible filtering of credential-like and dynamic-loader environment keys.
+Execution happens through a sandboxed worker model on macOS. The generated profile denies writes by default, then permits the package, prefix, temporary, cache, and setup locations required for compatibility. Installer-owned `var/glu` data is protected, with writable exceptions for logs and language caches; downloaded artifacts remain protected inside the cache directory. The declaration, package receipts and their containing directory names are protected too. Sandbox paths use canonical filesystem names, including when the final directory does not exist yet.
+
+The worker uses a temporary `HOME`, a system-first `PATH`, and Homebrew-compatible filtering of credential-like and dynamic-loader environment keys. Package-manager cache variables override inherited locations with directories under `var/glu/cache`, including npm, pnpm, uv, Bundler, Cargo, Go, Java, Cabal, Composer, RubyGems, Hex, NuGet, pip, Yarn and Zig.
+
+The implementation is reviewed against Homebrew/brew `7d2a02d22aa174b891f7a631d6ce9aecfe643352` (2026-09-09). All 34 serialized step types remain supported. Cask-specific architecture tokens and privileged-step brokering do not change formula execution. Deriving formula network policy during registry ingestion remains out of scope; an omitted policy still defaults to allowed.
 
 This is a write-confinement and correctness boundary, not a confidentiality boundary for malicious package code. Compatibility exceptions can leave non-enumerated home paths readable, environment filtering is not a complete secret allowlist, caller `PATH` entries remain available after system paths, and network access follows package metadata with Homebrew's allow-by-default fallback.
 
@@ -117,7 +127,7 @@ This is a write-confinement and correctness boundary, not a confidentiality boun
 
 Some postinstall work updates shared global caches. Running those rebuilds once per package is slow and produces unnecessary repeated writes.
 
-The postinstall subsystem can defer compatible global-cache requests, group contributors, and run a coalesced cache rebuild after all contributing packages are ready.
+The postinstall subsystem can defer compatible global-cache requests, group contributors, and run a coalesced cache rebuild after all contributing packages are ready. Deferred workers intentionally retain broad prefix write access: public cache paths can resolve through symlinks into another package's installed directory. The same installer-state exceptions described above still apply; broad access does not include staging, downloaded artifacts or receipts.
 
 This localizes complexity: package formulas express setup needs, postinstall planning turns those needs into package-local work plus efficient shared work, and the rest of the installer sees only DAG nodes and edges.
 

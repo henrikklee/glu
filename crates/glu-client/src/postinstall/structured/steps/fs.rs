@@ -1,8 +1,8 @@
 use super::super::*;
 
-// Homebrew 4dacfe77: install_steps.rb:990-1003 (copy case) + 1421-1424
+// Homebrew 7d2a02d2: install_steps.rb (copy case) +
 // (step_destination). Non-recursive overwrite is IN-PLACE (`FileUtils.cp` —
-// inode/mode preserved); a SYMLINK destination is removed first (rm_f, :997);
+// inode/mode preserved); a SYMLINK destination is removed first (rm_f);
 // Errno::EEXIST when `!overwrite` and the destination exists (exist? follows
 // symlinks). Recursive is `FileUtils.cp_r ... remove_destination:` and uses
 // FileUtils.copy_entry semantics: preserve file types, keep symlinks as
@@ -37,18 +37,18 @@ pub(in crate::postinstall::structured) fn copy_path(
 
 /// errno for cross-device link — rename(2) fails with EXDEV when source and
 /// destination live on different filesystems. 18 on both macOS and Linux;
-/// matches FileUtils.mv's `rescue Errno::EXDEV` (fileutils.rb:531).
+/// matches FileUtils.mv's `rescue Errno::EXDEV` (fileutils.rb).
 const EXDEV: i32 = 18;
 
-// Homebrew 4dacfe77: install_steps.rb:968-972 (`FileUtils.mv source, target,
+// Homebrew 7d2a02d2: install_steps.rb (`FileUtils.mv source, target,
 // force: step["force"] == true`), implemented against ruby 2.6 fileutils.rb
-// :509-538 (`mv`) + :1563-1578 (`fu_each_src_dest0`):
+// (`mv` + `fu_each_src_dest0`):
 // - dir target → destination = target/<basename> (File.directory? follows symlinks)
 // - an existing destination errors only when it is a real DIRECTORY (lstat,
-//   fileutils.rb:524-527 → Errno::EEXIST); an existing file/symlink is silently
+//   fileutils.rb → Errno::EEXIST); an existing file/symlink is silently
 //   replaced by rename(2)
-// - EXDEV (cross-device) → copy + remove source (fileutils.rb:531-535)
-// - upstream `force:` only suppresses SystemCallError (fileutils.rb:537); glu
+// - EXDEV (cross-device) → copy + remove source (fileutils.rb)
+// - upstream `force:` only suppresses SystemCallError (fileutils.rb); glu
 //   always surfaces errors (postinstall failures fail the install per spec), so
 //   `force` is intentionally not threaded through.
 pub(in crate::postinstall::structured) fn move_path(source: &Path, target: &Path) -> Result<()> {
@@ -81,7 +81,7 @@ pub(in crate::postinstall::structured) fn move_path(source: &Path, target: &Path
     Ok(())
 }
 
-// Homebrew 4dacfe77: install_steps.rb:1004-1025 (remove case).
+// Homebrew 7d2a02d2: install_steps.rb (remove case).
 // Compatibility: `sudo` is implemented (see the per-path logic below),
 // including the `"if_needed"` non-writable-parent escalation. glu omits the
 // `Cask::Utils.gain_permissions` chflags/chmod/chown retry escalation
@@ -124,7 +124,7 @@ pub(in crate::postinstall::structured) fn remove_step(
         if !(p.exists() || p.is_symlink()) {
             continue;
         }
-        // Homebrew 4dacfe77: install_steps.rb:1015-1021 — sudo when
+        // Homebrew 7d2a02d2: install_steps.rb — sudo when
         // `step["sudo"] == true` or `"if_needed"` on a non-writable parent
         // (`path.dirname.writable?` = access(W_OK)); `Cask::Utils.gain_permissions_remove`
         // (cask/utils.rb) then removes plainly when the parent is writable, else
@@ -153,7 +153,7 @@ pub(in crate::postinstall::structured) fn remove_step(
     }
     Ok(())
 }
-// Homebrew 4dacfe77: install_steps.rb:1037-1051 (link_dir case) — walk mirrors
+// Homebrew 7d2a02d2: install_steps.rb (link_dir case) — walk mirrors
 // `source_dir.find` (depth-first pre-order, does not follow symlinked dirs);
 // per-entry semantics in `link_dir_entry`.
 pub(in crate::postinstall::structured) fn link_dir_step(
@@ -164,7 +164,7 @@ pub(in crate::postinstall::structured) fn link_dir_step(
     let target = path(ctx, req(step, "target")?)?;
     link_dir_tree(&source, &target)
 }
-// Homebrew 4dacfe77: install_steps.rb:1052-1059 (link_children: each direct
+// Homebrew 7d2a02d2: install_steps.rb (link_children: each direct
 // child linked into target_dir with prefix/suffix, RELATIVE symlinks via
 // `install_symlink`, ln_sf force semantics).
 pub(in crate::postinstall::structured) fn link_children_step(
@@ -192,7 +192,7 @@ pub(in crate::postinstall::structured) fn link_children_step(
     }
     Ok(())
 }
-// Homebrew 4dacfe77: install_steps.rb:1060-1075 (symlink case) + 1253-1265
+// Homebrew 7d2a02d2: install_steps.rb (symlink case) +
 // (create_symlink). Matches upstream's flow: glob → multi/`target.directory?`
 // fan-out vs single, `link_source` for non-glob, sudo/`if_needed` via
 // `/bin/ln -s`, and `FileUtils.rm_f` file/symlink-only force semantics.
@@ -231,8 +231,8 @@ pub(in crate::postinstall::structured) fn symlink_step(
     )
 }
 
-// Homebrew 4dacfe77: ruby 2.6 fileutils.rb:448-455 (cp_r) + 474-482
-// (copy_entry) + 1350-1391/1393-1420 (Entry_#copy/copy_metadata). Used for
+// Homebrew 7d2a02d2: install_steps.rb (copy case). FileUtils cp_r /
+// copy_entry / Entry_#copy/copy_metadata behavior was ported from Ruby 2.6. Used for
 // recursive `copy`, PHP's `cp_r "src/.", dest` contents copy, and `mv` EXDEV
 // fallback. This preserves file TYPES for recursive copies (notably symlinks),
 // unlinks file/symlink destinations under `remove_destination`, and preserves
@@ -397,7 +397,7 @@ pub(in crate::postinstall::structured) fn chown_path(
     }
 }
 
-// Homebrew 4dacfe77: install_steps.rb:1037-1051 (link_dir walk). Depth-first
+// Homebrew 7d2a02d2: install_steps.rb (link_dir walk). Depth-first
 // pre-order like `source_dir.find`; does not descend into symlinked dirs
 // (Ruby Find does not follow symlinks).
 fn link_dir_tree(source: &Path, target: &Path) -> Result<()> {
@@ -413,9 +413,9 @@ fn link_dir_tree(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-// Homebrew 4dacfe77: install_steps.rb:1037-1051 — one `find` entry:
-// skip .DS_Store (:1042); leave existing real dirs (:1043); rm_f files/symlinks
-// (:1045); install_symlink files/symlinks / mkpath dirs (:1046-1049).
+// Homebrew 7d2a02d2: install_steps.rb — one `find` entry:
+// skip .DS_Store; leave existing real dirs; rm_f files/symlinks
+// before install_symlink files/symlinks / mkpath dirs.
 fn link_dir_entry(source: &Path, link_target: &Path) -> Result<()> {
     if source
         .file_name()
@@ -438,7 +438,7 @@ fn link_dir_entry(source: &Path, link_target: &Path) -> Result<()> {
     Ok(())
 }
 
-// Homebrew 4dacfe77: extend/pathname.rb:502-509 (install_symlink_p): mkpath
+// Homebrew 7d2a02d2: extend/pathname.rb (install_symlink_p): mkpath
 // the link's parent, realpath it (dstdir), expand the source against dstdir,
 // resolve the source's dirname via realpath when it exists, then create a
 // RELATIVE symlink at dstdir/<basename> with ln_sf (force) semantics.
@@ -473,7 +473,7 @@ pub(in crate::postinstall::structured) fn create_relative_symlink(
 }
 
 // Lexical relative path from directory `from` to `to` (both absolute) — the
-// equivalent of Pathname#relative_path_from (extend/pathname.rb:508).
+// equivalent of Pathname#relative_path_from (extend/pathname.rb).
 fn relative_path(from: &Path, to: &Path) -> PathBuf {
     let from_c: Vec<Component<'_>> = from.components().collect();
     let to_c: Vec<Component<'_>> = to.components().collect();
@@ -487,7 +487,7 @@ fn relative_path(from: &Path, to: &Path) -> PathBuf {
     }
     out
 }
-// Homebrew 4dacfe77: install_steps.rb:1253-1265 (create_symlink). Upstream:
+// Homebrew 7d2a02d2: install_steps.rb (create_symlink). Upstream:
 // `target.dirname.mkpath`; then when `step["sudo"] == true` or
 // `"if_needed"` on a non-writable parent → `sudo /bin/ln -s [-f]`; else
 // `FileUtils.rm_f target if force` (files/symlinks only — a real dir target is
@@ -529,7 +529,7 @@ fn path_cstring(path: &Path) -> io::Result<std::ffi::CString> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))
 }
 
-// Homebrew 4dacfe77: Pathname#writable? = File.writable? = access(path, W_OK).
+// Homebrew 7d2a02d2: Pathname#writable? = File.writable? = access(path, W_OK).
 fn dir_writable(dir: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -566,7 +566,7 @@ pub(in crate::postinstall::structured) fn remove_any(path: &Path) -> Result<()> 
     }
     Ok(())
 }
-// Homebrew 4dacfe77: install_steps.rb:1213-1223 (resolve_step_source) — glob
+// Homebrew 7d2a02d2: install_steps.rb (resolve_step_source) — glob
 // results deduped (.uniq) before the exactly-one check; error names the path.
 pub(in crate::postinstall::structured) fn single_source(
     ctx: &PostinstallContext<'_>,
@@ -588,7 +588,7 @@ pub(in crate::postinstall::structured) fn single_source(
     path(ctx, req(step, "source")?)
 }
 
-// Homebrew 4dacfe77: install_steps.rb:1500-1506 (link_source) — `relative`
+// Homebrew 7d2a02d2: install_steps.rb (link_source) — `relative`
 // specs link the raw template-expanded path, everything else resolves like a
 // path. Matches (modulo the `~`/empty-base gap noted on `path`).
 fn link_source(ctx: &PostinstallContext<'_>, spec: &Value) -> Result<String> {

@@ -89,7 +89,7 @@ impl std::fmt::Display for NoticedPostinstallFailure {
 
 impl std::error::Error for NoticedPostinstallFailure {}
 
-// Homebrew 4dacfe77: system_command.rb (SystemCommand.run / run!) — the
+// Homebrew 7d2a02d2: system_command.rb (SystemCommand.run / run!) — the
 // equivalent of glu's spawn. Sudo mirrors Homebrew's `/usr/bin/sudo ... -E --`
 // shape, including SUDO_ASKPASS `-A` and the nested
 // HOMEBREW_SUDO_THROUGH_SUDO_USER path. Non-sudo children reset real UID to the
