@@ -482,12 +482,6 @@ fn runtime_cli_error(error: &anyhow::Error) -> CliError {
                 operation: interrupted.operation.to_string(),
             })),
         )
-    } else if let Some(planning) =
-        error.downcast_ref::<glu_client::error::RegistryPlanningFailure>()
-    {
-        let mut error = runtime_cli_error(&planning.source);
-        error.message = planning.to_string();
-        error
     } else if let Some(partial) = error.downcast_ref::<glu_client::install::PartialInstallFailure>()
     {
         CliError::runtime(
@@ -556,14 +550,6 @@ fn runtime_error_is_interrupted(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<glu_client::error::InterruptedError>()
         .is_some()
-        || error
-            .downcast_ref::<glu_client::error::RegistryPlanningFailure>()
-            .is_some_and(|failure| {
-                failure
-                    .source
-                    .downcast_ref::<glu_client::error::InterruptedError>()
-                    .is_some()
-            })
 }
 
 fn failure_exit_class(error: &CliFailure) -> ExitClass {

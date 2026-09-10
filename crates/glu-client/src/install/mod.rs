@@ -11,7 +11,6 @@ use crate::{
         summary::InstallTimingSummary,
     },
     postinstall::structured::PostinstallPlans,
-    registry::resolve_client::HttpResolveClient,
     state::Declaration,
     state::{snapshot::StateSnapshot, store::InstalledStateStore},
     trace::writer::write_install_trace,
@@ -1169,90 +1168,23 @@ struct ResolveManifestTiming {
     diagnostics: crate::registry::resolve_client::RegistryRequestDiagnostics,
 }
 
-struct ResolutionTraceRecorder {
-    prefix: glu_core::Prefix,
-    plan_name: String,
-    client: HttpResolveClient,
-}
-
-impl ResolutionTraceRecorder {
-    fn new(client: HttpResolveClient, prefix: glu_core::Prefix, names: &[PackageSelector]) -> Self {
-        Self {
-            prefix,
-            plan_name: names
-                .iter()
-                .map(|name| name.0.as_str())
-                .collect::<Vec<_>>()
-                .join("+"),
-            client,
-        }
-    }
-
-    fn write_failure(&self, error: &anyhow::Error) -> Option<PathBuf> {
-        self.write("failed", Some(error.to_string()))
-    }
-
-    fn write(&self, status: &str, error: Option<String>) -> Option<PathBuf> {
-        let trace = serde_json::json!({
-            "schema_version": 3,
-            "status": status,
-            "error": error,
-            "plan": self.plan_name,
-            "nodes": [],
-            "edges": [],
-            "events": [],
-            "diagnostics": {
-                "registry_requests": self.client.diagnostics(),
-            },
-        });
-        write_install_trace(&self.prefix, &self.plan_name, &trace)
-            .ok()
-            .map(|written| written.path)
-    }
-}
-
 async fn resolve_manifest_timed(
     client: &GluClient,
     names: Vec<PackageSelector>,
 ) -> Result<(glu_core::InstallManifest, ResolveManifestTiming)> {
     let resolve = client.registry_client()?;
-    let trace_recorder =
-        ResolutionTraceRecorder::new(resolve.clone(), client.config().prefix.clone(), &names);
     let registry_started = std::time::Instant::now();
-    let manifest = match resolve
+    let manifest = resolve
         .resolve(&ResolveRequest {
             names,
             target: client.config().target.clone(),
         })
-        .await
-    {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            if let Some(trace_path) = trace_recorder.write_failure(&error) {
-                return Err(crate::error::RegistryPlanningFailure {
-                    trace_path,
-                    source: error,
-                }
-                .into());
-            }
-            return Err(error);
-        }
-    };
+        .await?;
     let registry_seconds = registry_started.elapsed().as_secs_f64();
     let diagnostics = resolve.diagnostics();
     let validation_started = std::time::Instant::now();
-    if let Err(error) = planner::validate_manifest(&manifest)
-        .and_then(|_| validate_client_support(&manifest, &client.config().prefix))
-    {
-        if let Some(trace_path) = trace_recorder.write_failure(&error) {
-            return Err(crate::error::RegistryPlanningFailure {
-                trace_path,
-                source: error,
-            }
-            .into());
-        }
-        return Err(error);
-    }
+    planner::validate_manifest(&manifest)?;
+    validate_client_support(&manifest, &client.config().prefix)?;
 
     Ok((
         manifest,
@@ -2210,7 +2142,7 @@ mod interrupted_install_tests {
 
     #[cfg(feature = "dev-registry")]
     #[tokio::test(flavor = "current_thread")]
-    async fn failed_preplan_resolution_writes_retry_diagnostics() {
+    async fn failed_preplan_resolution_does_not_write_trace() {
         let _serial = FAULT_TEST_LOCK.lock().await;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -2246,22 +2178,15 @@ mod interrupted_install_tests {
             .unwrap_err();
         server.join().unwrap();
 
-        let failure = error
-            .downcast_ref::<crate::error::RegistryPlanningFailure>()
-            .expect("planning failure retains trace path");
-        let trace: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&failure.trace_path).unwrap()).unwrap();
-        assert_eq!(trace["status"], "failed");
-        assert!(trace["nodes"].as_array().unwrap().is_empty());
-        let retry = &trace["diagnostics"]["registry_requests"]["retries"][0];
-        assert_eq!(retry["operation"], "resolve");
-        assert_eq!(retry["status"], 522);
-        assert_eq!(retry["backoff_seconds"], 0.0);
+        assert!(error
+            .downcast_ref::<crate::error::RegistryDecodeFailure>()
+            .is_some());
+        assert!(!prefix.0.join("var/glu/traces").exists());
     }
 
     #[cfg(feature = "dev-registry")]
     #[tokio::test(flavor = "current_thread")]
-    async fn cancelled_preplan_resolution_writes_a_typed_failure_trace() {
+    async fn cancelled_preplan_resolution_preserves_typed_error_without_trace() {
         let _serial = FAULT_TEST_LOCK.lock().await;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -2293,20 +2218,11 @@ mod interrupted_install_tests {
             .unwrap_err();
         server.join().unwrap();
 
-        let failure = error
-            .downcast_ref::<crate::error::RegistryPlanningFailure>()
-            .expect("cancellation retains trace path");
-        assert!(failure
-            .source
+        let interrupted = error
             .downcast_ref::<crate::error::InterruptedError>()
-            .is_some());
-        let trace: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&failure.trace_path).unwrap()).unwrap();
-        assert_eq!(trace["status"], "failed");
-        assert!(trace["error"]
-            .as_str()
-            .unwrap()
-            .contains("interrupted while waiting for the registry"));
+            .expect("cancellation retains its typed error");
+        assert!(interrupted.trace_path.is_none());
+        assert!(!client.config().prefix.0.join("var/glu/traces").exists());
     }
 
     #[tokio::test(flavor = "current_thread")]

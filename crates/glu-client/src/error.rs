@@ -57,29 +57,6 @@ impl std::fmt::Display for InterruptedError {
 
 impl std::error::Error for InterruptedError {}
 
-#[derive(Debug)]
-pub struct RegistryPlanningFailure {
-    pub trace_path: std::path::PathBuf,
-    pub source: anyhow::Error,
-}
-
-impl std::fmt::Display for RegistryPlanningFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "{}\nTrace: {}",
-            self.source,
-            self.trace_path.display()
-        )
-    }
-}
-
-impl std::error::Error for RegistryPlanningFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.source.as_ref())
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct RegistryFailure {

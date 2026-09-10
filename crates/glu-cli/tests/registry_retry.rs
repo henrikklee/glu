@@ -11,7 +11,60 @@ use std::{
 };
 
 #[test]
-fn sigint_during_registry_request_exits_promptly_and_keeps_trace() {
+fn unknown_package_has_concise_error_and_preserves_last_trace() {
+    for json in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = r#"{"error":"not_found","name":"pyton@3.12","suggestions":["python@3.12","python@3.11","python@3.13"]}"#;
+            write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let prefix = tempfile::tempdir().unwrap();
+        let traces = prefix.path().join("var/glu/traces");
+        fs::create_dir_all(&traces).unwrap();
+        fs::write(traces.join("previous.json"), "{}\n").unwrap();
+        std::os::unix::fs::symlink("previous.json", traces.join("last.json")).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_glu"));
+        if json {
+            command.arg("--json");
+        }
+        let output = command
+            .args(["install", "pyton@3.12"])
+            .env("GLU_REGISTRY", format!("http://{address}"))
+            .env("GLU_PREFIX", prefix.path())
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        server.join().unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let message = "package 'pyton@3.12' not found\n       Did you mean any of: 'python@3.12', 'python@3.11', 'python@3.13'?";
+        if json {
+            let envelope: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+            assert_eq!(envelope["error"]["code"], "package_not_found");
+            assert_eq!(envelope["error"]["message"], message);
+        } else {
+            assert_eq!(stderr, format!("Error: {message}\n"));
+        }
+        assert_eq!(
+            fs::read_link(traces.join("last.json")).unwrap(),
+            std::path::Path::new("previous.json")
+        );
+        assert_eq!(fs::read(traces.join("previous.json")).unwrap(), b"{}\n");
+        assert_eq!(fs::read_dir(&traces).unwrap().count(), 2);
+    }
+}
+
+#[test]
+fn sigint_during_registry_request_exits_promptly_without_trace() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let (received_tx, received_rx) = mpsc::channel();
@@ -69,25 +122,9 @@ fn sigint_during_registry_request_exits_promptly_and_keeps_trace() {
     assert!(started.elapsed() < Duration::from_secs(1));
     let envelope: serde_json::Value = serde_json::from_str(&stderr).unwrap();
     assert_eq!(envelope["error"]["code"], "interrupted");
-    assert!(envelope["error"]["message"]
+    assert!(!envelope["error"]["message"]
         .as_str()
         .unwrap()
         .contains("Trace:"));
-
-    let trace_dir = prefix.path().join("var/glu/traces");
-    let trace_path = fs::read_dir(trace_dir)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("trace-"))
-        })
-        .expect("resolution trace");
-    let trace: serde_json::Value = serde_json::from_slice(&fs::read(trace_path).unwrap()).unwrap();
-    assert_eq!(trace["status"], "failed");
-    assert!(trace["error"]
-        .as_str()
-        .unwrap()
-        .contains("interrupted while waiting for the registry"));
+    assert!(!prefix.path().join("var/glu/traces").exists());
 }
