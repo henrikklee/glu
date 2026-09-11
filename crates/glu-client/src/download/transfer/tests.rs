@@ -1303,7 +1303,10 @@ async fn final_pathological_range_uses_one_emergency() {
 
         emergency_per_range: 1,
         monitor_interval: Duration::from_millis(10),
-        emergency_warmup: Duration::from_millis(50),
+        // Fresh rescue clients can spend over 50 ms establishing a connection
+        // on loaded CI runners. Give the rescue enough observation time that
+        // setup latency alone cannot classify its first chunk as pathological.
+        emergency_warmup: Duration::from_millis(500),
         stalled_for: Duration::from_millis(80),
         pathological_remaining: Duration::from_millis(100),
         rolling_window: Duration::from_millis(200),
