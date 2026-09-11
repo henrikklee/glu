@@ -1,5 +1,69 @@
 use glu_client::outdated::OutdatedPackage;
 
+/// Width of stdout's terminal, when it can be queried.
+pub(crate) fn terminal_width() -> Option<usize> {
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0;
+    (ok && size.ws_col > 0).then_some(size.ws_col as usize)
+}
+
+/// Fit all columns into one table-wide budget. The widest columns surrender
+/// space first, so no single pathological value can force the table to wrap;
+/// every column remains eligible to shrink down to one display cell.
+pub(crate) fn fit_table_widths(natural: &[usize], max_table_width: usize) -> Vec<usize> {
+    if natural.is_empty() {
+        return Vec::new();
+    }
+    let frame_width = natural.len() * 3 + 1;
+    let content_budget = max_table_width
+        .saturating_sub(frame_width)
+        .max(natural.len());
+    if natural.iter().sum::<usize>() <= content_budget {
+        return natural.to_vec();
+    }
+
+    // Find the highest common cap that fits. This is equivalent to repeatedly
+    // shrinking the widest columns, but does not loop once per removed cell.
+    let mut low = 1;
+    let mut high = natural.iter().copied().max().unwrap_or(1);
+    while low < high {
+        let cap = low + (high - low).div_ceil(2);
+        let used = natural.iter().map(|width| (*width).min(cap)).sum::<usize>();
+        if used <= content_budget {
+            low = cap;
+        } else {
+            high = cap - 1;
+        }
+    }
+
+    let mut widths: Vec<usize> = natural.iter().map(|width| (*width).min(low)).collect();
+    let mut remaining = content_budget - widths.iter().sum::<usize>();
+    for (width, natural_width) in widths.iter_mut().zip(natural) {
+        if remaining == 0 {
+            break;
+        }
+        if *width < *natural_width {
+            *width += 1;
+            remaining -= 1;
+        }
+    }
+    widths
+}
+
+/// Truncate a cell to its allocated display cells, preserving the end marker.
+pub(crate) fn truncate_table_cell(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
+    format!("{}…", value.chars().take(width - 1).collect::<String>())
+}
+
 /// `glu outdated`: terminal table of installed → update → latest versions.
 /// `Update` is the newest version installable on this target (what `glu up`
 /// would install); `Latest` is the newest visible version overall — it can
@@ -105,7 +169,7 @@ pub(crate) fn table_row(cells: &[(&str, &str)], widths: &[usize], header: bool) 
             (*display).to_string()
         };
         s.push_str(&styled);
-        s.push_str(&" ".repeat(width.saturating_sub(plain.len())));
+        s.push_str(&" ".repeat(width.saturating_sub(plain.chars().count())));
         s.push(' ');
         s.push('│');
     }
@@ -180,6 +244,25 @@ mod tests {
     use super::*;
     use glu_client::outdated::OutdatedPackage;
     use glu_core::{PackageKey, PackageName};
+
+    #[test]
+    fn table_widths_shrink_columns_together_to_fit_the_budget() {
+        let natural = [20, 18, 16];
+        let widths = fit_table_widths(&natural, 40);
+
+        assert_eq!(widths.iter().sum::<usize>() + 10, 40);
+        assert!(widths
+            .iter()
+            .zip(natural)
+            .all(|(fitted, original)| *fitted < original));
+    }
+
+    #[test]
+    fn table_cell_truncation_preserves_the_allocated_width() {
+        assert_eq!(truncate_table_cell("package", 5), "pack…");
+        assert_eq!(truncate_table_cell("ok", 5), "ok");
+        assert_eq!(truncate_table_cell("failed", 1), "…");
+    }
 
     #[test]
     fn outdated_table_renders_boxed_terminal_style() {

@@ -139,13 +139,9 @@ fn help_width() -> usize {
     if !std::io::stdout().is_terminal() {
         return 88;
     }
-    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-    let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0;
-    if ok && size.ws_col > 0 {
-        (size.ws_col as usize).clamp(60, 120)
-    } else {
-        88
-    }
+    crate::tables::terminal_width()
+        .map(|width| width.clamp(60, 120))
+        .unwrap_or(88)
 }
 
 fn overview_line(out: &mut String, label: &str, text: &str, width: usize) {

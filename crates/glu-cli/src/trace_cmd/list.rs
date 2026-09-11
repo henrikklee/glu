@@ -1,6 +1,6 @@
 use crate::{
     command_model::generated_schema,
-    tables::{table_row, table_rule},
+    tables::{fit_table_widths, table_row, table_rule, terminal_width, truncate_table_cell},
 };
 use anyhow::{Context, Result};
 use glu_client::GluClient;
@@ -161,7 +161,8 @@ pub(crate) fn render_human(output: &TraceListOutput) {
     if tty {
         println!("{}", output.directory.display());
         if !output.traces.is_empty() {
-            println!("{}", trace_table(&output.traces));
+            let width = terminal_width().unwrap_or(88);
+            println!("{}", trace_table(&output.traces, width));
         }
     } else {
         for entry in &output.traces {
@@ -174,44 +175,57 @@ pub(crate) fn render_human(output: &TraceListOutput) {
 }
 
 /// Render the terminal table for `glu trace list`. Columns follow
-/// `timestamp package status duration id` — the id is last so the 15-char
-/// timestamp column is stable and the package column is wide enough for the
-/// longest plan (a multi-package closure name like `a+b+c`). Status is
-/// coloured (`ok` green, `failed` yellow); duration and id are dimmed. Uses
-/// the same `table_rule`/`table_row` helpers as the `outdated` and `list`
-/// tables.
-fn trace_table(entries: &[TraceEntry]) -> String {
-    let status_col = "Status";
-    let headers = ["Time", "Package", status_col, "Duration", "Id"];
-    let widths = [
-        "Time"
-            .len()
-            .max(entries.iter().map(|e| e.timestamp.len()).max().unwrap_or(0)),
-        "Package"
-            .len()
-            .max(entries.iter().map(|e| e.package.len()).max().unwrap_or(0)),
-        status_col.len(),
-        "Duration".len().max(
+/// `timestamp package status duration id`. Natural widths are fitted together
+/// to the terminal-wide budget, and every cell can be truncated, so one long
+/// multi-package plan cannot make the box wrap. Status is coloured (`ok`
+/// green, `failed` yellow); duration and id are dimmed.
+fn trace_table(entries: &[TraceEntry], max_width: usize) -> String {
+    let headers = ["Time", "Package", "Status", "Duration", "Id"];
+    let natural_widths = [
+        headers[0].chars().count().max(
             entries
                 .iter()
-                .map(|e| format!("{:.1}s", e.duration).len())
+                .map(|entry| entry.timestamp.chars().count())
                 .max()
                 .unwrap_or(0),
         ),
-        "Id".len()
-            .max(entries.iter().map(|e| e.id.len()).max().unwrap_or(0)),
+        headers[1].chars().count().max(
+            entries
+                .iter()
+                .map(|entry| entry.package.chars().count())
+                .max()
+                .unwrap_or(0),
+        ),
+        headers[2].chars().count(),
+        headers[3].chars().count().max(
+            entries
+                .iter()
+                .map(|entry| format!("{:.1}s", entry.duration).chars().count())
+                .max()
+                .unwrap_or(0),
+        ),
+        headers[4].chars().count().max(
+            entries
+                .iter()
+                .map(|entry| entry.id.chars().count())
+                .max()
+                .unwrap_or(0),
+        ),
     ];
+    let widths = fit_table_widths(&natural_widths, max_width);
+    let header_cells: Vec<String> = headers
+        .iter()
+        .zip(&widths)
+        .map(|(header, width)| truncate_table_cell(header, *width))
+        .collect();
 
     let mut lines = Vec::new();
     lines.push(table_rule(&widths, '┌', '┬', '┐'));
     lines.push(table_row(
-        &[
-            (headers[0], headers[0]),
-            (headers[1], headers[1]),
-            (headers[2], headers[2]),
-            (headers[3], headers[3]),
-            (headers[4], headers[4]),
-        ],
+        &header_cells
+            .iter()
+            .map(|cell| (cell.as_str(), cell.as_str()))
+            .collect::<Vec<_>>(),
         &widths,
         true,
     ));
@@ -220,18 +234,32 @@ fn trace_table(entries: &[TraceEntry]) -> String {
         if i > 0 {
             lines.push(table_rule(&widths, '├', '┼', '┤'));
         }
-        let status = match entry.status.as_str() {
-            "failed" => glu_client::style::yellow("failed"),
-            _ => glu_client::style::green("ok"),
+        let status = if entry.status == "failed" {
+            "failed"
+        } else {
+            "ok"
         };
-        let duration = format!("{:.1}s", entry.duration);
+        let values = [
+            truncate_table_cell(&entry.timestamp, widths[0]),
+            truncate_table_cell(&entry.package, widths[1]),
+            truncate_table_cell(status, widths[2]),
+            truncate_table_cell(&format!("{:.1}s", entry.duration), widths[3]),
+            truncate_table_cell(&entry.id, widths[4]),
+        ];
+        let status_display = if entry.status == "failed" {
+            glu_client::style::yellow(&values[2])
+        } else {
+            glu_client::style::green(&values[2])
+        };
+        let duration_display = glu_client::style::dim(&values[3]);
+        let id_display = glu_client::style::dim(&values[4]);
         lines.push(table_row(
             &[
-                (&entry.timestamp, &entry.timestamp),
-                (&entry.package, &entry.package),
-                (&status, &entry.status),
-                (&glu_client::style::dim(&duration), &duration),
-                (&glu_client::style::dim(&entry.id), &entry.id),
+                (&values[0], &values[0]),
+                (&values[1], &values[1]),
+                (&status_display, &values[2]),
+                (&duration_display, &values[3]),
+                (&id_display, &values[4]),
             ],
             &widths,
             false,
@@ -290,7 +318,7 @@ mod tests {
             te("aaaac9", "20260817 031611", "gnupg", "failed", 0.2),
             te("f51d70", "20260816 225926", "vips", "ok", 22.1),
         ];
-        let table = trace_table(&entries);
+        let table = trace_table(&entries, 120);
         let lines: Vec<&str> = table.lines().collect();
         // Top rule + header + rule, then one separator per data row, then
         // bottom rule — the same row-separated style as `glu outdated`.
@@ -308,5 +336,19 @@ mod tests {
             .collect();
         assert_eq!(widths[0], widths[1]);
         assert_eq!(widths[1], widths[2]);
+    }
+
+    #[test]
+    fn trace_table_fits_long_plans_to_terminal_width() {
+        let long_plan = (0..40)
+            .map(|index| format!("package-{index}"))
+            .collect::<Vec<_>>()
+            .join("+");
+        let entries = vec![te("1b7660", "20260817 031738", &long_plan, "failed", 6.2)];
+
+        let table = trace_table(&entries, 80);
+        assert!(table.lines().all(|line| line.chars().count() == 80));
+        assert!(table.contains('…'));
+        assert!(!table.contains(&long_plan));
     }
 }
