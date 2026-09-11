@@ -279,6 +279,8 @@ pub struct InstallSummary {
 #[derive(Debug, Clone, Default)]
 pub struct UpdateSummary {
     pub updates: Vec<PlannedUpdate>,
+    /// Additional packages removed after updating. Superseded old kegs are
+    /// already represented by their entry in `updates`.
     pub removed: Vec<crate::remove::RemovedPackage>,
     pub execution: WorksetExecutionSummary,
     pub latest_glu_version: Option<String>,
@@ -773,10 +775,15 @@ pub struct UpdatePlan {
     /// Download bytes for packages this update would fetch/prepare, excluding already-satisfied packages.
     pub would_download_bytes: Option<u64>,
     pub latest_glu_version: Option<String>,
-    /// Packages that become dangling once the new versions land —
-    /// dependencies the new bottles dropped. Execution removes them after
-    /// the update completes.
+    /// Packages that become dangling once the new versions land, excluding
+    /// the old kegs replaced by `to_update`. These are additional removals,
+    /// such as dependencies the new packages dropped, and therefore affect
+    /// presentation and confirmation policy.
     pub to_remove: Vec<InstalledPackage>,
+    /// Old kegs replaced by entries in `to_update`. Execution removes them
+    /// after the replacement commits, but the update transition already
+    /// communicates this cleanup to users.
+    superseded: Vec<InstalledPackage>,
     /// `None` when there was nothing to update (the caller prints the
     /// "already up to date" state and skips execution).
     pub manifest: Option<glu_core::InstallManifest>,
@@ -886,9 +893,10 @@ fn select_update_targets(
 /// Named and bare update retain dependencies that satisfy the active package
 /// requirements. `--dependents` extends a named update to outdated dependents.
 ///
-/// `to_remove` is computed by simulating the post-update installed set
-/// from the resolve manifest, so the confirmation can show the removals
-/// (dependencies a new version dropped) before anything happens.
+/// Removals are computed by simulating the post-update installed set from
+/// the resolve manifest. Superseded kegs are kept separate from additional
+/// removals so an ordinary version replacement is not presented as a second
+/// removal or treated as a reason to confirm a named update.
 pub async fn plan_update(
     client: &GluClient,
     names: Vec<PackageSelector>,
@@ -926,6 +934,7 @@ pub async fn plan_update(
             would_download_bytes: Some(0),
             latest_glu_version: outdated.latest_glu_version.clone(),
             to_remove: Vec::new(),
+            superseded: Vec::new(),
             manifest: None,
             workset: planner::InstallWorkSet {
                 satisfied: Vec::new(),
@@ -999,6 +1008,7 @@ pub async fn plan_update(
             would_download_bytes: Some(0),
             latest_glu_version: outdated.latest_glu_version.clone(),
             to_remove: Vec::new(),
+            superseded: Vec::new(),
             manifest: None,
             workset,
             outdated,
@@ -1063,7 +1073,7 @@ pub async fn plan_update(
     // (the same way the reloaded state would after
     // execution). Dependencies the new versions dropped surface as dangling
     // here, before execution.
-    let to_remove = crate::sync::without_workset_installs(
+    let predicted_removals = crate::sync::without_workset_installs(
         crate::sync::predicted_dangling_after_workset(
             &state,
             &manifest,
@@ -1072,6 +1082,11 @@ pub async fn plan_update(
         )?,
         &workset,
     );
+    let updated_keys: BTreeSet<glu_core::PackageKey> = to_update
+        .iter()
+        .map(|update| update.package_key.clone())
+        .collect();
+    let (superseded, to_remove) = partition_update_removals(predicted_removals, &updated_keys);
 
     let would_download_bytes = download_bytes_for_uncached_package_ids(
         &manifest,
@@ -1087,6 +1102,7 @@ pub async fn plan_update(
         would_download_bytes,
         latest_glu_version: outdated.latest_glu_version.clone(),
         to_remove,
+        superseded,
         manifest: Some(manifest),
         workset,
         outdated,
@@ -1094,9 +1110,18 @@ pub async fn plan_update(
     })
 }
 
+fn partition_update_removals(
+    removals: Vec<InstalledPackage>,
+    updated_keys: &BTreeSet<glu_core::PackageKey>,
+) -> (Vec<InstalledPackage>, Vec<InstalledPackage>) {
+    removals
+        .into_iter()
+        .partition(|package| updated_keys.contains(&package.package_key))
+}
+
 /// Executes a planned update: runs the resolved workset (Preserve policy —
-/// membership is unchanged) and then removes the packages the plan flagged
-/// as dangling, which the confirmation already listed.
+/// membership is unchanged) and then removes both superseded kegs and the
+/// additional dangling packages shown by the plan.
 pub async fn execute_update(
     client: &GluClient,
     plan: UpdatePlan,
@@ -1129,7 +1154,14 @@ pub async fn execute_update(
     .await?;
 
     let prefix = client.config().prefix.clone();
-    let removed = crate::remove::remove_installed_packages(&prefix, &plan.to_remove)?;
+    let superseded_count = plan.superseded.len();
+    let mut planned_removals = plan.superseded.clone();
+    planned_removals.extend(plan.to_remove.iter().cloned());
+    let mut removed = crate::remove::remove_installed_packages(&prefix, &planned_removals)?;
+    // `updates` already expresses replacement of the superseded kegs. Keep
+    // `removed` aligned with the plan's additional-removal meaning instead
+    // of reporting each update twice in machine output.
+    let removed = removed.split_off(superseded_count);
 
     // Sync the declaration: declared packages record the version this
     // update resolved for them. Automatic packages updated via --all or a
@@ -2080,6 +2112,21 @@ mod tree_tests {
         assert!(err.to_string().contains("update --all"));
     }
 
+    #[test]
+    fn update_removals_separate_superseded_kegs_from_dropped_dependencies() {
+        let updated_keys = BTreeSet::from([glu_core::PackageKey("package:app".to_string())]);
+
+        let (superseded, additional) = partition_update_removals(
+            vec![pkg("app", vec![]), pkg("old-dep", vec![])],
+            &updated_keys,
+        );
+
+        assert_eq!(superseded.len(), 1);
+        assert_eq!(superseded[0].name.0, "app");
+        assert_eq!(additional.len(), 1);
+        assert_eq!(additional[0].name.0, "old-dep");
+    }
+
     /// Installed keg helper for the autoremove regression test (mirrors the
     /// `pkg` builders in state/installed.rs).
     fn pkg(name: &str, deps: Vec<&str>) -> glu_core::InstalledPackage {
@@ -2597,6 +2644,16 @@ mod interrupted_install_tests {
             .collect();
         assert_eq!(names, vec!["app"]);
         assert_eq!(predicted[0].keg_version.0, "0.9");
+
+        let updated_keys: BTreeSet<glu_core::PackageKey> = manifest
+            .packages
+            .values()
+            .map(|package| package.package_key.clone())
+            .collect();
+        let (superseded, additional) = partition_update_removals(predicted.clone(), &updated_keys);
+        assert_eq!(superseded.len(), 1);
+        assert_eq!(superseded[0].keg_version.0, "0.9");
+        assert!(additional.is_empty());
 
         // Install the new version. The old keg must still be present: the
         // removal pass runs after the commit, so an interrupted update can

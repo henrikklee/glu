@@ -424,8 +424,9 @@ impl GluClient {
     /// Plans an update from a read-only state snapshot: named updates select
     /// declared roots, bare update selects every declared root, and `--all`
     /// additionally reconciles their complete dependency closure. The plan
-    /// computes what would be removed once the new versions land. The CLI uses
-    /// `to_update`/`to_remove` to decide whether to ask for confirmation.
+    /// computes the additional packages that would be removed once the new
+    /// versions land; superseded kegs remain implicit in `to_update`. The CLI
+    /// uses `to_update`/`to_remove` to decide whether to ask for confirmation.
     /// See `install::plan_update`.
     pub async fn plan_update(
         &self,
@@ -437,8 +438,8 @@ impl GluClient {
     }
 
     /// Executes a planned update: runs the resolved workset (membership is
-    /// unchanged) and removes the packages the plan flagged as dangling.
-    /// See `install::execute_update`.
+    /// unchanged), removes superseded kegs, and removes the additional
+    /// dangling packages exposed by the plan. See `install::execute_update`.
     pub async fn execute_update(
         &self,
         plan: install::UpdatePlan,
