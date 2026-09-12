@@ -1,30 +1,34 @@
-# glu – fast and friendly package management for humans and agents
+<p align="center">
+  <img src="docs/assets/gecko.png" width="180" alt="glu gecko">
+</p>
 
-> [!NOTE]
-> **Brand artwork placeholder**
->
-> Wide product artwork or logo lockup for GitHub light and dark themes.
+<h1 align="center">glu</h1>
 
-glu is an ultra-fast package manager for Apple Silicon Macs, built on Homebrew's trusted ecosystem of prebuilt packages.
+<p align="center">The fast package manager for macOS, written in Rust.</p>
 
-[Read the docs →](https://glu.run/docs/)
+<p align="center">
+  <a href="https://glu.run/docs/">Documentation</a> ·
+  <a href="https://glu.run/benchmarks/">Benchmarks</a> ·
+  <a href="https://glu.run/">Website</a>
+</p>
+
+<p align="center">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/benchmark-vips-dark.png">
+      <img src="docs/assets/benchmark-vips-light.png" width="520" alt="Median vips install time: glu 32.15 seconds, Homebrew 74.48 seconds, nanobrew 99.47 seconds. Lower is better.">
+    </picture><br>
+    <em>Installing <a href="https://glu.run/packages/vips">vips</a> with all dependencies from a cold cache, including downloads.</em>
+</p>
 
 ## Why glu
 
-Package installation is a graph problem. glu resolves the complete graph in one request, then overlaps downloads, preparation, linking, and final setup to finish the whole install sooner.
-
-- **Fast end to end.** glu is designed to be up to 3x faster across large dependency graphs, optimizing the complete installation rather than one isolated phase.
-- **More than 8,000 packages from day one.** glu uses Homebrew's mature package ecosystem instead of starting a new catalog.
-- **No metadata-update ritual.** Relevant commands resolve against the current registry as part of the operation.
-- **Declarative package state.** `glu.json` records the packages you chose; glu manages the dependencies they need.
-- **Built for humans and agents.** Terminal output stays concise, while plans, JSON envelopes, schemas, and a machine-readable command manifest give tools a strict interface.
-- **Inspectable by default.** Every install records a detailed trace of scheduling, downloads, preparation, linking, and shared work.
-
-> [!NOTE]
-> **Benchmark proof placeholder**
->
-> Comparison chart with hardware, macOS version, package sets, dependency
-> counts, cache conditions, and a link to the reproducible methodology.
+- **Fast end to end.** Downloads, preparation, and installation overlap to finish sooner.
+- **8,000+ packages available.** Install command-line tools from Homebrew’s ecosystem of prebuilt packages.
+- **No `brew update` step.** Package metadata is resolved from the registry as part of the operation.
+- **Concise output by default.** Clear progress and useful errors keep everyday commands readable.
+- **JSON Schema and plan mode for agents.** Structured output and previews let agents inspect changes before applying them.
+- **Declarative package state.** `glu.json` records the packages you chose; glu manages their dependencies.
+- **Built-in observability.** Every install records a local trace showing where time goes.
 
 ## Install
 
@@ -34,6 +38,18 @@ glu supports macOS on Apple Silicon.
 curl -fsSL https://glu.run/install | bash
 ```
 
+> [!TIP]
+> **Let your agent introduce glu**
+>
+> Ask your coding agent:
+>
+> ```text
+> Run `glu help --json --schemas`. Explain what makes glu useful and show
+> me how to manage packages safely. Do not make any changes.
+> ```
+>
+> This read-only command provides the command manifest and JSON Schemas, so agents can discover the interface without scraping terminal help.
+
 ### Upgrade
 
 Upgrade glu to the latest version:
@@ -42,107 +58,43 @@ Upgrade glu to the latest version:
 glu upgrade
 ```
 
-## Quick start
-
-> [!TIP]
-> **Let your agent introduce glu**
->
-> Ask your coding agent:
->
-> ```text
-> Run `glu help --json`. Explain what makes glu useful and show me how to
-> manage packages safely. Do not make any changes.
-> ```
->
-> The command is read-only and publishes glu's complete command surface as structured JSON.
-
-Install your first package:
-
-```sh
-glu install jq
-```
-
-Install a small development setup:
-
-```sh
-glu install ripgrep neovim tree node
-```
-
-List the packages you chose, then inspect the complete dependency graph:
-
-```sh
-glu list
-glu list --tree
-```
-
-Remove a package:
-
-```sh
-glu remove jq
-```
-
-Continue with the [full Quick Start](https://glu.run/docs/quick-start/).
-
 ## How glu works
-
-```text
-resolve → download → prepare → link → postinstall → record state
-```
-
-The registry returns one complete install manifest containing package versions, dependency edges, artifact URLs, checksums, linking metadata, and structured postinstall work. With the graph available up front, glu can run independent work concurrently, prioritize packages that unlock expensive downstream operations, commit in dependency order, and coalesce shared setup.
-
-glu installs packages under `/opt/glustore`, separate from Homebrew's prefix. It verifies artifacts, performs compatibility-sensitive relocation and signing, confines local filesystem work, and fails closed when it cannot complete a transformation safely.
-
-### Every install explains itself
-
-Open the latest install trace:
 
 ```sh
 glu trace view
 ```
 
-The built-in viewer renders the timeline and dependency graph together, making bottlenecks, critical work, failures, and idle gaps visible.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/vips-trace-dark.png">
+  <img src="docs/assets/vips-trace-light.png" alt="A recorded vips install in glu’s trace viewer, showing concurrent pipeline stages and the dependency graph.">
+</picture>
 
-> [!NOTE]
-> **Trace viewer placeholder**
->
-> Real trace screenshot with parallel timeline lanes, the dependency graph,
-> and recognizable packages from a large installation.
+*A recorded vips install in glu’s trace viewer.*
 
-Read more about the [install pipeline](https://glu.run/docs/concepts/install-pipeline/), [performance](https://glu.run/docs/concepts/performance/), and [traces](https://glu.run/docs/reference/traces/).
+- **[One-shot server-side resolution](https://glu.run/docs/deep-dives/one-shot-resolve/).** Fetch the complete dependency graph and install metadata in one round trip. No local index to refresh.
+- **[Built-in observability](https://glu.run/docs/reference/traces/).** Every install records a local trace, showing where time goes without uploading data.
+- **[Critical-path scheduling](https://glu.run/docs/deep-dives/orchestrator/).** Prioritize downloads that unlock expensive work.
+- **[Parallel, multipart downloads](https://glu.run/docs/deep-dives/orchestrator/).** Fetch packages concurrently and split large downloads into chunks.
+- **[Overlapping stages](https://glu.run/docs/deep-dives/orchestrator/).** Download, extract, prepare, and install concurrently where dependencies allow.
+- **[Shared resource limits](https://glu.run/docs/deep-dives/orchestrator/).** Coordinate network, CPU, memory, and filesystem work.
+- **[Coalesced postinstall work](https://glu.run/docs/deep-dives/postinstall/).** Rebuild shared caches once, after all contributing packages are ready.
+- **Written in Rust.** Native performance, with explicit control over concurrency and memory.
 
-## Design principles
-
-### Keep complexity bounded
-
-Fast orchestration requires real machinery: concurrent execution, fused work, critical-path scheduling, indexed registry data, caching, state transitions, and strict output contracts. glu keeps that complexity inside focused subsystems with narrow responsibilities.
-
-### Optimize the time users wait
-
-glu optimizes the time between entering a command and using the installed software. It overlaps independent work, prioritizes costly downstream paths, coalesces shared operations, and removes repeated reads, scans, and process launches from the critical path.
-
-### Earn compatibility
-
-glu implements package behavior in Rust with close reference to mature upstream sources. Compatibility-sensitive work is cited, tested, and reviewed so faster execution preserves expected package behavior and filesystem state.
+Read more about [performance](https://glu.run/docs/concepts/performance/).
 
 ## Common commands
 
-| Task                                            | Command                     |
-| ----------------------------------------------- | --------------------------- |
-| Install packages                                | `glu install <name...>`     |
-| Sync from `glu.json`                            | `glu install`               |
-| Update declared packages                        | `glu update`                |
-| Update the complete declared dependency closure | `glu update --all`          |
-| Remove a package                                | `glu remove <name>`         |
-| List declared packages                          | `glu list`                  |
-| Show the installed dependency tree              | `glu list --tree`           |
-| Inspect a package                               | `glu info <name>`           |
-| Explain why a package is installed              | `glu why <name>`            |
-| Preview a change                                | `glu install <name> --plan` |
-| Inspect the latest trace                        | `glu trace view`            |
-| Check local setup                               | `glu status`                |
+Follow the [Quick Start](https://glu.run/docs/quick-start/) for a walkthrough, or browse the [CLI reference](https://glu.run/docs/reference/cli/) for all commands.
 
-Run `glu help <command>` for human-readable help. Run `glu help --json` for the machine-readable command manifest, or read the [CLI reference](https://glu.run/docs/reference/cli/).
+| Task                              | Command                     |
+| --------------------------------- | --------------------------- |
+| Install a package                 | `glu install vips`          |
+| Sync from `glu.json`               | `glu install`               |
+| Preview an installation           | `glu install vips --plan`   |
+| Show the installed dependency tree | `glu list --tree`          |
+| Explain why a package is installed | `glu why <name>`           |
+| Inspect the latest trace          | `glu trace view`            |
+| Discover commands and schemas     | `glu help --json --schemas` |
 
 ## Development
 
