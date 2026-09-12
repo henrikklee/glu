@@ -240,7 +240,7 @@ run_as_install_user() {
 
 install_user_can_write() {
   if [[ "$current_uid" = '0' ]]; then
-    /usr/bin/sudo -n -H -u "$install_user" /usr/bin/test -w "$1"
+    /usr/bin/sudo -n -H -u "$install_user" /bin/test -w "$1"
   else
     [[ -w "$1" ]]
   fi
