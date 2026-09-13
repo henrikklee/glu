@@ -143,6 +143,16 @@ case "$(uname -ms)" in
 'Darwin arm64')
   target='aarch64-apple-darwin'
   ;;
+'Darwin x86_64')
+  # An Intel shell under Rosetta reports x86_64 even on Apple Silicon.
+  # Probe hardware support, not the architecture of the calling process.
+  if [[ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" = '1' ]]; then
+    target='aarch64-apple-darwin'
+    info 'Detected Apple Silicon through Rosetta; installing the ARM64 build.'
+  else
+    error 'glu supports Apple Silicon (arm64) Macs only; this Mac is not arm64.'
+  fi
+  ;;
 'Darwin'*)
   error 'glu supports Apple Silicon (arm64) Macs only; this Mac is not arm64.'
   ;;

@@ -81,6 +81,9 @@ sha256() {
   fi
 }
 
+# Check platform detection in the actual source or packaged installer.
+python3 scripts/test-install-platform.py "$INSTALLER"
+
 # --- fixture mirror (GitHub releases shape) --------------------------------
 latest_dir="$FIXTURE/releases/latest/download"
 pinned_dir="$FIXTURE/releases/download/$TAG"
