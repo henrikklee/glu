@@ -149,7 +149,10 @@ fn ask_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
     let term = Term::stdout();
     if term.is_term() {
         loop {
-            let key = term.read_key()?;
+            let Some(key) = input_or_cancel(term.read_key())? else {
+                println!();
+                return Ok(false);
+            };
             let Some(confirmed) = confirmation_for_key(&key, default_yes) else {
                 continue;
             };
@@ -165,7 +168,10 @@ fn ask_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
     // Preserve line-oriented behavior in the unusual case where stdin is a
     // terminal but stdout is redirected and cannot support key events.
     let mut answer = String::new();
-    std::io::stdin().lock().read_line(&mut answer)?;
+    let Some(_) = input_or_cancel(std::io::stdin().lock().read_line(&mut answer))? else {
+        println!();
+        return Ok(false);
+    };
     let answer = answer.trim().to_ascii_lowercase();
     let confirmed = if answer.is_empty() {
         default_yes
@@ -174,6 +180,14 @@ fn ask_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
     };
     println!();
     Ok(confirmed)
+}
+
+fn input_or_cancel<T>(input: std::io::Result<T>) -> Result<Option<T>> {
+    match input {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn confirmation_for_key(key: &Key, default_yes: bool) -> Option<bool> {
@@ -187,8 +201,9 @@ fn confirmation_for_key(key: &Key, default_yes: bool) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::confirmation_for_key;
+    use super::{confirmation_for_key, input_or_cancel};
     use console::Key;
+    use std::io::{Error, ErrorKind};
 
     #[test]
     fn confirmation_keys_accept_or_cancel_without_enter() {
@@ -200,5 +215,20 @@ mod tests {
         assert_eq!(confirmation_for_key(&Key::Char('N'), false), Some(false));
         assert_eq!(confirmation_for_key(&Key::Escape, true), Some(false));
         assert_eq!(confirmation_for_key(&Key::ArrowDown, true), None);
+    }
+
+    #[test]
+    fn interrupted_confirmation_input_is_cancellation() {
+        let interrupted = Error::new(ErrorKind::Interrupted, "read interrupted");
+        assert!(input_or_cancel::<Key>(Err(interrupted)).unwrap().is_none());
+    }
+
+    #[test]
+    fn other_confirmation_input_errors_are_preserved() {
+        let error = Error::other("terminal failed");
+        assert_eq!(
+            input_or_cancel::<Key>(Err(error)).unwrap_err().to_string(),
+            "terminal failed"
+        );
     }
 }
