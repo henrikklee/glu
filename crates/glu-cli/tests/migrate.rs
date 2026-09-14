@@ -263,6 +263,40 @@ fn migrate_plan_preserves_only_clear_global_unlink_intent() {
 }
 
 #[test]
+fn migrate_execution_preflight_uses_will_wording() {
+    let prefix = tempfile::tempdir().unwrap();
+    let source = tempfile::tempdir().unwrap();
+    write_requested_receipt(source.path(), "global-root");
+    write_requested_receipt(source.path(), "isolated-root");
+    let (registry, server) = registry_for_migration();
+
+    let output = run_with_registry(
+        prefix.path(),
+        &registry,
+        &["migrate", "--from", source.path().to_str().unwrap()],
+    );
+    server.join().unwrap();
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Will migrate 2 requested packages:"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Will install 2 packages:"), "{stdout}");
+    assert!(stdout.contains("Will download:"), "{stdout}");
+    assert!(
+        stdout.contains("Will keep 1 package deactivated."),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Homebrew configuration and runtime data will be left untouched."),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Would"), "{stdout}");
+}
+
+#[test]
 fn migrate_executes_through_normal_install_and_preserves_source() {
     let prefix = tempfile::tempdir().unwrap();
     let source = tempfile::tempdir().unwrap();

@@ -794,11 +794,27 @@ pub(crate) fn render_migration_preflight(
     plan: &glu_client::migrate::MigrationPlan,
     globals: GlobalOptions,
 ) {
-    let mut output = migrate_plan_output(plan);
-    // Execution renders source-discovery warnings with the final result. Keep
-    // the preflight package plan from printing the same warning twice.
-    output.warnings.clear();
-    render_migrate_plan_output(&output, &globals);
+    if globals.verbose {
+        println!("Homebrew source: {}", plan.source.display());
+    }
+    println!(
+        "Will migrate {}:",
+        glu_client::format::plural(plan.roots.len(), "requested package")
+    );
+    if let Some(install) = &plan.install {
+        render_install_preflight(install);
+        render_install_execution_plan(install, "install", globals.tree);
+        print_will_download(install.would_download_bytes);
+    }
+    if !plan.inferred_deactivated.is_empty() {
+        println!(
+            "Will keep {} deactivated.",
+            glu_client::format::plural(plan.inferred_deactivated.len(), "package")
+        );
+    }
+    if !plan.configuration_migrated {
+        println!("Homebrew configuration and runtime data will be left untouched.");
+    }
 }
 
 pub(crate) fn migrate_output(summary: &glu_client::migrate::MigrationSummary) -> MigrateOutput {
@@ -2050,14 +2066,27 @@ fn render_update_plan_output(plan: &UpdatePlanOutput, globals: &GlobalOptions) {
     print_would_download(plan.would_download_bytes);
 }
 
+fn download_message(verb: &str, bytes: Option<u64>) -> Option<String> {
+    bytes.filter(|bytes| *bytes > 0).map(|bytes| {
+        format!(
+            "{verb} download: {}",
+            glu_client::format::human_bytes(bytes)
+        )
+    })
+}
+
 fn would_download_message(bytes: Option<u64>) -> Option<String> {
-    bytes
-        .filter(|bytes| *bytes > 0)
-        .map(|bytes| format!("Would download: {}", glu_client::format::human_bytes(bytes)))
+    download_message("Would", bytes)
 }
 
 fn print_would_download(bytes: Option<u64>) {
     if let Some(message) = would_download_message(bytes) {
+        println!("{message}");
+    }
+}
+
+fn print_will_download(bytes: Option<u64>) {
+    if let Some(message) = download_message("Will", bytes) {
         println!("{message}");
     }
 }
