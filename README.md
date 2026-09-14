@@ -15,7 +15,7 @@
 <p align="center">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="docs/assets/benchmark-vips-dark.png">
-      <img src="docs/assets/benchmark-vips-light.png" width="520" alt="Median vips install time: glu 32.15 seconds, Homebrew 74.48 seconds, nanobrew 99.47 seconds. Lower is better.">
+      <img src="docs/assets/benchmark-vips-light.png" width="520" alt="Median vips install time: glu 34.09 seconds, Homebrew 77.58 seconds, nanobrew 102.81 seconds. Lower is better.">
     </picture><br>
     <em>Installing <a href="https://glu.run/packages/vips">vips</a> with all dependencies from a cold cache, including downloads.</em>
 </p>
