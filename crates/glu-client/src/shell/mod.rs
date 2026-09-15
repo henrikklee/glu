@@ -43,9 +43,9 @@ pub struct SetupResult {
     pub current_rc: Option<PathBuf>,
 }
 
-/// Install or refresh shell integration for every present shell.
+/// Install or refresh shell integration for the login shell and configured secondary shells.
 pub fn setup_shells(config: &ClientConfig) -> Result<SetupResult> {
-    ensure_all_shell_hooks(config)
+    ensure_shell_hooks(config)
 }
 
 pub fn shellenv(config: &ClientConfig, shell_name: Option<&str>) -> Result<String> {
@@ -63,10 +63,16 @@ pub fn shellenv(config: &ClientConfig, shell_name: Option<&str>) -> Result<Strin
     Ok(output)
 }
 
-fn ensure_all_shell_hooks(config: &ClientConfig) -> Result<SetupResult> {
+fn ensure_shell_hooks(config: &ClientConfig) -> Result<SetupResult> {
+    // The bootstrap installer runs under Bash regardless of the user's login
+    // shell, so it supplies the shell whose configuration should be created.
+    let current_shell = env::var("GLU_SETUP_SHELL")
+        .ok()
+        .filter(|shell| !shell.is_empty())
+        .map(|shell| shell_from_name(&shell))
+        .or_else(detected_shell);
     let mut applied = Vec::new();
-    for shell in discovered_shells() {
-        let path = shell_config_path(&shell)?;
+    for (shell, path) in shells_to_configure(current_shell.as_ref())? {
         let block = managed_block(config, &shell);
         install_managed_block(&path, &block)?;
         applied.push(ShellStatus {
@@ -75,7 +81,10 @@ fn ensure_all_shell_hooks(config: &ClientConfig) -> Result<SetupResult> {
             configured: true,
         });
     }
-    let current_rc = detected_shell().and_then(|shell| shell_config_path(&shell).ok());
+    let current_rc = current_shell
+        .as_ref()
+        .filter(|_| !path_contains_bin(config))
+        .and_then(|shell| shell_config_path(shell).ok());
     Ok(SetupResult {
         shells: applied,
         current_rc,
@@ -83,9 +92,9 @@ fn ensure_all_shell_hooks(config: &ClientConfig) -> Result<SetupResult> {
 }
 
 pub fn shell_statuses() -> Result<Vec<ShellStatus>> {
+    let current_shell = detected_shell();
     let mut out = Vec::new();
-    for shell in discovered_shells() {
-        let path = shell_config_path(&shell)?;
+    for (shell, path) in shells_to_configure(current_shell.as_ref())? {
         let configured = contains_managed_block(&path).unwrap_or(false);
         out.push(ShellStatus {
             name: shell.name.clone(),
@@ -329,44 +338,26 @@ fn csh_shellenv(path: &str) -> String {
     format!("setenv PATH {};\n", csh_quote(path))
 }
 
-fn discovered_shells() -> Vec<Shell> {
-    KNOWN_SHELLS
-        .iter()
-        .map(|name| shell_from_name(name))
-        .filter(|shell| shell_present(&shell.name))
-        .collect()
+fn shells_to_configure(current_shell: Option<&Shell>) -> Result<Vec<(Shell, PathBuf)>> {
+    let mut shells = Vec::new();
+    for name in KNOWN_SHELLS {
+        let shell = shell_from_name(name);
+        let path = shell_config_path(&shell)?;
+        let is_current = current_shell
+            .map(|current| current.name == shell.name)
+            .unwrap_or(false);
+        if is_current || fs::symlink_metadata(&path).is_ok() {
+            shells.push((shell, path));
+        }
+    }
+    Ok(shells)
 }
 
-fn shell_present(name: &str) -> bool {
-    if detected_shell()
-        .map(|shell| shell.name == name)
+fn path_contains_bin(config: &ClientConfig) -> bool {
+    let bin = config.prefix.0.join("bin");
+    env::var_os("PATH")
+        .map(|path| env::split_paths(&path).any(|entry| entry == bin))
         .unwrap_or(false)
-    {
-        return true;
-    }
-    if let Some(path) = env::var_os("PATH") {
-        for dir in env::split_paths(&path) {
-            if dir.join(name).is_file() {
-                return true;
-            }
-        }
-    }
-    if let Ok(content) = fs::read_to_string("/etc/shells") {
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if Path::new(line)
-                .file_name()
-                .map(|f| f == name)
-                .unwrap_or(false)
-            {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 fn detected_shell() -> Option<Shell> {
@@ -459,6 +450,33 @@ fn csh_quote(value: &str) -> String {
 mod tests {
     use super::*;
     use glu_core::{Prefix, Target};
+    use std::ffi::OsString;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvRestore(Vec<(&'static str, Option<OsString>)>);
+
+    impl EnvRestore {
+        fn capture(names: &[&'static str]) -> Self {
+            Self(
+                names
+                    .iter()
+                    .map(|name| (*name, env::var_os(name)))
+                    .collect(),
+            )
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => env::set_var(name, value),
+                    None => env::remove_var(name),
+                }
+            }
+        }
+    }
 
     fn test_config() -> ClientConfig {
         ClientConfig {
@@ -467,6 +485,55 @@ mod tests {
             registry_base_url: "http://localhost:3000".to_string(),
             distribution_base_url: glu_core::DEFAULT_DISTRIBUTION_BASE_URL.to_string(),
         }
+    }
+
+    #[test]
+    fn setup_creates_only_the_login_shell_config_and_updates_existing_configs() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _restore =
+            EnvRestore::capture(&["HOME", "SHELL", "PATH", "ZDOTDIR", "GLU_SETUP_SHELL"]);
+        let home = tempfile::tempdir().unwrap();
+        env::set_var("HOME", home.path());
+        env::set_var("SHELL", "/bin/bash");
+        env::set_var("GLU_SETUP_SHELL", "/bin/zsh");
+        env::set_var("PATH", "/usr/bin:/bin");
+        env::remove_var("ZDOTDIR");
+        fs::write(home.path().join(".profile"), "existing\n").unwrap();
+
+        let result = ensure_shell_hooks(&test_config()).unwrap();
+        let configured: Vec<_> = result
+            .shells
+            .iter()
+            .map(|shell| shell.name.as_str())
+            .collect();
+
+        assert_eq!(configured, ["zsh", "sh"]);
+        assert_eq!(result.current_rc, Some(home.path().join(".zshrc")));
+        assert!(home.path().join(".zshrc").is_file());
+        assert!(contains_managed_block(&home.path().join(".zshrc")).unwrap());
+        assert!(contains_managed_block(&home.path().join(".profile")).unwrap());
+        for path in [".bashrc", ".tcshrc", ".cshrc"] {
+            assert!(!home.path().join(path).exists());
+        }
+    }
+
+    #[test]
+    fn setup_omits_source_guidance_when_glu_bin_is_already_on_path() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _restore =
+            EnvRestore::capture(&["HOME", "SHELL", "PATH", "ZDOTDIR", "GLU_SETUP_SHELL"]);
+        let home = tempfile::tempdir().unwrap();
+        env::set_var("HOME", home.path());
+        env::set_var("SHELL", "/bin/bash");
+        env::set_var("GLU_SETUP_SHELL", "/bin/zsh");
+        env::set_var("PATH", "/opt/glustore/bin:/usr/bin:/bin");
+        env::remove_var("ZDOTDIR");
+
+        let result = ensure_shell_hooks(&test_config()).unwrap();
+
+        assert_eq!(result.current_rc, None);
+        assert_eq!(result.shells.len(), 1);
+        assert_eq!(result.shells[0].name, "zsh");
     }
 
     #[test]
@@ -625,11 +692,7 @@ mod tests {
 
     #[test]
     fn ordered_path_always_puts_glu_first_and_leaves_homebrew_in_the_tail() {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        let _guard = LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
         let old = env::var_os("PATH");
         env::set_var(
             "PATH",

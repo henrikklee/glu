@@ -3299,7 +3299,7 @@ fn render_upgrade_output(result: &glu_client::upgrade::UpgradeResult) {
 }
 
 fn render_setup_output(result: &SetupResult) {
-    println!("Configured shell integration:");
+    println!("{}", shell_integration_heading(result.shells.len()));
     for shell in &result.shells {
         println!("  {:<5} {}", shell.name, display_path(&shell.config_path));
     }
@@ -3434,6 +3434,14 @@ fn fmt_size(bytes: Option<u64>) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
+fn shell_integration_heading(count: usize) -> &'static str {
+    if count == 1 {
+        "Configured shell integration:"
+    } else {
+        "Configured shell integrations:"
+    }
+}
+
 /// Prints an error to stderr in red, with quoted suggestion names in the
 /// `Did you mean ...?` lines bolded. Falls back to plain text when styling
 /// is disabled (piped / NO_COLOR).
@@ -3461,6 +3469,18 @@ mod tests {
             already_shown: false,
             incoming: None,
         }
+    }
+
+    #[test]
+    fn shell_integration_heading_is_pluralized() {
+        assert_eq!(
+            shell_integration_heading(1),
+            "Configured shell integration:"
+        );
+        assert_eq!(
+            shell_integration_heading(2),
+            "Configured shell integrations:"
+        );
     }
 
     #[test]
