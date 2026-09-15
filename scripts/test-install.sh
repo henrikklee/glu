@@ -11,7 +11,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 INSTALLER="$PWD/scripts/install.sh"
 RELEASE_DIR=''
-VERSION='0.1.0'
+VERSION='0.1.1'
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
