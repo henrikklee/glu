@@ -42,7 +42,7 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: Validate production policy and exact installer artifact
-        run: scripts/test-release.sh 0.1.0
+        run: scripts/test-release.sh 0.1.1
 
       - name: Validate dev build isolation
         run: scripts/test-dev-build-isolation.sh

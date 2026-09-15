@@ -14,7 +14,7 @@
 #   target     aarch64-apple-darwin         (Apple Silicon only)
 #   checksum   <artifact>.sha256            sidecar; first whitespace token is
 #                                           the lowercase hex digest
-#   version    a semver (e.g. 0.1.0), release tag (e.g. v0.1.0), or `latest`;
+#   version    a semver (e.g. 0.1.1), release tag (e.g. v0.1.1), or `latest`;
 #              bare semver is normalized to its v-prefixed Git tag
 #   URLs       $GLU_BASE_URL/download/$version/$artifact    (pinned)
 #              $GLU_BASE_URL/latest/download/$artifact      (latest)
@@ -35,13 +35,12 @@
 set -euo pipefail
 
 # --- presentation ----------------------------------------------------------
-Color_Off=''; Red=''; Green=''; Dim=''; Bold_White=''
+Color_Off=''; Red=''; Green=''; Dim=''
 if [[ -t 1 ]]; then
   Color_Off='\033[0m'
   Red='\033[0;31m'
   Green='\033[0;32m'
   Dim='\033[0;2m'
-  Bold_White='\033[1m'
 fi
 
 error() {
@@ -132,7 +131,7 @@ if [[ "$requested_version" == 'latest' ]]; then
 elif [[ "$requested_version" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?)$ ]]; then
   version="v${BASH_REMATCH[1]}"
 else
-  error "Invalid glu version: $requested_version (expected 0.1.0, v0.1.0, or latest)."
+  error "Invalid glu version: $requested_version (expected 0.1.1, v0.1.1, or latest)."
 fi
 
 # --- platform --------------------------------------------------------------
@@ -365,13 +364,11 @@ if [[ "$current_uid" = '0' ]]; then
   [[ -n "$install_home" && -n "$install_shell" ]] \
     || error "Cannot resolve the home directory and shell for $install_user."
   /usr/bin/sudo -n -H -u "$install_user" /usr/bin/env \
-    HOME="$install_home" SHELL="$install_shell" "$GLU_BIN" setup
+    HOME="$install_home" SHELL="$install_shell" GLU_SETUP_SHELL="$install_shell" \
+    "$GLU_BIN" setup
 else
-  "$GLU_BIN" setup
+  GLU_SETUP_SHELL="${SHELL:-}" "$GLU_BIN" setup
 fi
 
 echo
 success "glu installed to $(tildify "$GLU_BIN")"
-echo
-info 'glu is now first on PATH. If one glu package should not shadow another tool:'
-info "  ${Bold_White}glu deactivate <package>${Color_Off}"
