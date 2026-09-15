@@ -94,12 +94,12 @@ run_upgrade() {
 # --- test 1: already up to date -> no download ----------------------------
 echo "test 1: registry reports own version -> already up to date, no download"
 : > "$LOG"
-start_server "0.1.0"
+start_server "0.1.1"
 out="$(run_upgrade 2>&1)"
 kill "$SERVER_PID" 2>/dev/null || true
-echo "$out" | grep -q "Already up to date (glu 0.1.0)" || fail "unexpected output: $out"
+echo "$out" | grep -q "Already up to date (glu 0.1.1)" || fail "unexpected output: $out"
 grep -q "download/" "$LOG" && fail "downloaded despite being up to date"
-[[ "$("$PREFIX/bin/glu" --version)" == "glu 0.1.0" ]] || fail "binary was modified"
+[[ "$("$PREFIX/bin/glu" --version)" == "glu 0.1.1" ]] || fail "binary was modified"
 echo "ok: already up to date"
 
 # --- test 2: update -> download, verify, sanity-run, swap -----------------
@@ -125,7 +125,7 @@ if run_upgrade > "$WORK/out" 2>&1; then
 fi
 kill "$SERVER_PID" 2>/dev/null || true
 grep -q "checksum mismatch" "$WORK/out" || fail "unexpected failure output: $(cat "$WORK/out")"
-[[ "$("$PREFIX/bin/glu" --version)" == "glu 0.1.0" ]] || fail "binary changed on failed upgrade"
+[[ "$("$PREFIX/bin/glu" --version)" == "glu 0.1.1" ]] || fail "binary changed on failed upgrade"
 echo "ok: checksum mismatch rejected"
 
 # --- test 4: registry ahead of distribution -------------------------------
@@ -136,7 +136,7 @@ if run_upgrade > "$WORK/out" 2>&1; then
 fi
 kill "$SERVER_PID" 2>/dev/null || true
 grep -q "failed to fetch" "$WORK/out" || fail "unexpected failure output: $(cat "$WORK/out")"
-[[ "$("$PREFIX/bin/glu" --version)" == "glu 0.1.0" ]] || fail "binary changed on failed upgrade"
+[[ "$("$PREFIX/bin/glu" --version)" == "glu 0.1.1" ]] || fail "binary changed on failed upgrade"
 echo "ok: missing release rejected"
 
 echo

@@ -1,6 +1,6 @@
 # Homebrew compatibility boundary
 
-`glu` 0.1.0 implements Homebrew-compatible dependency behavior for stable, default-option, Apple Silicon macOS bottle installs. It does not claim compatibility with unrestricted Homebrew installation.
+`glu` 0.1.x implements Homebrew-compatible dependency behavior for stable, default-option, Apple Silicon macOS bottle installs. It does not claim compatibility with unrestricted Homebrew installation.
 
 The source oracle for package-version ordering and dependency semantics is Homebrew commit:
 
@@ -37,7 +37,7 @@ Update scope is explicit:
 
 Installed and prospective graphs remain different authorities. `deps` normally reads receipts for an installed package; `deps --online` and `uses` read registry graphs.
 
-## Outside the 0.1.0 boundary
+## Outside the 0.1.x boundary
 
 The following are not compatibility claims:
 

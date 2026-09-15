@@ -116,7 +116,7 @@ else
     cat > "$BIN_SRC" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "--version" ]]; then
-  echo "glu ${GLU_FAKE_VERSION:-0.1.0}"
+  echo "glu ${GLU_FAKE_VERSION:-0.1.1}"
   exit 0
 fi
 echo "fake-glu $*" >> "${GLU_MARKER:?}"
