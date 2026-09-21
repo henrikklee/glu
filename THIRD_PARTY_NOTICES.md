@@ -142,7 +142,7 @@ The distribution also bundles Lodash 4.x modules under the MIT License:
 
 ## MPL-2.0 runtime components
 
-The `0.1.1` release binary includes unmodified components distributed under
+The `0.1.2` release binary includes unmodified components distributed under
 MPL-2.0. Their complete license text is included in
 `THIRD_PARTY_LICENSES.html`. The exact Source Code Form for each locked version
 is available from crates.io:

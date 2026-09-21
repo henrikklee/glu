@@ -234,7 +234,12 @@ fn macos_codename() -> Option<&'static str> {
     }
     let version = String::from_utf8_lossy(&output.stdout);
     let major = version.trim().split('.').next()?.parse::<u32>().ok()?;
+    macos_codename_for_major(major)
+}
+
+fn macos_codename_for_major(major: u32) -> Option<&'static str> {
     match major {
+        27 => Some("golden_gate"),
         26 => Some("tahoe"),
         15 => Some("sequoia"),
         14 => Some("sonoma"),
@@ -248,6 +253,11 @@ fn macos_codename() -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_macos_golden_gate() {
+        assert_eq!(macos_codename_for_major(27), Some("golden_gate"));
+    }
 
     #[test]
     fn resolve_prefix_env_wins_verbatim() {
