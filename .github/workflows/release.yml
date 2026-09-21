@@ -4,9 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Plain semver or v-prefixed tag to build without publishing
-        required: true
-        default: 0.1.2
+        description: Plain semver or v-prefixed tag; blank uses the workspace version
+        required: false
         type: string
   push:
     tags:
@@ -16,8 +15,7 @@ permissions:
   contents: read
 
 jobs:
-  # Every release requirement belongs in this job. The publishing job below
-  # cannot run unless this complete gate succeeds.
+  # Publishing cannot run unless source and the exact retained artifact pass.
   build:
     name: "Release gate: validate, package, and attest"
     runs-on: macos-14
@@ -62,7 +60,7 @@ jobs:
           if [[ "$EVENT_NAME" == "push" ]]; then
             requested="$REF_NAME"
           else
-            requested="$INPUT_VERSION"
+            requested="${INPUT_VERSION:-$(scripts/workspace-version.sh)}"
           fi
           if [[ "$requested" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?)$ ]]; then
             version="${BASH_REMATCH[1]}"
@@ -85,15 +83,6 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --locked
 
-      - name: Validate dev build isolation
-        run: scripts/test-dev-build-isolation.sh
-
-      - name: Validate upgrade behavior
-        run: scripts/test-upgrade.sh
-
-      - name: Validate retry-safe release publication
-        run: scripts/test-publish-release.sh
-
       - name: Package and smoke-test retained release assets
         id: package
         env:
@@ -104,6 +93,15 @@ jobs:
           archive_sha256="$(awk '{print $1}' "dist/$ASSET.sha256")"
           [[ "$archive_sha256" =~ ^[0-9a-f]{64}$ ]]
           echo "archive_sha256=$archive_sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Validate dev build isolation
+        run: scripts/test-dev-build-isolation.sh
+
+      - name: Validate upgrade behavior
+        run: scripts/test-upgrade.sh
+
+      - name: Validate retry-safe release publication
+        run: scripts/test-publish-release.sh
 
       - name: Attest production executable
         if: ${{ !github.event.repository.private }}

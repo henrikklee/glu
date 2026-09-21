@@ -4,17 +4,19 @@ This document describes how contributors validate and publish glu releases.
 
 ## Release model
 
-`main` is the integration branch. A green `main` commit is eligible to become a
-release candidate, but pushing to `main` does not publish a release.
+`main` is the integration branch. This workflow layout requires branch
+protection to enforce the PR quality gate on the current merge result and to
+disable direct pushes and bypasses. Pushing to `main` does not publish a release
+or rerun CI.
 
 Two GitHub Actions workflows enforce the process:
 
-- **CI** runs for pull requests and pushes to `main`. It validates source,
+- **CI** runs for pull requests. It validates source,
   licenses, the production build, packaging, installation, upgrades, and the
-  publication script.
+  publication script. Superseded PR runs are canceled.
 - **Release** runs manually or for tags matching `v*.*.*`. A manual run retains
-  inspection artifacts without publishing. A tag run publishes only after its
-  release gate passes.
+  inspection artifacts without publishing. A tag run checks source, builds and
+  tests the exact package from the tagged commit, then publishes it.
 
 The publishing job is the only job with `contents: write`. It depends on the
 complete release gate, so a failed check cannot publish a release.
@@ -63,6 +65,9 @@ Development registry overrides use `cargo build-dev` and write
 `target/dev-registry/release/glu`. Build guards prevent a development-feature
 build from replacing the production binary.
 
+CI uses a debug-profile development binary for the isolation and upgrade tests.
+Those tests share one development build and do not need a second fat-LTO link.
+
 Daily local testing uses `cargo build-local`, which writes `target/local/glu`.
 The local profile keeps production behavior but uses faster build settings.
 Packaging reads only the release-profile artifact.
@@ -85,10 +90,10 @@ scripts/check-third-party-licenses.sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+scripts/test-release.sh "$(scripts/workspace-version.sh)"
 scripts/test-dev-build-isolation.sh
 scripts/test-upgrade.sh
 scripts/test-publish-release.sh
-scripts/test-release.sh 0.1.2
 ```
 
 `test-release.sh` builds the production executable, checks its architecture and
@@ -107,18 +112,18 @@ Do not hand-edit `THIRD_PARTY_LICENSES.html`.
 
 ## Publishing a release
 
-Run the Release workflow manually against the intended commit and inspect its
-retained artifacts. After the candidate passes validation, create and push its
-version tag:
+After PR CI passes and the change is merged, create and push the version tag.
+The manual Release workflow is available when a retained candidate artifact is
+useful for inspection:
 
 ```sh
 git tag v0.1.2 <validated-commit-sha>
 git push origin v0.1.2
 ```
 
-The tagged workflow reruns the complete release gate and publishes only after
-every preceding step succeeds. Do not move a published tag. If validation
-exposes a source defect, fix it and select a new release candidate.
+The tagged workflow reruns source checks and builds the exact package it will
+attest and publish. Do not move a published tag. If validation exposes a source
+defect, fix it and select a new release candidate.
 
 ## Independent verification
 
