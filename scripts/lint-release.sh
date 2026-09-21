@@ -22,4 +22,5 @@ shellcheck \
   scripts/test-publish-release.sh \
   scripts/test-release.sh \
   scripts/test-upgrade.sh \
-  scripts/verify-outdated-shape.sh
+  scripts/verify-outdated-shape.sh \
+  scripts/workspace-version.sh

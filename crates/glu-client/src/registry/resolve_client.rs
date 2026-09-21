@@ -366,7 +366,13 @@ fn validate_info_response(
 
 fn parse_macos_bottle_tag(value: &str) -> Option<(&str, usize)> {
     const RELEASES: &[&str] = &[
-        "big_sur", "monterey", "ventura", "sonoma", "sequoia", "tahoe",
+        "big_sur",
+        "monterey",
+        "ventura",
+        "sonoma",
+        "sequoia",
+        "tahoe",
+        "golden_gate",
     ];
     RELEASES.iter().enumerate().find_map(|(release, name)| {
         value
@@ -1152,6 +1158,16 @@ mod tests {
         assert!(bottle_tag_is_compatible("arm64_sonoma", &target));
         assert!(!bottle_tag_is_compatible("arm64_tahoe", &target));
         assert!(!bottle_tag_is_compatible("x86_64_sonoma", &target));
+
+        let golden_gate = Target("arm64_golden_gate".to_string());
+        assert!(bottle_tag_is_compatible("arm64_golden_gate", &golden_gate));
+        assert!(bottle_tag_is_compatible("all", &golden_gate));
+        assert!(bottle_tag_is_compatible("arm64_tahoe", &golden_gate));
+        assert!(!bottle_tag_is_compatible("x86_64_tahoe", &golden_gate));
+        assert!(!bottle_tag_is_compatible(
+            "arm64_golden_gate",
+            &Target("arm64_tahoe".to_string())
+        ));
     }
 
     #[test]

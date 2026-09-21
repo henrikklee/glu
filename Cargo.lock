@@ -1284,7 +1284,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "glu-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1306,7 +1306,7 @@ dependencies = [
 
 [[package]]
 name = "glu-client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "apple-codesign",
@@ -1333,7 +1333,7 @@ dependencies = [
 
 [[package]]
 name = "glu-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "schemars",
  "serde",

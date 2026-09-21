@@ -833,6 +833,15 @@ mod tests {
             .contains("incompatible with target arm64_sequoia"));
     }
 
+    #[test]
+    fn manifest_accepts_tahoe_bottle_on_golden_gate() {
+        let mut manifest = manifest(vec!["vips"], vec![("vips", vec![])]);
+        manifest.request.target = Target("arm64_golden_gate".to_string());
+        manifest.artifacts.values_mut().next().unwrap().bottle_tag = "arm64_tahoe".to_string();
+
+        validate_manifest(&manifest).unwrap();
+    }
+
     fn id(name: &str) -> PackageId {
         PackageId(format!("pkg:homebrew/core/{name}@1.0"))
     }

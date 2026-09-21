@@ -10,7 +10,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-version="${1:-0.1.1}"
+version="${1:-$(scripts/workspace-version.sh)}"
 work="$(mktemp -d "${TMPDIR:-/tmp}/glu-release-smoke.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 release_dir="${2:-$work/dist}"

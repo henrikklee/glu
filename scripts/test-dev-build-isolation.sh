@@ -11,7 +11,7 @@ before="$(shasum -a 256 "$production_bin" | awk '{print $1}')"
 log="$(mktemp "${TMPDIR:-/tmp}/glu-dev-isolation.XXXXXX")"
 trap 'rm -f "$log"' EXIT
 
-if cargo build --release --locked --features dev-registry >"$log" 2>&1; then
+if cargo check --release --locked --features dev-registry >"$log" 2>&1; then
   echo 'FAIL: dev-registry build succeeded in the production target directory' >&2
   exit 1
 fi
@@ -24,8 +24,9 @@ after="$(shasum -a 256 "$production_bin" | awk '{print $1}')"
 
 grep -q -- '--target-dir target/dev-registry' .cargo/config.toml \
   || { echo 'FAIL: cargo build-dev does not declare an isolated target directory' >&2; exit 1; }
-cargo build-dev
-[[ -x target/dev-registry/release/glu ]] \
+dev_target_dir="${GLU_DEV_TARGET_DIR:-target/dev-registry}"
+CARGO_TARGET_DIR="$dev_target_dir" cargo build --locked --features dev-registry
+[[ -x "$dev_target_dir/debug/glu" ]] \
   || { echo 'FAIL: isolated dev binary was not produced' >&2; exit 1; }
 
 echo 'dev build isolation tests passed'

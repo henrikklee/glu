@@ -14,7 +14,7 @@
 #   target     aarch64-apple-darwin         (Apple Silicon only)
 #   checksum   <artifact>.sha256            sidecar; first whitespace token is
 #                                           the lowercase hex digest
-#   version    a semver (e.g. 0.1.1), release tag (e.g. v0.1.1), or `latest`;
+#   version    a semver (e.g. 0.1.2), release tag (e.g. v0.1.2), or `latest`;
 #              bare semver is normalized to its v-prefixed Git tag
 #   URLs       $GLU_BASE_URL/download/$version/$artifact    (pinned)
 #              $GLU_BASE_URL/latest/download/$artifact      (latest)
@@ -131,7 +131,7 @@ if [[ "$requested_version" == 'latest' ]]; then
 elif [[ "$requested_version" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?)$ ]]; then
   version="v${BASH_REMATCH[1]}"
 else
-  error "Invalid glu version: $requested_version (expected 0.1.1, v0.1.1, or latest)."
+  error "Invalid glu version: $requested_version (expected 0.1.2, v0.1.2, or latest)."
 fi
 
 # --- platform --------------------------------------------------------------
