@@ -14,7 +14,7 @@
 #   target     aarch64-apple-darwin         (Apple Silicon only)
 #   checksum   <artifact>.sha256            sidecar; first whitespace token is
 #                                           the lowercase hex digest
-#   version    a semver (e.g. 0.1.2), release tag (e.g. v0.1.2), or `latest`;
+#   version    a semver (e.g. 0.1.3), release tag (e.g. v0.1.3), or `latest`;
 #              bare semver is normalized to its v-prefixed Git tag
 #   URLs       $GLU_BASE_URL/download/$version/$artifact    (pinned)
 #              $GLU_BASE_URL/latest/download/$artifact      (latest)
@@ -131,7 +131,7 @@ if [[ "$requested_version" == 'latest' ]]; then
 elif [[ "$requested_version" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?)$ ]]; then
   version="v${BASH_REMATCH[1]}"
 else
-  error "Invalid glu version: $requested_version (expected 0.1.2, v0.1.2, or latest)."
+  error "Invalid glu version: $requested_version (expected 0.1.3, v0.1.3, or latest)."
 fi
 
 # --- platform --------------------------------------------------------------
@@ -188,6 +188,7 @@ esac
 # --- download and verify ---------------------------------------------------
 command -v curl >/dev/null || error 'curl is required to install glu.'
 command -v tar >/dev/null || error 'tar is required to install glu.'
+curl_retry=(--retry 2 --retry-delay 1 --retry-connrefused --connect-timeout 10)
 
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/glu-install.XXXXXX")"
 tmp_bin=''
@@ -197,13 +198,23 @@ cleanup() {
 }
 trap cleanup EXIT
 
+download_release_file() {
+  local url="$1" destination="$2"
+  if curl "${curl_transport[@]}" "${curl_retry[@]}" --fail --location --silent --show-error \
+    --output "$destination" "$url" 2>"$tmp/curl-error"; then
+    return 0
+  fi
+  [[ ! -s "$tmp/curl-error" ]] || tail -n 1 "$tmp/curl-error" >&2
+  return 1
+}
+
 if [[ -n "${GLU_BINARY:-}" ]]; then
   [[ -x "$GLU_BINARY" ]] || error "GLU_BINARY is not executable: $GLU_BINARY"
   info "Using local binary $(tildify "$GLU_BINARY") (skipping download and checksum)."
   downloaded_bin="$GLU_BINARY"
 else
   info "Downloading glu ($target, $version)..."
-  curl "${curl_transport[@]}" --fail --location --progress-bar --output "$tmp/$asset" "$asset_url" \
+  download_release_file "$asset_url" "$tmp/$asset" \
     || error "Failed to download glu from $asset_url. If no distribution host is live yet, set GLU_BASE_URL to a mirror (e.g. file://...) or GLU_BINARY to a local build."
 
   if [[ "${GLU_NO_VERIFY:-0}" = '1' ]]; then
@@ -211,7 +222,7 @@ else
   else
     command -v shasum >/dev/null || command -v sha256sum >/dev/null \
       || error 'No sha256 tool found (need shasum or sha256sum) to verify the download.'
-    curl "${curl_transport[@]}" --fail --location --silent --show-error --output "$tmp/$asset.sha256" "$checksum_url" \
+    download_release_file "$checksum_url" "$tmp/$asset.sha256" \
       || error "Failed to fetch checksum from $checksum_url."
     expected="$(awk '{print $1}' "$tmp/$asset.sha256")"
     [[ "$expected" =~ ^[0-9a-f]{64}$ ]] \

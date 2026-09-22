@@ -155,6 +155,10 @@ impl InstalledStateStore {
         receipts::validate_receipt_path_components(receipt)
             .context("validating install receipt")?;
         let bytes = serde_json::to_vec_pretty(receipt).context("encoding install receipt")?;
+        Self::write_receipt_bytes_at_keg(keg_path, &bytes)
+    }
+
+    fn write_receipt_bytes_at_keg(keg_path: &Path, bytes: &[u8]) -> Result<()> {
         let keg = atomic_write::open_directory(keg_path)?;
         let metadata = atomic_write::open_or_create_child_directory(
             &keg,
@@ -166,8 +170,45 @@ impl InstalledStateStore {
             &metadata,
             &keg_path.join(".glu"),
             OsStr::new("receipt.json"),
-            &bytes,
+            bytes,
         )
+    }
+
+    /// Rewrite only the legacy macOS bottle tag in complete receipts. Validate
+    /// the entire installed set before the first write so a damaged record
+    /// cannot leave a partly migrated set. Each replacement is atomic; a
+    /// crash between replacements is safe because this operation is idempotent.
+    pub(crate) fn migrate_golden_gate_bottle_tags(&self) -> Result<usize> {
+        let complete = self.load_complete_receipts(&mut Vec::new(), ReceiptLoadPolicy::Strict)?;
+        let mut changes = Vec::new();
+        for bound in complete {
+            if bound.artifact.bottle_tag != "aarch64_macos" {
+                continue;
+            }
+            let keg = bound.paths.keg;
+            // Preserve the receipt's stored path spelling (which may differ
+            // from its physical path by a macOS path alias).
+            let receipt = Self::read_unbound_receipt_at_keg(&keg)?;
+            Self::validate_receipt_at_keg(&receipt, &keg)?;
+            let path = Self::receipt_path(&keg);
+            let mut raw: serde_json::Value = serde_json::from_slice(
+                &fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
+            )
+            .with_context(|| format!("parsing {}", path.display()))?;
+            let tag = raw
+                .pointer_mut("/artifact/bottle_tag")
+                .context("install receipt has no artifact bottle tag")?;
+            if tag != "aarch64_macos" {
+                bail!("install receipt changed while migrating {}", path.display());
+            }
+            *tag = serde_json::Value::String("arm64_golden_gate".to_string());
+            changes.push((keg, serde_json::to_vec_pretty(&raw)?));
+        }
+        let count = changes.len();
+        for (keg, bytes) in changes {
+            Self::write_receipt_bytes_at_keg(&keg, &bytes)?;
+        }
+        Ok(count)
     }
 
     /// Loads declaration and installed package records for a read-only query.

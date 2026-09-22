@@ -44,8 +44,14 @@ cp "$DEV_BIN" "$PREFIX/bin/glu"
 mkdir -p "$DIST/dist/download/v$NEXT_VERSION" "$WORK/release"
 cat > "$WORK/fake-glu.rs" <<EOF
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("--version") {
-        println!("glu $NEXT_VERSION");
+    match std::env::args().nth(1).as_deref() {
+        Some("--version") => println!("glu $NEXT_VERSION"),
+        Some("__complete-upgrade") => {
+            if let Ok(path) = std::env::var("GLU_MARKER") {
+                std::fs::write(path, "handoff complete").unwrap();
+            }
+        }
+        _ => {}
     }
 }
 EOF
@@ -61,11 +67,19 @@ shasum -a 256 "$DIST/dist/download/v$NEXT_VERSION/$ASSET" | awk '{print $1}' > "
 cat > "$WORK/mock-glu-server.py" <<'EOF'
 import json, os, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
-LATEST, DIST, LOG, PORT = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+LATEST, DIST, LOG, PORT, FAIL_ONCE = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
 class H(BaseHTTPRequestHandler):
+    failed_once = False
+
     def do_GET(self):
         with open(LOG, "a") as f:
             f.write(self.path + "\n")
+        if FAIL_ONCE == "checksum" and self.path.endswith(".sha256") and not H.failed_once:
+            H.failed_once = True
+            self.send_response(503)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if self.path.startswith("/v1/outdated"):
             body = json.dumps({"schema": "glu.outdated.v1", "packages": []}).encode()
             self.send_response(200)
@@ -89,7 +103,7 @@ HTTPServer(("127.0.0.1", PORT), H).serve_forever()
 EOF
 
 start_server() {
-  python3 "$WORK/mock-glu-server.py" "$1" "$DIST" "$LOG" "$PORT" 2>/dev/null &
+  python3 "$WORK/mock-glu-server.py" "$1" "$DIST" "$LOG" "$PORT" "${2:-none}" 2>/dev/null &
   SERVER_PID=$!
   sleep 0.5
 }
@@ -113,12 +127,17 @@ grep -q "download/" "$LOG" && fail "downloaded despite being up to date"
 echo "ok: already up to date"
 
 # --- test 2: update -> download, verify, sanity-run, swap -----------------
-echo "test 2: registry reports $NEXT_VERSION -> download, verify, swap"
+echo "test 2: transient checksum failure -> retry, verify, swap"
 : > "$LOG"
-start_server "$NEXT_VERSION"
+start_server "$NEXT_VERSION" checksum
 GLU_MARKER="$WORK/marker" run_upgrade > "$WORK/out" 2>&1
 kill "$SERVER_PID" 2>/dev/null || true
 grep -q "glu updated to $NEXT_VERSION" "$WORK/out" || fail "unexpected output: $(cat "$WORK/out")"
+[[ "$(cat "$WORK/marker")" == "handoff complete" ]] || fail "updated binary did not receive migration handoff"
+if grep -qi "retry" "$WORK/out"; then
+  fail "successful retry produced noisy output: $(cat "$WORK/out")"
+fi
+[[ "$(grep -c '\.sha256' "$LOG")" == 2 ]] || fail "checksum request was not retried exactly once"
 grep -q "download/v$NEXT_VERSION/glu-" "$LOG" || fail "v-prefixed release was not downloaded"
 [[ "$("$PREFIX/bin/glu" --version)" == "glu $NEXT_VERSION" ]] || fail "binary was not swapped"
 echo "ok: updated to $NEXT_VERSION"

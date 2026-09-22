@@ -84,6 +84,8 @@ Selector aliases and filesystem opt-link names are independent facts. An alias c
 
 Only complete receipts count as installed. Incomplete receipts are ignored by state reads and cleaned before mutating commands plan work. Unsupported receipt schemas fail closed; there is no compatibility or migration path for pre-release receipt shapes.
 
+One-time state migrations run after recovery under the prefix operation lock, before mutating commands proceed. Plans and read-only queries leave pending migrations untouched. After self-upgrade, the old process releases its lock and invokes the replacement binary to complete its migrations. Completed migration IDs are recorded in `var/glu/migrations.json`; interrupted migrations can safely retry. On ARM64 macOS Golden Gate, the receipt-tag migration changes legacy `aarch64_macos` tags to `arm64_golden_gate` without changing other receipt fields.
+
 Receipts do not decide why a package is installed. `glu.json` decides user intent. Installed state resolves receipt selectors against the complete installed package set, then traverses the resulting package-key graph for reachability. Exact installed names take precedence over another package's alias or old name; ambiguous non-exact selector claims fail closed.
 
 ## Declared, automatic, and dangling

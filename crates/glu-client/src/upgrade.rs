@@ -31,6 +31,7 @@ const RELEASE_ARCHIVE_ENTRIES: [&str; 5] = [
 const MACHO_64_LE_MAGIC: [u8; 4] = [0xcf, 0xfa, 0xed, 0xfe];
 const CPU_TYPE_ARM64: u32 = 0x0100_000c;
 const MH_EXECUTE: u32 = 0x2;
+const DOWNLOAD_ATTEMPTS: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpgradeStatus {
@@ -43,6 +44,9 @@ pub struct UpgradeResult {
     pub previous_version: String,
     pub version: String,
     pub status: UpgradeStatus,
+    /// Exact installed path of the replacement binary, for the post-swap
+    /// migration handoff after the old process releases its prefix lock.
+    pub installed_binary: Option<PathBuf>,
 }
 
 pub async fn upgrade(
@@ -68,6 +72,7 @@ pub async fn upgrade(
             previous_version: own.to_string(),
             version: own.to_string(),
             status: UpgradeStatus::AlreadyCurrent,
+            installed_binary: None,
         });
     }
 
@@ -120,6 +125,7 @@ pub async fn upgrade(
         previous_version: own.to_string(),
         version: latest,
         status: UpgradeStatus::Updated,
+        installed_binary: Some(bin),
     })
 }
 
@@ -231,15 +237,31 @@ fn http_client() -> Result<reqwest::Client> {
 }
 
 async fn fetch_response(http: &reqwest::Client, url: &str) -> Result<reqwest::Response> {
-    let response = http
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("failed to fetch {url}"))?;
-    if !response.status().is_success() {
-        bail!("failed to fetch {url}: {}", response.status());
+    for attempt in 1..=DOWNLOAD_ATTEMPTS {
+        match http.get(url).send().await {
+            Ok(response) if response.status().is_success() => return Ok(response),
+            Ok(response) => {
+                let status = response.status();
+                let retryable = status == reqwest::StatusCode::REQUEST_TIMEOUT
+                    || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error();
+                if !retryable || attempt == DOWNLOAD_ATTEMPTS {
+                    bail!(
+                        "failed to fetch {url}: {status} (attempt {attempt}/{DOWNLOAD_ATTEMPTS})"
+                    );
+                }
+            }
+            Err(error) => {
+                if !(error.is_timeout() || error.is_connect()) || attempt == DOWNLOAD_ATTEMPTS {
+                    return Err(error).with_context(|| {
+                        format!("failed to fetch {url} (attempt {attempt}/{DOWNLOAD_ATTEMPTS})")
+                    });
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(u64::from(attempt))).await;
     }
-    Ok(response)
+    unreachable!("download attempts are nonzero")
 }
 
 /// Reads only the first whitespace-delimited SHA-256 token. Its fixed digest

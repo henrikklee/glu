@@ -11,7 +11,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 INSTALLER="$PWD/scripts/install.sh"
 RELEASE_DIR=''
-VERSION='0.1.2'
+VERSION='0.1.3'
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -116,7 +116,7 @@ else
     cat > "$BIN_SRC" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "--version" ]]; then
-  echo "glu ${GLU_FAKE_VERSION:-0.1.2}"
+  echo "glu ${GLU_FAKE_VERSION:-0.1.3}"
   exit 0
 fi
 echo "fake-glu $*" >> "${GLU_MARKER:?}"
@@ -207,8 +207,8 @@ echo "ok: checksum mismatch rejected"
 # Restore the valid sidecar for the remaining tests.
 sha256 "$pinned_dir/$ASSET" > "$pinned_dir/$ASSET.sha256"
 
-# --- test 6: archive and checksum redirects are followed ------------------
-echo "test 6: archive and checksum redirects are followed"
+# --- test 6: redirects and transient failures are handled quietly ---------
+echo "test 6: archive and checksum redirects and transient failures"
 cat > "$WORK/redirect-server.py" <<'PY'
 import os
 import sys
@@ -217,6 +217,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 root, port_file, request_log = sys.argv[1:]
 
 class Handler(BaseHTTPRequestHandler):
+    failed_once = set()
+
     def do_GET(self):
         with open(request_log, "a", encoding="utf-8") as log:
             log.write(self.path + "\n")
@@ -231,6 +233,12 @@ class Handler(BaseHTTPRequestHandler):
             name = self.path[len("/objects/"):]
             path = os.path.join(root, name)
             if os.path.isfile(path):
+                if name not in Handler.failed_once:
+                    Handler.failed_once.add(name)
+                    self.send_response(503)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 with open(path, "rb") as source:
                     body = source.read()
                 self.send_response(200)
@@ -261,11 +269,14 @@ done
 [[ -s "$redirect_port_file" ]] || fail 'redirect server did not start'
 redirect_port="$(cat "$redirect_port_file")"
 redirect_prefix="$WORK/redirect-prefix"
-run_installer_from "http://127.0.0.1:$redirect_port/releases" "$redirect_prefix"
+run_installer_from "http://127.0.0.1:$redirect_port/releases" "$redirect_prefix" \
+  >"$WORK/redirect-out" 2>"$WORK/redirect-err"
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=''
 [[ -x "$redirect_prefix/bin/glu" ]] || fail 'redirected artifact was not installed'
+[[ ! -s "$WORK/redirect-err" ]] \
+  || fail "successful retries produced noisy output: $(cat "$WORK/redirect-err")"
 grep -q "/releases/latest/download/$ASSET$" "$redirect_log" \
   || fail 'archive redirect endpoint was not requested'
 grep -q "/objects/$ASSET$" "$redirect_log" \
@@ -274,7 +285,11 @@ grep -q "/releases/latest/download/$ASSET.sha256$" "$redirect_log" \
   || fail 'checksum redirect endpoint was not requested'
 grep -q "/objects/$ASSET.sha256$" "$redirect_log" \
   || fail 'checksum redirect was not followed'
-echo "ok: archive and checksum redirects followed"
+[[ "$(grep -c "/objects/$ASSET$" "$redirect_log")" == 2 ]] \
+  || fail 'archive request was not retried exactly once'
+[[ "$(grep -c "/objects/$ASSET.sha256$" "$redirect_log")" == 2 ]] \
+  || fail 'checksum request was not retried exactly once'
+echo "ok: archive and checksum redirects and silent retries"
 
 # A harmless local binary keeps the prefix-policy tests independent of the
 # production binary and shell setup.
