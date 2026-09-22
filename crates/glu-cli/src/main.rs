@@ -34,6 +34,13 @@ async fn main() {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args == ["__complete-upgrade"] {
+        if let Err(error) = complete_upgrade() {
+            eprintln!("glu: post-upgrade migration failed: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let invocation = InvocationContext::from_args(&args);
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -74,8 +81,35 @@ async fn main() {
     };
     let argument_seconds = main_started.elapsed().as_secs_f64();
 
-    match run(cli, main_started, argument_seconds).await {
-        Ok((Some(result), globals)) => output::render_command_output(&result, &globals),
+    match run(
+        cli,
+        main_started,
+        argument_seconds,
+        ClientConfig::default_for_host,
+    )
+    .await
+    {
+        Ok((Some(result), globals)) => {
+            // `run` has returned, so its operation lock is gone. The new
+            // binary can now take that lock and finish its own migrations.
+            if let CommandOutput::Upgrade(upgrade) = &result {
+                if upgrade.status == glu_client::upgrade::UpgradeStatus::Updated {
+                    let handoff = upgrade
+                        .installed_binary
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("updated binary path is missing"))
+                        .and_then(complete_upgrade_with);
+                    if let Err(error) = handoff {
+                        let failure = CliFailure::Runtime(error.context(
+                            "glu was updated, but its state migration is pending; the new binary will retry on its next mutating command",
+                        ));
+                        print_cli_failure(&failure);
+                        std::process::exit(failure_exit_class(&failure).code());
+                    }
+                }
+            }
+            output::render_command_output(&result, &globals)
+        }
         Ok((None, _)) => {}
         Err(error) => {
             if invocation.json_requested {
@@ -86,6 +120,31 @@ async fn main() {
             std::process::exit(failure_exit_class(&error).code());
         }
     }
+}
+
+fn complete_upgrade() -> anyhow::Result<()> {
+    let config = ClientConfig::default_for_host();
+    if !glu_client::state::migrations::has_pending(&config.prefix, &config.target)? {
+        return Ok(());
+    }
+    let lock = glu_client::state::op_lock::acquire(&config.prefix)?;
+    glu_client::state::recovery::cleanup_interrupted(&config.prefix)?;
+    glu_client::state::migrations::run_pending(&config.prefix, &config.target, &lock)?;
+    Ok(())
+}
+
+fn complete_upgrade_with(binary: &std::path::Path) -> anyhow::Result<()> {
+    let result = std::process::Command::new(binary)
+        .arg("__complete-upgrade")
+        .output()
+        .map_err(|error| anyhow::anyhow!("running updated glu {}: {error}", binary.display()))?;
+    if !result.status.success() {
+        anyhow::bail!(
+            "updated glu failed to complete its migrations: {}",
+            String::from_utf8_lossy(&result.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -181,6 +240,7 @@ async fn run(
     cli: Cli,
     main_started: std::time::Instant,
     argument_seconds: f64,
+    resolve_config: impl FnOnce() -> ClientConfig,
 ) -> std::result::Result<(Option<CommandOutput>, GlobalOptions), CliFailure> {
     let command_validation_started = std::time::Instant::now();
     let globals = GlobalOptions::from_args(cli.globals);
@@ -206,24 +266,25 @@ async fn run(
         return Ok((None, globals));
     }
     let config_started = std::time::Instant::now();
-    let config = ClientConfig::default_for_host();
+    let config = resolve_config();
     let config_seconds = config_started.elapsed().as_secs_f64();
     // A1: serialize mutating commands against this prefix with a process lock,
     // so two concurrent install/up/rm/upgrade runs can't race on staging
-    // dirs, linked markers, or state writes. Read-only queries skip it.
+    // dirs, linked markers, or state writes. Plans and read-only queries skip it.
     let mutating = !plan && spec.mutates;
     let operation_lock_started = std::time::Instant::now();
-    let _op_lock = if mutating {
+    let op_lock = if mutating {
         Some(glu_client::state::op_lock::acquire(&config.prefix)?)
     } else {
         None
     };
     let operation_lock_seconds = operation_lock_started.elapsed().as_secs_f64();
     let recovery_started = std::time::Instant::now();
-    if mutating {
-        // Recovery is an execution-side mutation. Plan commands deliberately
-        // use read-only snapshots and must not clean or rewrite prefix state.
+    if let Some(lock) = op_lock.as_ref() {
+        // Recovery and pending migrations are execution-side mutations.
+        // Plans and read-only queries must leave prefix state untouched.
         glu_client::state::recovery::cleanup_interrupted(&config.prefix)?;
+        glu_client::state::migrations::run_pending(&config.prefix, &config.target, lock)?;
     }
     let recovery_seconds = recovery_started.elapsed().as_secs_f64();
     let client = GluClient::new(config);
@@ -591,6 +652,83 @@ fn print_cli_failure(error: &CliFailure) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pending_migration_preserves_read_only_commands_and_runs_on_execution() {
+        use glu_client::state::{migrations, op_lock};
+        use glu_core::{Prefix, Target};
+        use std::fs;
+
+        let temp = tempfile::tempdir().unwrap();
+        let prefix = Prefix(temp.path().to_path_buf());
+        let config = ClientConfig {
+            prefix: prefix.clone(),
+            target: Target("arm64_golden_gate".to_string()),
+            registry_base_url: "https://unused.invalid".to_string(),
+            distribution_base_url: "https://unused.invalid".to_string(),
+        };
+        let staging = prefix.0.join("var/glu/staging/marker");
+        fs::create_dir_all(staging.parent().unwrap()).unwrap();
+        fs::write(&staging, b"keep during read-only commands").unwrap();
+        let keg = prefix.0.join("Cellar/demo/1.0");
+        let receipt = keg.join(".glu/receipt.json");
+        let original = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "glu.install-receipt.v1",
+            "status": "complete",
+            "package": {
+                "id": "demo@1.0", "package_key": "package:demo", "name": "demo",
+                "aliases": [], "oldnames": [], "version": "1.0",
+                "revision": 0, "keg_version": "1.0"
+            },
+            "artifact": {
+                "id": "artifact:demo@1.0", "sha256": "a".repeat(64),
+                "bottle_tag": "aarch64_macos", "cellar": ":any"
+            },
+            "paths": { "keg": keg, "opt": prefix.0.join("opt/demo") },
+            "links": { "opt_names": [] },
+            "install": {
+                "exposure": { "mode": "global" }, "linked": false,
+                "link_overwrite": [], "deps": [], "dependency_requirements": {}
+            }
+        }))
+        .unwrap();
+        fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+        fs::write(&receipt, &original).unwrap();
+        let ledger = prefix.0.join("var/glu/migrations.json");
+        assert!(migrations::has_pending(&prefix, &config.target).unwrap());
+
+        for args in [
+            vec!["glu", "autoremove", "--plan", "--json"],
+            vec!["glu", "list", "--installed", "--json"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            run(cli, std::time::Instant::now(), 0.0, || config.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                fs::read(&staging).unwrap(),
+                b"keep during read-only commands"
+            );
+            assert_eq!(fs::read(&receipt).unwrap(), original);
+            assert!(!ledger.exists(), "read-only command wrote migration ledger");
+            assert!(
+                !op_lock::lock_path(&prefix).exists(),
+                "read-only command took lock"
+            );
+            assert!(migrations::has_pending(&prefix, &config.target).unwrap());
+        }
+
+        let cli = Cli::try_parse_from(["glu", "cleanup", "--yes", "--json"]).unwrap();
+        run(cli, std::time::Instant::now(), 0.0, || config.clone())
+            .await
+            .unwrap();
+        assert!(!staging.exists(), "execution must run recovery");
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        assert_eq!(migrated["artifact"]["bottle_tag"], "arm64_golden_gate");
+        assert!(!migrations::has_pending(&prefix, &config.target).unwrap());
+        assert!(ledger.exists());
+    }
 
     fn assert_error_envelope_valid(value: &serde_json::Value) {
         let help = crate::help::compact_help_json_value(&[]).unwrap();

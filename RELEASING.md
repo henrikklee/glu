@@ -23,8 +23,8 @@ complete release gate, so a failed check cannot publish a release.
 
 ## Version and artifact conventions
 
-Cargo packages and the registry use plain semantic versions such as `0.1.2`.
-Git tags use a `v` prefix such as `v0.1.2`.
+Cargo packages and the registry use plain semantic versions such as `0.1.3`.
+Git tags use a `v` prefix such as `v0.1.3`.
 
 A release publishes three assets:
 
@@ -117,8 +117,8 @@ The manual Release workflow is available when a retained candidate artifact is
 useful for inspection:
 
 ```sh
-git tag v0.1.2 <validated-commit-sha>
-git push origin v0.1.2
+git tag v0.1.3 <validated-commit-sha>
+git push origin v0.1.3
 ```
 
 The tagged workflow reruns source checks and builds the exact package it will
@@ -132,8 +132,8 @@ Download the release archive and extract a second copy of `glu`, then run:
 ```sh
 gh attestation verify glu-aarch64-apple-darwin.tar.gz -R henrikklee/glu
 gh attestation verify glu -R henrikklee/glu
-gh release verify v0.1.2 -R henrikklee/glu
-gh release verify-asset v0.1.2 glu-aarch64-apple-darwin.tar.gz -R henrikklee/glu
+gh release verify v0.1.3 -R henrikklee/glu
+gh release verify-asset v0.1.3 glu-aarch64-apple-darwin.tar.gz -R henrikklee/glu
 ```
 
 Also confirm:

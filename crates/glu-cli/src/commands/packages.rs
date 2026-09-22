@@ -71,11 +71,13 @@ pub(crate) async fn install(
         output::render_install_execution_plan(&install_plan, "install", context.globals.tree);
     }
     if install_plan.requires_confirmation {
+        let confirmation_started = std::time::Instant::now();
         let approved = approval::approve(
             context.globals,
             || install_confirmation_error(&install_plan, "install"),
             || confirm::confirm_install(&install_plan, "install"),
         )?;
+        install_plan.exclude_confirmation_wait(confirmation_started.elapsed());
         if !approved {
             return Ok(CommandOutcome::cancelled());
         }
@@ -122,11 +124,13 @@ pub(crate) async fn reinstall(
         output::render_install_execution_plan(&install_plan, "reinstall", false);
     }
     if install_plan.requires_confirmation {
+        let confirmation_started = std::time::Instant::now();
         let approved = approval::approve(
             context.globals,
             || install_confirmation_error(&install_plan, "reinstall"),
             || confirm::confirm_install(&install_plan, "reinstall"),
         )?;
+        install_plan.exclude_confirmation_wait(confirmation_started.elapsed());
         if !approved {
             return Ok(CommandOutcome::cancelled());
         }

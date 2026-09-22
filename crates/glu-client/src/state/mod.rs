@@ -1,6 +1,7 @@
 pub(crate) mod atomic_write;
 mod declaration;
 pub mod installed;
+pub mod migrations;
 pub mod op_lock;
 pub mod package_graph;
 mod receipts;

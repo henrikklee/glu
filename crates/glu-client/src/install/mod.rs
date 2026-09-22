@@ -203,6 +203,12 @@ pub struct InstallPlan {
 }
 
 impl InstallPlan {
+    /// Keep planning time in the execution total without charging time spent
+    /// waiting for the user at a confirmation prompt.
+    pub fn exclude_confirmation_wait(&mut self, wait: std::time::Duration) {
+        self.command_start += wait;
+    }
+
     pub fn set_host_startup_diagnostics(&mut self, diagnostics: HostStartupDiagnostics) {
         self.startup_diagnostics.host = Some(diagnostics);
     }
