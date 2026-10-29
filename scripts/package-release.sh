@@ -2,7 +2,7 @@
 # Build, validate, and package a production glu release artifact.
 #
 # Usage: scripts/package-release.sh <version-or-tag> [output-directory]
-# Example: scripts/package-release.sh 0.1.3 dist
+# Example: scripts/package-release.sh 0.1.4 dist
 #
 # Bare versions and v-prefixed tags are both accepted. Cargo package versions
 # remain plain semver; the corresponding GitHub release tag is v-prefixed.
@@ -21,7 +21,7 @@ requested_version="${1:-}"
 if [[ "$requested_version" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?)$ ]]; then
   version="${BASH_REMATCH[1]}"
 else
-  fail "invalid release version: $requested_version (expected 0.1.3 or v0.1.3)"
+  fail "invalid release version: $requested_version (expected 0.1.4 or v0.1.4)"
 fi
 tag="v$version"
 
