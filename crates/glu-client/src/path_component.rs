@@ -30,12 +30,14 @@ struct ComponentOwner {
     value: String,
     owner: String,
     label: String,
+    shared: bool,
 }
 
 /// Detects two metadata values that would address the same path component on
 /// Glu's supported filesystem while claiming different spelling or ownership.
 /// Repeated identical facts for the same package are harmless (for example an
-/// alias also appearing in `opt_names`) and are accepted.
+/// alias also appearing in `opt_names`) and are accepted. Values inserted with
+/// `insert_shared` may also repeat across packages when spelled identically.
 #[derive(Debug, Default)]
 pub(crate) struct PathComponentCollisionTracker {
     components: HashMap<String, ComponentOwner>,
@@ -43,13 +45,28 @@ pub(crate) struct PathComponentCollisionTracker {
 
 impl PathComponentCollisionTracker {
     pub(crate) fn insert(&mut self, value: &str, owner: &str, label: &str) -> Result<()> {
+        self.insert_with(value, owner, label, false)
+    }
+
+    /// Inserts a value several packages may claim with identical spelling.
+    /// Installed receipts keep the aliases and stable link names the registry
+    /// published at install time, so a name that moved to a new package (an
+    /// unversioned alias moving to the next versioned package) stays claimed
+    /// by the old receipt too. Case-equivalent spellings still collide, and
+    /// shared values never coincide with another package's exclusive names.
+    pub(crate) fn insert_shared(&mut self, value: &str, owner: &str, label: &str) -> Result<()> {
+        self.insert_with(value, owner, label, true)
+    }
+
+    fn insert_with(&mut self, value: &str, owner: &str, label: &str, shared: bool) -> Result<()> {
         if !is_safe_path_component(value) {
             bail!("{label} {value:?} is not a supported package path component");
         }
 
         let key = filesystem_component_key(value);
         if let Some(existing) = self.components.get(&key) {
-            if existing.value != value || existing.owner != owner {
+            let shared_claim = shared && existing.shared;
+            if existing.value != value || (existing.owner != owner && !shared_claim) {
                 bail!(
                     "filesystem-equivalent package path components collide: {label} {value:?} for {owner:?} conflicts with {} {:?} for {:?}",
                     existing.label,
@@ -66,6 +83,7 @@ impl PathComponentCollisionTracker {
                 value: value.to_string(),
                 owner: owner.to_string(),
                 label: label.to_string(),
+                shared,
             },
         );
         Ok(())
@@ -143,6 +161,28 @@ mod tests {
 
         assert!(tracker
             .insert("llvm@22", "package:other", "opt name")
+            .is_err());
+    }
+
+    #[test]
+    fn collision_tracker_accepts_shared_values_across_owners_only_when_identical() {
+        let mut tracker = PathComponentCollisionTracker::default();
+        tracker
+            .insert_shared("icu4c", "package:icu4c@78", "alias")
+            .unwrap();
+        tracker
+            .insert_shared("icu4c", "package:icu4c@79", "alias")
+            .unwrap();
+
+        assert!(tracker
+            .insert_shared("ICU4C", "package:icu4c@80", "alias")
+            .is_err());
+        assert!(tracker.insert("icu4c", "package:icu4c", "name").is_err());
+
+        let mut tracker = PathComponentCollisionTracker::default();
+        tracker.insert("icu4c", "package:icu4c", "name").unwrap();
+        assert!(tracker
+            .insert_shared("icu4c", "package:icu4c@79", "alias")
             .is_err());
     }
 }

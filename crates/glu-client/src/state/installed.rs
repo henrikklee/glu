@@ -6,7 +6,7 @@ use crate::{
 use anyhow::{bail, Result};
 use glu_core::{InstalledPackage, PackageId, PackageKey, PackageName, PackageSelector, Prefix};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::PathBuf,
 };
 
@@ -103,30 +103,11 @@ impl InstalledState {
     ) -> Result<Self> {
         let mut by_name: BTreeMap<PackageName, Vec<InstalledPackage>> = BTreeMap::new();
         let mut by_key: BTreeMap<PackageKey, Vec<InstalledPackage>> = BTreeMap::new();
-        let mut selector_index: HashMap<PackageSelector, PackageKey> = HashMap::new();
-        let exact_selectors: BTreeSet<PackageSelector> = packages
-            .iter()
-            .map(|package| PackageSelector(package.name.0.clone()))
-            .collect();
-        for package in &packages {
-            insert_selector_mapping(
-                &mut selector_index,
-                PackageSelector(package.name.0.clone()),
-                &package.package_key,
-            )?;
-        }
-        for package in &packages {
-            for selector in package.aliases.iter().chain(&package.oldnames) {
-                if exact_selectors.contains(selector) {
-                    continue;
-                }
-                insert_selector_mapping(
-                    &mut selector_index,
-                    selector.clone(),
-                    &package.package_key,
-                )?;
-            }
-        }
+        let selector_index: HashMap<PackageSelector, PackageKey> =
+            index_installed_selectors(&packages)?
+                .into_iter()
+                .map(|(selector, package)| (selector, package.package_key.clone()))
+                .collect();
         for package in packages {
             let current = package.name.clone();
             by_key
@@ -395,24 +376,77 @@ impl InstalledState {
     }
 }
 
-fn insert_selector_mapping(
-    index: &mut HashMap<PackageSelector, PackageKey>,
-    selector: PackageSelector,
-    package_key: &PackageKey,
-) -> Result<()> {
-    if let Some(existing) = index.get(&selector) {
-        if existing != package_key {
-            bail!(
-                "installed selector '{}' belongs to both {} and {}",
+/// Maps every selector advertised by installed receipts to the receipt that
+/// provides it. Shared by receipt loading and installed-state snapshots so both
+/// resolve selectors identically.
+///
+/// Exact installed names always beat aliases and old names; two packages with
+/// the same exact name fail closed. Receipts keep the aliases the registry
+/// published at install time, so when an alias moves to a new package (`icu4c`
+/// from `icu4c@78` to `icu4c@79`) both receipts claim it while the old package
+/// stays installed. The package with the newest installed release owns such a
+/// selector; claims that remain tied fail closed.
+pub(crate) fn index_installed_selectors(
+    packages: &[InstalledPackage],
+) -> Result<HashMap<PackageSelector, &InstalledPackage>> {
+    let mut index: HashMap<PackageSelector, &InstalledPackage> = HashMap::new();
+    for package in packages {
+        let selector = PackageSelector(package.name.0.clone());
+        match index.get(&selector) {
+            Some(existing) if existing.package_key != package.package_key => bail!(
+                "installed exact selector '{}' belongs to both {} and {}",
                 selector.0,
-                existing.0,
-                package_key.0
-            );
+                existing.package_key.0,
+                package.package_key.0
+            ),
+            Some(_) => {}
+            None => {
+                index.insert(selector, package);
+            }
         }
-        return Ok(());
     }
-    index.insert(selector, package_key.clone());
-    Ok(())
+    let exact_selectors: HashSet<PackageSelector> = index.keys().cloned().collect();
+
+    let mut newest: HashMap<&PackageKey, &InstalledPackage> = HashMap::new();
+    for package in packages {
+        newest
+            .entry(&package.package_key)
+            .and_modify(|current| {
+                if compare_installed(package, current).is_gt() {
+                    *current = package;
+                }
+            })
+            .or_insert(package);
+    }
+
+    for package in packages {
+        for selector in package.aliases.iter().chain(&package.oldnames) {
+            if exact_selectors.contains(selector) {
+                continue;
+            }
+            let Some(existing) = index.get(selector).copied() else {
+                index.insert(selector.clone(), package);
+                continue;
+            };
+            if existing.package_key == package.package_key {
+                continue;
+            }
+            let claimant = newest[&package.package_key];
+            match compare_installed(claimant, newest[&existing.package_key]) {
+                std::cmp::Ordering::Greater => {
+                    index.insert(selector.clone(), claimant);
+                }
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Equal => bail!(
+                    "installed selector '{}' belongs to both {} and {}",
+                    selector.0,
+                    existing.package_key.0,
+                    package.package_key.0
+                ),
+            }
+        }
+    }
+    Ok(index)
 }
 
 fn compare_installed(a: &InstalledPackage, b: &InstalledPackage) -> std::cmp::Ordering {
@@ -669,6 +703,102 @@ mod tests {
         assert!(err
             .to_string()
             .contains("installed selector 'foo' belongs to both"));
+    }
+
+    #[test]
+    fn installed_alias_moved_to_a_newer_package_resolves_to_the_newest_claimant() {
+        let mut old = installed_pkg_with_oldnames("icu4c@78", &[], "78.3");
+        old.aliases = vec![PackageSelector("icu4c".to_string())];
+        let mut new = installed_pkg_with_oldnames("icu4c@79", &[], "79.1");
+        new.aliases = vec![PackageSelector("icu4c".to_string())];
+
+        for packages in [
+            vec![old.clone(), new.clone()],
+            vec![new.clone(), old.clone()],
+        ] {
+            let state = InstalledState::from_packages(packages);
+            let selected = state
+                .resolve_selector(&PackageSelector("icu4c".to_string()))
+                .unwrap();
+            assert_eq!(selected.package_key.0, "package:icu4c@79");
+            let old_selected = state
+                .resolve_selector(&PackageSelector("icu4c@78".to_string()))
+                .unwrap();
+            assert_eq!(old_selected.package_key.0, "package:icu4c@78");
+        }
+    }
+
+    #[test]
+    fn installed_state_fails_closed_on_duplicate_exact_names() {
+        let mut other = installed_pkg_with_oldnames("foo", &[], "2.0");
+        other.package_key = glu_core::PackageKey("package:other".to_string());
+        let err = InstalledState::from_loaded_packages(
+            vec![installed_pkg_with_oldnames("foo", &[], "1.0"), other],
+            Prefix(std::path::PathBuf::from("/tmp/glu")),
+            BTreeSet::new(),
+            BTreeSet::new(),
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("installed exact selector 'foo' belongs to both"));
+    }
+
+    #[test]
+    fn loaded_state_keeps_exact_dependencies_on_a_package_that_lost_its_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_receipt(tmp.path(), "app", "1.0", true, false);
+        write_receipt(tmp.path(), "icu4c@78", "78.3", false, false);
+        write_receipt(tmp.path(), "icu4c@79", "79.1", false, false);
+        let edit = |name: &str, version: &str, change: &dyn Fn(&mut GluInstallReceipt)| {
+            let keg = tmp.path().join("Cellar").join(name).join(version);
+            let path = InstalledStateStore::receipt_path_for_keg(&keg);
+            let mut receipt: GluInstallReceipt =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            change(&mut receipt);
+            fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        };
+        edit("app", "1.0", &|receipt| {
+            receipt.install.deps = vec![PackageSelector("icu4c@78".to_string())];
+        });
+        for (name, version) in [("icu4c@78", "78.3"), ("icu4c@79", "79.1")] {
+            edit(name, version, &|receipt| {
+                receipt.package.aliases = vec![PackageSelector("icu4c".to_string())];
+                receipt.links.opt_names = vec![PackageName("icu4c".to_string())];
+            });
+        }
+
+        let store = InstalledStateStore::new(Prefix(tmp.path().to_path_buf()));
+        let declaration = store.load_declaration().unwrap();
+        let mut warnings = Vec::new();
+        let state = store
+            .load_installed_state_with_warnings(&declaration, &mut warnings)
+            .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        store
+            .load_installed_state_with_declaration_strict(&declaration)
+            .unwrap();
+        let app_key = PackageKey("package:app".to_string());
+
+        assert_eq!(
+            state
+                .resolve_selector(&PackageSelector("icu4c".to_string()))
+                .unwrap()
+                .package_key
+                .0,
+            "package:icu4c@79"
+        );
+        assert_eq!(
+            state.package_graph().dependencies(&app_key)[0].provider.0,
+            "package:icu4c@78"
+        );
+        let dangling: Vec<String> = state
+            .dangling()
+            .into_iter()
+            .map(|package| package.name.0)
+            .collect();
+        assert_eq!(dangling, vec!["icu4c@79".to_string()]);
     }
 
     #[test]

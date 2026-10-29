@@ -252,6 +252,45 @@ mod tests {
     }
 
     #[test]
+    fn predicted_dangling_tolerates_an_alias_moving_to_a_new_package() {
+        // The registry moved `icu` from icu@78 to icu@79. The installed
+        // icu@78 receipt still claims `icu` and stays reachable from app.
+        let mut old = pkg("icu@78", vec![]);
+        old.aliases = vec![PackageSelector("icu".to_string())];
+        let state = InstalledState::from_packages_declared(
+            vec![pkg("app", vec!["icu@78"]), old],
+            [PackageName("app".to_string())].into_iter().collect(),
+        );
+        let (new_id, mut new) = resolved_pkg("icu@79", vec![]);
+        new.aliases = vec![PackageSelector("icu".to_string())];
+        let manifest = InstallManifest {
+            schema: "glu.resolve.v1".to_string(),
+            request: ResolveRequestEcho {
+                name: vec![PackageSelector("icu@79".to_string())],
+                target: Target("arm64_sequoia".to_string()),
+                slim: false,
+            },
+            roots: vec![root_selection("icu@79", new_id.clone())],
+            packages: BTreeMap::from([(new_id.clone(), new)]),
+            artifacts: BTreeMap::new(),
+        };
+        let workset = InstallWorkSet {
+            satisfied: Vec::new(),
+            rename: Vec::new(),
+            install: vec![new_id],
+        };
+        let declared: BTreeSet<PackageName> = ["app", "icu@79"]
+            .into_iter()
+            .map(|name| PackageName(name.to_string()))
+            .collect();
+
+        let dangling =
+            predicted_dangling_after_workset(&state, &manifest, &workset, &declared).unwrap();
+
+        assert!(dangling.is_empty());
+    }
+
+    #[test]
     fn predicted_dangling_after_a_version_bump_includes_the_superseded_keg() {
         // app 1.0 is installed and declared; the update resolves app 2.0,
         // which drops the dependency the old bottle had. The prediction

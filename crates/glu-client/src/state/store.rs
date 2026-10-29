@@ -3,7 +3,7 @@ use crate::{
     state::{
         atomic_write,
         declaration::Declaration,
-        installed::InstalledState,
+        installed::{index_installed_selectors, InstalledState},
         receipts::{self, GluInstallReceipt, ReceiptStatus},
     },
 };
@@ -13,7 +13,7 @@ use glu_core::{
     PackageName, PackageSelector, Prefix,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
@@ -291,45 +291,14 @@ impl InstalledStateStore {
         // Receipts persist what each package asked for, not which package
         // happened to provide that selector at install time. Resolve those
         // selectors against the complete installed package set when building
-        // the in-memory state. Exact installed names always beat aliases.
-        let mut providers: HashMap<PackageSelector, (PackageKey, PackageId)> = HashMap::new();
-        let mut exact_names = HashSet::new();
-        for package in &packages {
-            let selector = PackageSelector(package.name.0.clone());
-            exact_names.insert(selector.clone());
-            match providers.get(&selector) {
-                Some((key, _)) if key != &package.package_key => bail!(
-                    "installed exact selector '{}' belongs to both {} and {}",
-                    selector.0,
-                    key.0,
-                    package.package_key.0
-                ),
-                _ => {
-                    providers.insert(selector, (package.package_key.clone(), package.id.clone()));
-                }
-            }
-        }
-        for package in &packages {
-            for selector in package.aliases.iter().chain(&package.oldnames) {
-                if exact_names.contains(selector) {
-                    continue;
-                }
-                match providers.get(selector) {
-                    Some((key, _)) if key != &package.package_key => bail!(
-                        "installed selector '{}' belongs to both {} and {}",
-                        selector.0,
-                        key.0,
-                        package.package_key.0
-                    ),
-                    _ => {
-                        providers.insert(
-                            selector.clone(),
-                            (package.package_key.clone(), package.id.clone()),
-                        );
-                    }
-                }
-            }
-        }
+        // the in-memory state.
+        let providers: HashMap<PackageSelector, (PackageKey, PackageId)> =
+            index_installed_selectors(&packages)?
+                .into_iter()
+                .map(|(selector, package)| {
+                    (selector, (package.package_key.clone(), package.id.clone()))
+                })
+                .collect();
 
         for (package, receipt) in packages.iter_mut().zip(&receipts) {
             package.deps = receipt
@@ -450,13 +419,13 @@ pub(crate) fn validate_receipt_set_path_components(receipts: &[GluInstallReceipt
         let owner = &receipt.package.package_key.0;
         path_names.insert(&receipt.package.name.0, owner, "installed package name")?;
         for alias in &receipt.package.aliases {
-            path_names.insert(&alias.0, owner, "installed package alias")?;
+            path_names.insert_shared(&alias.0, owner, "installed package alias")?;
         }
         for oldname in &receipt.package.oldnames {
-            path_names.insert(&oldname.0, owner, "installed package old name")?;
+            path_names.insert_shared(&oldname.0, owner, "installed package old name")?;
         }
         for opt_name in &receipt.links.opt_names {
-            path_names.insert(&opt_name.0, owner, "installed package stable link name")?;
+            path_names.insert_shared(&opt_name.0, owner, "installed package stable link name")?;
         }
     }
     Ok(())
